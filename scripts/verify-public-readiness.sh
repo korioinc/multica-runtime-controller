@@ -14,8 +14,164 @@ require_command() {
   command -v "$1" >/dev/null 2>&1 || fail "required command not found: $1"
 }
 
+run_gitleaks_scan() {
+  local report_path=$1
+  shift
+  local exit_code=0
+
+  gitleaks "$@" --report-format json --report-path "$report_path" || exit_code=$?
+  case "$exit_code" in
+    0 | 1) ;;
+    *) fail "gitleaks operational failure (exit $exit_code): $*" ;;
+  esac
+  [[ -f $report_path ]] || fail "gitleaks did not create report: $report_path"
+}
+
 sha256_file() {
   shasum -a 256 "$1" | awk '{print $1}'
+}
+
+extract_artifact() {
+  local source=$1
+  local destination=$2
+
+  python3 - "$source" "$destination" <<'PY'
+import gzip
+import pathlib
+import stat
+import sys
+import tarfile
+import zipfile
+
+source = pathlib.Path(sys.argv[1])
+destination = pathlib.Path(sys.argv[2])
+max_entries = 100_000
+max_expanded_bytes = 1_073_741_824
+entry_count = 0
+expanded_bytes = 0
+
+
+def fail(message: str) -> None:
+    raise SystemExit(f"unsafe or unsupported artifact: {message}")
+
+
+def relative_path(name: str) -> pathlib.PurePosixPath:
+    if "\\" in name:
+        fail(f"backslash path: {name!r}")
+    path = pathlib.PurePosixPath(name)
+    if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+        fail(f"non-relative path: {name!r}")
+    return path
+
+
+def reserve(size: int) -> None:
+    global entry_count, expanded_bytes
+    if size < 0:
+        fail("negative file size")
+    entry_count += 1
+    expanded_bytes += size
+    if entry_count > max_entries:
+        fail(f"more than {max_entries} entries")
+    if expanded_bytes > max_expanded_bytes:
+        fail(f"expanded content exceeds {max_expanded_bytes} bytes")
+
+
+def output_path(root: pathlib.Path, name: str) -> pathlib.Path:
+    path = root.joinpath(*relative_path(name).parts)
+    if path.exists() or path.is_symlink():
+        fail(f"duplicate path: {name!r}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def copy_stream(stream, path: pathlib.Path, size: int) -> None:
+    remaining = size
+    with path.open("xb") as output:
+        while remaining:
+            chunk = stream.read(min(1024 * 1024, remaining))
+            if not chunk:
+                fail(f"truncated member: {path.name!r}")
+            output.write(chunk)
+            remaining -= len(chunk)
+        if stream.read(1):
+            fail(f"member exceeds declared size: {path.name!r}")
+
+
+def unpack(path: pathlib.Path, root: pathlib.Path, depth: int) -> None:
+    global expanded_bytes
+    if depth > 4:
+        fail("archive nesting exceeds four levels")
+    root.mkdir(parents=True, exist_ok=False)
+
+    is_zip = zipfile.is_zipfile(path)
+    is_tar = not is_zip and tarfile.is_tarfile(path)
+    if is_zip:
+        with zipfile.ZipFile(path) as archive:
+            members = archive.infolist()
+            for member in members:
+                relative_path(member.filename.rstrip("/"))
+                mode = member.external_attr >> 16
+                file_type = stat.S_IFMT(mode)
+                if member.flag_bits & 1:
+                    fail(f"encrypted ZIP member: {member.filename!r}")
+                if file_type not in {0, stat.S_IFREG, stat.S_IFDIR}:
+                    fail(f"non-regular ZIP member: {member.filename!r}")
+                reserve(0 if member.is_dir() else member.file_size)
+            for member in members:
+                name = member.filename.rstrip("/")
+                target = root.joinpath(*relative_path(name).parts)
+                if member.is_dir():
+                    target.mkdir(parents=True, exist_ok=True)
+                    continue
+                target = output_path(root, name)
+                with archive.open(member) as stream:
+                    copy_stream(stream, target, member.file_size)
+    elif is_tar:
+        with tarfile.open(path, mode="r:*") as archive:
+            members = archive.getmembers()
+            for member in members:
+                relative_path(member.name.rstrip("/"))
+                if not (member.isdir() or member.isfile()):
+                    fail(f"non-regular TAR member: {member.name!r}")
+                reserve(0 if member.isdir() else member.size)
+            for member in members:
+                name = member.name.rstrip("/")
+                target = root.joinpath(*relative_path(name).parts)
+                if member.isdir():
+                    target.mkdir(parents=True, exist_ok=True)
+                    continue
+                stream = archive.extractfile(member)
+                if stream is None:
+                    fail(f"unreadable TAR member: {member.name!r}")
+                with stream:
+                    copy_stream(stream, output_path(root, name), member.size)
+    else:
+        with path.open("rb") as stream:
+            gzip_magic = stream.read(2) == b"\x1f\x8b"
+        if gzip_magic:
+            target = output_path(root, "payload.gunzip")
+            reserve(0)
+            with gzip.open(path, "rb") as stream, target.open("xb") as output:
+                while chunk := stream.read(1024 * 1024):
+                    expanded_bytes += len(chunk)
+                    if expanded_bytes > max_expanded_bytes:
+                        fail(f"expanded content exceeds {max_expanded_bytes} bytes")
+                    output.write(chunk)
+        else:
+            target = output_path(root, "payload")
+            reserve(path.stat().st_size)
+            with path.open("rb") as stream:
+                copy_stream(stream, target, path.stat().st_size)
+
+    if depth == 4:
+        return
+    for candidate in sorted(item for item in root.rglob("*") if item.is_file()):
+        if zipfile.is_zipfile(candidate) or tarfile.is_tarfile(candidate):
+            unpack(candidate, candidate.with_name(candidate.name + ".unpacked"), depth + 1)
+
+
+unpack(source, destination, 0)
+PY
 }
 
 fetch_array() {
@@ -92,7 +248,21 @@ fi
 
 workdir=$(mktemp -d "${TMPDIR:-/tmp}/multica-public-readiness.XXXXXX")
 trap 'rm -rf "$workdir"' EXIT
-mkdir -p "$workdir/surfaces" "$workdir/logs" "$workdir/artifacts"
+mkdir -p "$workdir/surfaces" "$workdir/logs" "$workdir/artifacts" "$workdir/artifact-downloads"
+cat >"$workdir/artifact-gitleaks.toml" <<'TOML'
+title = "Actions artifact scan with public signing-key allowlist"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "generic-api-key"
+
+  [[rules.allowlists]]
+  description = "Base-image GPG public signing-key fingerprints are not credentials."
+  regexTarget = "match"
+  regexes = ['''(?i)^GPG_KEYS=[0-9A-F ]+$''']
+TOML
 
 git fetch --all --tags --prune
 git for-each-ref --format='%(refname) %(objectname)' refs/heads refs/remotes refs/tags |
@@ -100,10 +270,10 @@ git for-each-ref --format='%(refname) %(objectname)' refs/heads refs/remotes ref
 git ls-remote --refs origin | LC_ALL=C sort >"$workdir/remote-ref-map.txt"
 cat "$workdir/ref-map.txt" "$workdir/remote-ref-map.txt" >"$workdir/all-ref-map.txt"
 
-gitleaks git --no-banner --redact=100 --log-level error --log-opts='--all' \
-  --report-format json --report-path "$workdir/git-findings.json" .
-gitleaks dir --no-banner --redact=100 --log-level error \
-  --report-format json --report-path "$workdir/tree-findings.json" .
+run_gitleaks_scan "$workdir/git-findings.json" \
+  git --no-banner --redact=100 --log-level error --log-opts='--all' .
+run_gitleaks_scan "$workdir/tree-findings.json" \
+  dir --no-banner --redact=100 --log-level error .
 
 gh api "repos/$repository" >"$workdir/repository.json"
 fetch_array "$workdir/surfaces/issues.json" \
@@ -151,7 +321,14 @@ else
   printf '[]\n' >"$workdir/surfaces/discussions.json"
 fi
 
-gh api graphql -f query='query{repository(owner:"korioinc",name:"multica-runtime-controller"){projectsV2(first:100){totalCount nodes{id number title shortDescription readme updatedAt}}}}' \
+owner=${repository%%/*}
+repository_name=${repository#*/}
+# GraphQL variables are expanded by gh, not by this shell.
+# shellcheck disable=SC2016
+gh api graphql \
+  -f query='query($owner:String!,$name:String!){repository(owner:$owner,name:$name){projectsV2(first:100){totalCount nodes{id number title shortDescription readme updatedAt}}}}' \
+  -F owner="$owner" \
+  -F name="$repository_name" \
   >"$workdir/projects-response.json"
 jq '.data.repository.projectsV2.nodes // []' "$workdir/projects-response.json" \
   >"$workdir/surfaces/projects.json"
@@ -159,14 +336,32 @@ project_total=$(jq -r '.data.repository.projectsV2.totalCount' "$workdir/project
 project_loaded=$(jq 'length' "$workdir/surfaces/projects.json")
 [[ $project_total == "$project_loaded" ]] || fail "more than 100 repository projects require explicit review"
 
-owner=${repository%%/*}
-gh api graphql -f query="query{organization(login:\"$owner\"){packages(first:100){totalCount nodes{name packageType repository{nameWithOwner} versions(first:100){totalCount nodes{id version}}}}}}" \
-  >"$workdir/packages-response.json"
+printf '[]\n' >"$workdir/package-index.json"
+for package_type in npm maven rubygems docker nuget container; do
+  package_page="$workdir/package-index-$package_type.json"
+  fetch_array "$package_page" \
+    "orgs/$owner/packages?package_type=$package_type&per_page=100"
+  jq -s 'add' "$workdir/package-index.json" "$package_page" \
+    >"$workdir/package-index.next.json"
+  mv "$workdir/package-index.next.json" "$workdir/package-index.json"
+done
 jq --arg repository "$repository" \
-  '[.data.organization.packages.nodes[]? | select(.repository.nameWithOwner == $repository)]' \
-  "$workdir/packages-response.json" >"$workdir/surfaces/packages.json"
-package_total=$(jq -r '.data.organization.packages.totalCount // 0' "$workdir/packages-response.json")
-((package_total <= 100)) || fail "more than 100 organization packages require explicit review"
+  '[.[] | select(.repository.full_name == $repository)] | sort_by(.package_type, .name)' \
+  "$workdir/package-index.json" >"$workdir/linked-packages.json"
+
+printf '[]\n' >"$workdir/surfaces/packages.json"
+while IFS= read -r package; do
+  package_type=$(jq -r .package_type <<<"$package")
+  package_name=$(jq -r .name <<<"$package")
+  encoded_package_name=$(jq -nr --arg value "$package_name" '$value | @uri')
+  package_versions="$workdir/package-versions-$(jq -nr --arg value "$package_type/$package_name" '$value | @uri').json"
+  fetch_array "$package_versions" \
+    "orgs/$owner/packages/$package_type/$encoded_package_name/versions?per_page=100"
+  jq --argjson package "$package" --slurpfile versions "$package_versions" \
+    '. + [$package + {versions: $versions[0]}]' \
+    "$workdir/surfaces/packages.json" >"$workdir/surfaces/packages.next.json"
+  mv "$workdir/surfaces/packages.next.json" "$workdir/surfaces/packages.json"
+done < <(jq -c '.[]' "$workdir/linked-packages.json")
 
 jq '{has_wiki,has_pages,has_discussions,has_projects}' "$workdir/repository.json" \
   >"$workdir/surfaces/repository-features.json"
@@ -178,8 +373,8 @@ fi
 printf '[]\n' >"$workdir/wiki-findings.json"
 if [[ -s $workdir/surfaces/wiki-refs.txt ]]; then
   git clone --quiet --mirror "https://github.com/$repository.wiki.git" "$workdir/wiki.git"
-  gitleaks git --no-banner --redact=100 --log-level error --log-opts='--all' \
-    --report-format json --report-path "$workdir/wiki-findings.json" "$workdir/wiki.git"
+  run_gitleaks_scan "$workdir/wiki-findings.json" \
+    git --no-banner --redact=100 --log-level error --log-opts='--all' "$workdir/wiki.git"
 fi
 if jq -e '.has_pages == true' "$workdir/repository.json" >/dev/null; then
   gh api "repos/$repository/pages" >"$workdir/surfaces/pages.json"
@@ -193,17 +388,19 @@ while IFS= read -r run_id; do
 done < <(jq -r '.[] | select(.status == "completed") | .id' "$workdir/surfaces/actions-runs.json")
 
 while IFS= read -r artifact_id; do
+  artifact_file="$workdir/artifact-downloads/$artifact_id"
   gh api "repos/$repository/actions/artifacts/$artifact_id/zip" \
-    >"$workdir/artifacts/$artifact_id.zip"
-  unzip -qq "$workdir/artifacts/$artifact_id.zip" -d "$workdir/artifacts/$artifact_id"
+    >"$artifact_file"
+  extract_artifact "$artifact_file" "$workdir/artifacts/$artifact_id"
 done < <(jq -r '.[] | select(.expired == false) | .id' "$workdir/surfaces/actions-artifacts.json")
 
-gitleaks dir --no-banner --redact=100 --log-level error \
-  --report-format json --report-path "$workdir/surface-findings.json" "$workdir/surfaces"
-gitleaks dir --no-banner --redact=100 --log-level error \
-  --report-format json --report-path "$workdir/actions-findings.json" "$workdir/logs"
-gitleaks dir --no-banner --redact=100 --log-level error \
-  --report-format json --report-path "$workdir/artifact-findings.json" "$workdir/artifacts"
+run_gitleaks_scan "$workdir/surface-findings.json" \
+  dir --no-banner --redact=100 --log-level error "$workdir/surfaces"
+run_gitleaks_scan "$workdir/actions-findings.json" \
+  dir --no-banner --redact=100 --log-level error "$workdir/logs"
+run_gitleaks_scan "$workdir/artifact-findings.json" \
+  dir --no-banner --redact=100 --log-level error \
+  --config "$workdir/artifact-gitleaks.toml" "$workdir/artifacts"
 
 fetch_array "$workdir/collaborators.json" \
   "repos/$repository/collaborators?affiliation=all&per_page=100"
@@ -341,9 +538,6 @@ surfaces["repository_features"] = {
     "sha256": digest(features_path),
     "updated_at_max": None,
 }
-if surfaces["packages"]["count"]:
-    surfaces["packages"]["status"] = "requires_manual_review"
-
 surface_manifest = json.dumps(surfaces, sort_keys=True, separators=(",", ":")).encode()
 active_writers = json.loads((root / "active-writers.json").read_text())
 actions_permissions = json.loads((root / "actions-permissions.json").read_text())
