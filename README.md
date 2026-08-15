@@ -50,13 +50,13 @@ The Make targets pass every value to the Dockerfile as an explicit build arg.
 ```bash
 # Build and load the host architecture for local verification.
 make image \
-  IMAGE=docker.io/jskorlol/multica-runtime-controller:dev \
+  IMAGE=ghcr.io/korioinc/multica-runtime-controller:dev \
   VERSION=dev
 
 # Break-glass image build. This does not create an official GitHub Release and
-# cannot replace an immutable stable Docker tag.
+# cannot replace the digest-bound release workflow.
 make image-push \
-  IMAGE=docker.io/jskorlol/multica-runtime-controller:recovery-<revision> \
+  IMAGE=ghcr.io/korioinc/multica-runtime-controller:recovery-<revision> \
   VERSION=<version> \
   COMMIT=<full-40-character-revision>
 ```
@@ -85,24 +85,33 @@ Three workflows own delivery:
 - `Release` runs when `VERSION` changes on `main`. Manual recovery requires the
   exact stable version and the original full 40-character revision.
 
-Privileged credentials have separate owners. The `automation` Environment has
-the `AUTOMATION_APP_ID` variable and `AUTOMATION_APP_PRIVATE_KEY` secret. The
-`release` Environment has `DOCKERHUB_USERNAME=jskorlol` and the
-`DOCKERHUB_TOKEN` secret. Both Environments allow exactly the `main` branch.
-The App is installed only on this repository with Contents and Pull Requests
-read/write permissions and has no ruleset, workflow, or administration access.
-The Docker Hub token is Read & Write without Delete permission and expires
-within 90 days. Secret values must be entered through GitHub's secret UI or an
+The only long-lived privileged credential is owned by the `automation`
+Environment: variable `AUTOMATION_APP_ID` and secret
+`AUTOMATION_APP_PRIVATE_KEY`. That Environment allows exactly the `main`
+branch. The App is installed only on this repository with Contents and Pull
+Requests read/write permissions and has no ruleset, workflow, package, or
+administration access. Release jobs publish to
+`ghcr.io/korioinc/multica-runtime-controller` with the ephemeral,
+repository-scoped `GITHUB_TOKEN`; no registry PAT or repository secret is
+required. Secret values must be entered through GitHub's secret UI or an
 interactive non-logging command and must never be placed in source, shell
 history, workflow inputs, build arguments, artifacts, or cache keys.
 
-Stable Docker tags match `^[0-9]+\.[0-9]+\.[0-9]+$` and are immutable;
-`latest` remains mutable. The GitHub `v*` tag ruleset denies update and deletion
-without bypass actors. A release rerun reconciles
-`absent → candidate_verified → release_verified → latest_digest_matched` and
-continues only the earliest incomplete step. A different revision or digest is
-a terminal conflict and requires a higher patch release; published stable
-objects are never overwritten or deleted.
+The first GHCR candidate is private by default. Before a GitHub Release can be
+created, an organization owner must make the linked
+`multica-runtime-controller` package public once in Package settings; this
+visibility change is irreversible. Rerun the same version and exact revision
+afterward. The OCI source label links the package to this repository, and the
+workflow verifies public visibility before finalizing the release.
+
+Stable image tags match `^[0-9]+\.[0-9]+\.[0-9]+$`; automation never overwrites
+them, while `latest` remains mutable. Because GHCR does not provide a stable-tag
+immutability control, the recorded manifest digest is authoritative. The
+GitHub `v*` tag ruleset denies update and deletion without bypass actors. A
+release rerun reconciles
+`absent → candidate_private → candidate_verified → release_verified → latest_digest_matched`
+and continues only the earliest incomplete step. A different revision, source,
+or digest is a terminal conflict and requires a higher patch release.
 
 GitHub's scheduled workflows are a polling cadence, not a four-hour SLA: runs
 can be delayed, and a public repository schedule can be disabled after 60 days
@@ -228,13 +237,13 @@ multica:
 
 controller:
   image:
-    reference: docker.io/jskorlol/multica-runtime-controller@sha256:<runtime-image-digest>
+    reference: ghcr.io/korioinc/multica-runtime-controller@sha256:<runtime-image-digest>
     pullPolicy: IfNotPresent
 
 runtime:
   name: runtime-controller
   image:
-    reference: docker.io/jskorlol/multica-runtime-controller@sha256:<runtime-image-digest>
+    reference: ghcr.io/korioinc/multica-runtime-controller@sha256:<runtime-image-digest>
     pullPolicy: IfNotPresent
   capacity: 20
   taskDeadline: 6h

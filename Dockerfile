@@ -178,6 +178,7 @@ ARG COPILOT_VERSION
 ARG PI_VERSION
 ARG ANTIGRAVITY_VERSION
 LABEL org.opencontainers.image.title="Multica Runtime Controller" \
+      org.opencontainers.image.source="https://github.com/korioinc/multica-runtime-controller" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${COMMIT}" \
       io.multica.cli-version="${MULTICA_CLI_VERSION}" \

@@ -8,6 +8,7 @@ owner logic runs locally and on a stock GitHub-hosted runner.
 from __future__ import annotations
 
 import argparse
+import base64
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 import hashlib
@@ -26,7 +27,9 @@ from urllib import request as urlrequest
 
 
 REPOSITORY = "korioinc/multica-runtime-controller"
-DOCKER_REPOSITORY = "jskorlol/multica-runtime-controller"
+IMAGE_REPOSITORY = REPOSITORY
+IMAGE_REFERENCE = f"ghcr.io/{IMAGE_REPOSITORY}"
+IMAGE_SOURCE = f"https://github.com/{REPOSITORY}"
 ENV_PATH = Path("build/runtime-versions.env")
 VERSION_PATH = Path("VERSION")
 REQUESTED_FIELDS = (
@@ -48,7 +51,7 @@ SEMVER_PATTERN = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)
 REVISION_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 DIGEST_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 ASSIGNMENT_PATTERN = re.compile(r"^([A-Z][A-Z0-9_]*)=(.*)$")
-DOCKER_STABLE_TAG_PATTERN = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
+REGISTRY_STABLE_TAG_PATTERN = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
 ACTION_USES_PATTERN = re.compile(r"^\s*uses:\s*([^\s#]+)(?:\s+#\s*(\S.*))?$")
 
 
@@ -417,9 +420,9 @@ def _stable_versions(surfaces: Mapping[str, Any]) -> list[SemVer]:
             candidate = raw[1:] if raw.startswith("v") else raw
             if SEMVER_PATTERN.fullmatch(candidate):
                 values.append(SemVer.parse(candidate))
-    for raw in surfaces.get("docker_tags", []):
+    for raw in surfaces.get("registry_tags", []):
         name = raw.get("name") if isinstance(raw, dict) else raw
-        if isinstance(name, str) and DOCKER_STABLE_TAG_PATTERN.fullmatch(name):
+        if isinstance(name, str) and REGISTRY_STABLE_TAG_PATTERN.fullmatch(name):
             values.append(SemVer.parse(name))
     return values
 
@@ -454,12 +457,26 @@ def plan_release_state(
         raise ReleaseConflict("candidate_schema")
     if image.get("revision") != revision or image.get("version") != str(parsed_version):
         raise ReleaseConflict("candidate_identity_mismatch")
+    if image.get("source") != IMAGE_SOURCE:
+        raise ReleaseConflict("candidate_source_mismatch")
     digest = image.get("digest")
     if not isinstance(digest, str) or not DIGEST_PATTERN.fullmatch(digest):
         raise ReleaseConflict("candidate_digest_invalid")
     platforms = set(image.get("platforms", []))
     if platforms != {"linux/amd64", "linux/arm64"}:
         raise ReleaseConflict("candidate_platform_mismatch")
+    package = surfaces.get("package")
+    if isinstance(package, dict) and (
+        package.get("name") != "multica-runtime-controller"
+        or package.get("package_type") != "container"
+    ):
+        raise ReleaseConflict("package_identity_mismatch")
+    if not isinstance(package, dict) or package.get("visibility") != "public":
+        return {
+            "state": "candidate_private",
+            "next_action": "publish_package_visibility",
+            "digest": digest,
+        }
     if tag is not None:
         _check_revision(tag, revision, "tag")
     if release is None:
@@ -558,46 +575,84 @@ def _github_paginated_releases() -> list[dict[str, Any]]:
         page += 1
 
 
-def _docker_hub_tags() -> list[str]:
-    url: str | None = (
-        f"https://hub.docker.com/v2/repositories/{DOCKER_REPOSITORY}/tags?page_size=100"
+def _github_package() -> dict[str, Any] | None:
+    url = (
+        "https://api.github.com/orgs/korioinc/packages/container/"
+        "multica-runtime-controller"
     )
+    try:
+        payload = _http_json(url, source="github_package")
+    except urlerror.HTTPError as exc:
+        if exc.code == 404:
+            exc.close()
+            return None
+        raise
+    if not isinstance(payload, dict):
+        raise ReleaseConflict("github_package_schema")
+    return payload
+
+
+def _ghcr_tags() -> list[str]:
+    path = "tags/list?n=100"
     tags: list[str] = []
-    while url:
-        payload = _http_json(url, source="docker_tags")
+    cursors: set[str] = set()
+    while path:
+        try:
+            raw, _ = _registry_request(path, accept="application/json")
+        except urlerror.HTTPError as exc:
+            if exc.code == 404:
+                exc.close()
+                return []
+            raise
+        payload = json.loads(raw)
         if not isinstance(payload, dict):
-            raise ReleaseConflict("docker_tag_schema")
-        results = payload.get("results")
-        if not isinstance(results, list):
-            raise ReleaseConflict("docker_tag_schema")
-        tags.extend(result["name"] for result in results if isinstance(result.get("name"), str))
-        next_url = payload.get("next")
-        url = next_url if isinstance(next_url, str) and next_url else None
+            raise ReleaseConflict("ghcr_tag_schema")
+        page = payload.get("tags")
+        if page is None:
+            page = []
+        if not isinstance(page, list) or not all(isinstance(tag, str) for tag in page):
+            raise ReleaseConflict("ghcr_tag_schema")
+        tags.extend(page)
+        if len(page) < 100:
+            break
+        cursor = page[-1]
+        if cursor in cursors:
+            raise ReleaseConflict("ghcr_tag_pagination_stalled")
+        cursors.add(cursor)
+        path = f"tags/list?n=100&last={urlparse.quote(cursor, safe='')}"
     return tags
 
 
 def _registry_request(path: str, *, accept: str | None = None) -> tuple[bytes, Mapping[str, str]]:
     token_url = (
-        "https://auth.docker.io/token?service=registry.docker.io&scope="
-        + urlparse.quote(f"repository:{DOCKER_REPOSITORY}:pull", safe=":")
+        "https://ghcr.io/token?service=ghcr.io&scope="
+        + urlparse.quote(f"repository:{IMAGE_REPOSITORY}:pull", safe=":")
     )
-    token_payload = _http_json(token_url, source="docker_registry_token")
+    token_headers = {"Accept": "application/json", "User-Agent": "multica-release-verifier/1"}
+    actor = os.environ.get("GITHUB_ACTOR")
+    github_token = os.environ.get("GH_TOKEN")
+    if actor and github_token:
+        credentials = base64.b64encode(f"{actor}:{github_token}".encode()).decode("ascii")
+        token_headers["Authorization"] = f"Basic {credentials}"
+    token_request = urlrequest.Request(token_url, headers=token_headers)
+    with urlrequest.urlopen(token_request, timeout=30) as response:
+        token_payload = json.loads(response.read())
     if not isinstance(token_payload, dict):
-        raise ReleaseConflict("docker_registry_token_schema")
+        raise ReleaseConflict("ghcr_registry_token_schema")
     token = token_payload.get("token")
     if not isinstance(token, str):
-        raise ReleaseConflict("docker_registry_token_schema")
+        raise ReleaseConflict("ghcr_registry_token_schema")
     headers = {"Authorization": f"Bearer {token}", "User-Agent": "multica-release-verifier/1"}
     if accept:
         headers["Accept"] = accept
     request = urlrequest.Request(
-        f"https://registry-1.docker.io/v2/{DOCKER_REPOSITORY}/{path}", headers=headers
+        f"https://ghcr.io/v2/{IMAGE_REPOSITORY}/{path}", headers=headers
     )
     with urlrequest.urlopen(request, timeout=30) as response:
         return response.read(), dict(response.headers.items())
 
 
-def _docker_image(tag: str) -> dict[str, Any] | None:
+def _registry_image(tag: str) -> dict[str, Any] | None:
     accepts = ", ".join(
         (
             "application/vnd.oci.image.index.v1+json",
@@ -610,6 +665,7 @@ def _docker_image(tag: str) -> dict[str, Any] | None:
         raw, headers = _registry_request(f"manifests/{tag}", accept=accepts)
     except urlerror.HTTPError as exc:
         if exc.code == 404:
+            exc.close()
             return None
         raise
     payload = json.loads(raw)
@@ -622,6 +678,7 @@ def _docker_image(tag: str) -> dict[str, Any] | None:
     platforms: set[str] = set()
     revisions: set[str] = set()
     versions: set[str] = set()
+    sources: set[str] = set()
     for descriptor in descriptors:
         platform = descriptor.get("platform", {})
         architecture = platform.get("architecture")
@@ -630,26 +687,30 @@ def _docker_image(tag: str) -> dict[str, Any] | None:
             platforms.add(f"{operating_system}/{architecture}")
         descriptor_digest = descriptor.get("digest")
         if not isinstance(descriptor_digest, str):
-            raise ReleaseConflict("docker_descriptor_digest_missing")
+            raise ReleaseConflict("registry_descriptor_digest_missing")
         manifest_raw, _ = _registry_request(f"manifests/{descriptor_digest}", accept=accepts)
         manifest = json.loads(manifest_raw)
         config_digest = manifest.get("config", {}).get("digest")
         if not isinstance(config_digest, str):
-            raise ReleaseConflict("docker_config_digest_missing")
+            raise ReleaseConflict("registry_config_digest_missing")
         config_raw, _ = _registry_request(f"blobs/{config_digest}")
         config = json.loads(config_raw)
         labels = config.get("config", {}).get("Labels") or {}
         revision = labels.get("org.opencontainers.image.revision")
         version = labels.get("org.opencontainers.image.version")
+        source = labels.get("org.opencontainers.image.source")
         if isinstance(revision, str):
             revisions.add(revision)
         if isinstance(version, str):
             versions.add(version)
+        if isinstance(source, str):
+            sources.add(source)
     return {
         "digest": digest,
         "revision": next(iter(revisions)) if len(revisions) == 1 else None,
         "version": next(iter(versions)) if len(versions) == 1 else None,
         "platforms": sorted(platforms),
+        "source": next(iter(sources)) if len(sources) == 1 else None,
     }
 
 
@@ -664,9 +725,17 @@ def live_release_surfaces(version: str) -> dict[str, Any]:
     git_tags = _run("git", "tag", "--list").stdout.splitlines()
     releases_payload = _github_paginated_releases()
     release_tags = [release.get("tag_name") for release in releases_payload]
-    docker_tags = _docker_hub_tags()
-    version_image = _docker_image(version) if version in docker_tags else None
-    latest_image = _docker_image("latest") if "latest" in docker_tags else None
+    package_payload = _github_package()
+    package = None
+    if isinstance(package_payload, dict):
+        package = {
+            "name": package_payload.get("name"),
+            "package_type": package_payload.get("package_type"),
+            "visibility": package_payload.get("visibility"),
+        }
+    registry_tags = _ghcr_tags() if package is not None else []
+    version_image = _registry_image(version) if version in registry_tags else None
+    latest_image = _registry_image("latest") if "latest" in registry_tags else None
     tag_name = f"v{version}"
     tag_revision_result = _run("git", "rev-list", "-n", "1", tag_name, check=False)
     tag_object = None
@@ -683,7 +752,8 @@ def live_release_surfaces(version: str) -> dict[str, Any]:
     return {
         "git_tags": git_tags,
         "github_releases": [{"tag_name": tag} for tag in release_tags if isinstance(tag, str)],
-        "docker_tags": docker_tags,
+        "registry_tags": registry_tags,
+        "package": package,
         "version_image": version_image,
         "git_tag": tag_object,
         "github_release": release_object,
@@ -699,6 +769,8 @@ def validate_actions(directory: Path) -> dict[str, Any]:
     checkout_count = 0
     for path in workflows:
         text = path.read_text(encoding="utf-8")
+        if re.search(r"DOCKERHUB_|docker\.io/jskorlol/multica-runtime-controller", text):
+            raise ResolverError(f"legacy_registry_reference file={path}")
         if not re.search(r"(?m)^permissions:\s*\{\}\s*$", text):
             raise ResolverError(f"workflow_top_permissions_not_empty file={path}")
         if re.search(r"(?m)^\s*pull_request_target\s*:", text):
@@ -746,10 +818,8 @@ def validate_actions(directory: Path) -> dict[str, Any]:
             job_name = job_match.group(1)
             if not re.search(r"(?m)^    permissions:\s*$", block):
                 raise ResolverError(f"job_permissions_missing file={path} job={job_name}")
-            if "AUTOMATION_APP_PRIVATE_KEY" in block and "DOCKERHUB_TOKEN" in block:
-                raise ResolverError(
-                    f"job_combines_external_credentials file={path} job={job_name}"
-                )
+            if "AUTOMATION_APP_PRIVATE_KEY" in block and "packages: write" in block:
+                raise ResolverError(f"job_combines_write_credentials file={path} job={job_name}")
         if re.search(r"(?m)^  pull_request:\s*$", text):
             if "secrets." in text or re.search(r"(?m)^\s+environment:\s*", text):
                 raise ResolverError(f"pull_request_workflow_is_privileged file={path}")

@@ -7,7 +7,12 @@
       "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
     }
   ],
-  "docker_tags": ["0.3.13"],
+  "registry_tags": ["0.3.13"],
+  "package": {
+    "name": "multica-runtime-controller",
+    "package_type": "container",
+    "visibility": "public"
+  },
   "version_image": null,
   "git_tag": null,
   "github_release": null,

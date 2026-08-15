@@ -179,7 +179,12 @@ class ReleaseStateMachineTests(unittest.TestCase):
         return {
             "git_tags": ["v0.3.13"],
             "github_releases": [],
-            "docker_tags": ["0.3.13"],
+            "registry_tags": ["0.3.13"],
+            "package": {
+                "name": "multica-runtime-controller",
+                "package_type": "container",
+                "visibility": "public",
+            },
             "version_image": None,
             "git_tag": None,
             "github_release": None,
@@ -192,6 +197,7 @@ class ReleaseStateMachineTests(unittest.TestCase):
             "version": "0.3.15",
             "digest": self.digest,
             "platforms": ["linux/amd64", "linux/arm64"],
+            "source": "https://github.com/korioinc/multica-runtime-controller",
         }
 
     def release(self) -> dict:
@@ -203,7 +209,30 @@ class ReleaseStateMachineTests(unittest.TestCase):
             runtime_versions.plan_release_state(absent, "0.3.15", self.revision),
             {"state": "absent", "next_action": "build_candidate"},
         )
-        candidate = self.base() | {"version_image": self.image(), "docker_tags": ["0.3.13", "0.3.15"]}
+        private_candidate = self.base() | {
+            "version_image": self.image(),
+            "registry_tags": ["0.3.13", "0.3.15"],
+            "package": {
+                "name": "multica-runtime-controller",
+                "package_type": "container",
+                "visibility": "private",
+            },
+        }
+        self.assertEqual(
+            runtime_versions.plan_release_state(private_candidate, "0.3.15", self.revision),
+            {
+                "state": "candidate_private",
+                "next_action": "publish_package_visibility",
+                "digest": self.digest,
+            },
+        )
+        candidate = private_candidate | {
+            "package": {
+                "name": "multica-runtime-controller",
+                "package_type": "container",
+                "visibility": "public",
+            }
+        }
         self.assertEqual(
             runtime_versions.plan_release_state(candidate, "0.3.15", self.revision),
             {"state": "candidate_verified", "next_action": "finalize_release", "digest": self.digest},
@@ -229,10 +258,29 @@ class ReleaseStateMachineTests(unittest.TestCase):
 
         mismatched = self.base() | {
             "version_image": self.image() | {"revision": "c" * 40},
-            "docker_tags": ["0.3.13", "0.3.15"],
+            "registry_tags": ["0.3.13", "0.3.15"],
         }
         with self.assertRaisesRegex(runtime_versions.ReleaseConflict, "candidate_identity_mismatch"):
             runtime_versions.plan_release_state(mismatched, "0.3.15", self.revision)
+
+        wrong_source = self.base() | {
+            "version_image": self.image() | {"source": "https://github.com/other/repository"},
+            "registry_tags": ["0.3.13", "0.3.15"],
+        }
+        with self.assertRaisesRegex(runtime_versions.ReleaseConflict, "candidate_source_mismatch"):
+            runtime_versions.plan_release_state(wrong_source, "0.3.15", self.revision)
+
+        wrong_package = self.base() | {
+            "version_image": self.image(),
+            "registry_tags": ["0.3.13", "0.3.15"],
+            "package": {
+                "name": "other-package",
+                "package_type": "container",
+                "visibility": "public",
+            },
+        }
+        with self.assertRaisesRegex(runtime_versions.ReleaseConflict, "package_identity_mismatch"):
+            runtime_versions.plan_release_state(wrong_package, "0.3.15", self.revision)
 
     def test_preflight_modes_are_mutually_exclusive_and_identity_bound(self) -> None:
         surfaces = self.base()
@@ -241,7 +289,7 @@ class ReleaseStateMachineTests(unittest.TestCase):
         )
         candidate = surfaces | {
             "version_image": self.image(),
-            "docker_tags": ["0.3.13", "0.3.15"],
+            "registry_tags": ["0.3.13", "0.3.15"],
         }
         runtime_versions.preflight_release(
             candidate, "0.3.15", self.revision, require_absent=False, allow_same_identity=True
@@ -276,6 +324,98 @@ class ReleaseStateMachineTests(unittest.TestCase):
             [call.args[0] for call in github_json.call_args_list],
             ["releases?per_page=100&page=1", "releases?per_page=100&page=2"],
         )
+
+    def test_github_package_inventory_uses_the_organization_packages_endpoint(self) -> None:
+        package = {
+            "name": "multica-runtime-controller",
+            "package_type": "container",
+            "visibility": "public",
+        }
+
+        with mock.patch(
+            "scripts.runtime_versions._http_json", return_value=package
+        ) as http_json:
+            result = runtime_versions._github_package()
+
+        self.assertEqual(result, package)
+        http_json.assert_called_once_with(
+            "https://api.github.com/orgs/korioinc/packages/container/"
+            "multica-runtime-controller",
+            source="github_package",
+        )
+
+    def test_ghcr_tag_inventory_reads_every_page(self) -> None:
+        first = [f"0.3.{index}" for index in range(100)]
+        final = ["1.0.0"]
+
+        with mock.patch(
+            "scripts.runtime_versions._registry_request",
+            side_effect=[
+                (json.dumps({"name": runtime_versions.IMAGE_REPOSITORY, "tags": first}).encode(), {}),
+                (json.dumps({"name": runtime_versions.IMAGE_REPOSITORY, "tags": final}).encode(), {}),
+            ],
+        ) as registry_request:
+            tags = runtime_versions._ghcr_tags()
+
+        self.assertEqual(tags, first + final)
+        self.assertEqual(
+            [call.args[0] for call in registry_request.call_args_list],
+            ["tags/list?n=100", "tags/list?n=100&last=0.3.99"],
+        )
+
+    def test_ghcr_registry_uses_ephemeral_github_credentials(self) -> None:
+        token_response = mock.MagicMock()
+        token_response.__enter__.return_value.read.return_value = b'{"token":"registry-token"}'
+        registry_response = mock.MagicMock()
+        registry_response.__enter__.return_value.read.return_value = b'{"tags":[]}'
+        registry_response.__enter__.return_value.headers.items.return_value = []
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"GITHUB_ACTOR": "release-actor", "GH_TOKEN": "ephemeral-token"},
+                clear=False,
+            ),
+            mock.patch(
+                "scripts.runtime_versions.urlrequest.urlopen",
+                side_effect=[token_response, registry_response],
+            ) as urlopen,
+        ):
+            raw, _ = runtime_versions._registry_request("tags/list?n=100")
+
+        token_request = urlopen.call_args_list[0].args[0]
+        registry_request = urlopen.call_args_list[1].args[0]
+        self.assertEqual(raw, b'{"tags":[]}')
+        self.assertEqual(
+            token_request.full_url,
+            "https://ghcr.io/token?service=ghcr.io&scope="
+            "repository:korioinc%2Fmultica-runtime-controller:pull",
+        )
+        self.assertEqual(
+            token_request.get_header("Authorization"),
+            "Basic cmVsZWFzZS1hY3RvcjplcGhlbWVyYWwtdG9rZW4=",
+        )
+        self.assertEqual(
+            registry_request.full_url,
+            "https://ghcr.io/v2/korioinc/multica-runtime-controller/tags/list?n=100",
+        )
+        self.assertEqual(registry_request.get_header("Authorization"), "Bearer registry-token")
+
+    def test_live_inventory_skips_ghcr_until_the_package_exists(self) -> None:
+        command_result = mock.MagicMock(stdout="", returncode=1)
+        with (
+            mock.patch("scripts.runtime_versions._run", return_value=command_result),
+            mock.patch("scripts.runtime_versions._github_paginated_releases", return_value=[]),
+            mock.patch("scripts.runtime_versions._github_package", return_value=None),
+            mock.patch("scripts.runtime_versions._github_json", return_value=None),
+            mock.patch("scripts.runtime_versions._ghcr_tags") as ghcr_tags,
+        ):
+            surfaces = runtime_versions.live_release_surfaces("0.3.15")
+
+        ghcr_tags.assert_not_called()
+        self.assertIsNone(surfaces["package"])
+        self.assertEqual(surfaces["registry_tags"], [])
+        self.assertIsNone(surfaces["version_image"])
 
 
 if __name__ == "__main__":
