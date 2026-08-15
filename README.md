@@ -41,8 +41,11 @@ Controller and task Pods use the same immutable image digest. The image contains
 The image never compiles Multica from a local source checkout.
 
 Pinned runtime, extension, cloud CLI, Multica, and provider versions live in
-`build/runtime-versions.env`. Update that one file when bumping the toolchain;
-the Make targets pass every value to the Dockerfile as an explicit build arg.
+`build/runtime-versions.env`. The root `VERSION` file owns the controller
+release version. A reviewed manual toolchain change updates both files in one
+commit; the four-hour automation changes only `MULTICA_CLI_VERSION`,
+`CODEX_VERSION`, and `PI_VERSION`, and increments the `VERSION` patch once.
+The Make targets pass every value to the Dockerfile as an explicit build arg.
 
 ```bash
 # Build and load the host architecture for local verification.
@@ -50,13 +53,63 @@ make image \
   IMAGE=docker.io/jskorlol/multica-runtime-controller:dev \
   VERSION=dev
 
-# Publish the amd64/arm64 image after verification.
+# Break-glass image build. This does not create an official GitHub Release and
+# cannot replace an immutable stable Docker tag.
 make image-push \
-  IMAGE=docker.io/jskorlol/multica-runtime-controller:{version} \
-  VERSION={version}
+  IMAGE=docker.io/jskorlol/multica-runtime-controller:recovery-<revision> \
+  VERSION=<version> \
+  COMMIT=<full-40-character-revision>
 ```
 
-After publishing, configure both `controller.image.reference` and `runtime.image.reference` with the resulting multi-platform digest.
+Official stable publication is owned by the `Release` GitHub Actions workflow.
+It builds and verifies the immutable amd64/arm64 version image, creates the
+same-revision GitHub Release, and only then promotes that digest to `latest`.
+After publication, configure both `controller.image.reference` and
+`runtime.image.reference` with the recorded multi-platform digest.
+
+## Public Repository and Release Automation
+
+The repository is public source. No open-source license grant is implied until
+a `LICENSE` file is added by the repository owner. Report vulnerabilities only
+through the private process in [SECURITY.md](SECURITY.md), never in public
+issues, pull requests, logs, or artifacts.
+
+Three workflows own delivery:
+
+- `CI` is read-only and secret-free. `CI / verify` and `CI / runtime-image` are
+  required for every pull request.
+- `Runtime Version Update` runs at minute 0 every four hours UTC and can also
+  be dispatched manually. It reads only the fixed official Multica, Codex, and
+  Pi sources, maintains one `automation/runtime-versions` pull request, and
+  requests native squash auto-merge after both required checks pass.
+- `Release` runs when `VERSION` changes on `main`. Manual recovery requires the
+  exact stable version and the original full 40-character revision.
+
+Privileged credentials have separate owners. The `automation` Environment has
+the `AUTOMATION_APP_ID` variable and `AUTOMATION_APP_PRIVATE_KEY` secret. The
+`release` Environment has `DOCKERHUB_USERNAME=jskorlol` and the
+`DOCKERHUB_TOKEN` secret. Both Environments allow exactly the `main` branch.
+The App is installed only on this repository with Contents and Pull Requests
+read/write permissions and has no ruleset, workflow, or administration access.
+The Docker Hub token is Read & Write without Delete permission and expires
+within 90 days. Secret values must be entered through GitHub's secret UI or an
+interactive non-logging command and must never be placed in source, shell
+history, workflow inputs, build arguments, artifacts, or cache keys.
+
+Stable Docker tags match `^[0-9]+\.[0-9]+\.[0-9]+$` and are immutable;
+`latest` remains mutable. The GitHub `v*` tag ruleset denies update and deletion
+without bypass actors. A release rerun reconciles
+`absent → candidate_verified → release_verified → latest_digest_matched` and
+continues only the earliest incomplete step. A different revision or digest is
+a terminal conflict and requires a higher patch release; published stable
+objects are never overwritten or deleted.
+
+GitHub's scheduled workflows are a polling cadence, not a four-hour SLA: runs
+can be delayed, and a public repository schedule can be disabled after 60 days
+without repository activity. Treat a last successful updater run older than
+eight hours as an operational alert, re-enable the workflow if needed, and use
+manual dispatch to reconcile it. Kubernetes/Helm deployment remains a separate
+operation and is not performed by either automation workflow.
 
 ## Mount Runtime Configuration
 

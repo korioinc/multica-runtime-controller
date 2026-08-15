@@ -1,0 +1,15 @@
+{
+  "git_tags": ["v0.3.13"],
+  "github_releases": [
+    {
+      "tag_name": "v0.3.13",
+      "revision": "1111111111111111111111111111111111111111",
+      "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    }
+  ],
+  "docker_tags": ["0.3.13"],
+  "version_image": null,
+  "git_tag": null,
+  "github_release": null,
+  "latest": null
+}

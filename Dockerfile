@@ -54,12 +54,19 @@ RUN /usr/local/sbin/install-runtime-tools \
  && corepack --version | grep --fixed-strings "${COREPACK_VERSION}" \
  && npm cache clean --force
 RUN install -d /opt/codebase-memory-mcp-install/home \
- && curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh \
-      | HOME=/opt/codebase-memory-mcp-install/home \
-        bash -s -- --dir=/opt/codebase-memory-mcp-install --skip-config \
+ && curl -fsSL \
+      -o /tmp/codebase-memory-mcp-install.sh \
+      https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/c0bd4bbf8dace58cffdb24fad86d95e325df99f4/install.sh \
+ && printf '%s  %s\n' \
+      2fdd4d6563fc8e540bb32e233c5fdef22ecf05d7ebd5a80657cd4fec953b3475 \
+      /tmp/codebase-memory-mcp-install.sh \
+      | sha256sum --check --strict \
+ && HOME=/opt/codebase-memory-mcp-install/home \
+      bash /tmp/codebase-memory-mcp-install.sh \
+        --dir=/opt/codebase-memory-mcp-install --skip-config \
  && install -m 0555 /opt/codebase-memory-mcp-install/codebase-memory-mcp \
       /usr/local/bin/codebase-memory-mcp \
- && rm -rf /opt/codebase-memory-mcp-install \
+ && rm -rf /opt/codebase-memory-mcp-install /tmp/codebase-memory-mcp-install.sh \
  && install -d -o 65532 -g 65532 -m 0700 /home/multica/.cache/codebase-memory-mcp \
  && runuser --user multica -- env \
       CBM_CACHE_DIR=/home/multica/.cache/codebase-memory-mcp \
@@ -95,11 +102,17 @@ RUN case "${TARGETARCH}" in \
       amd64|arm64) ;; \
       *) echo "unsupported Multica CLI architecture: ${TARGETARCH}" >&2; exit 1 ;; \
     esac \
+ && archive="multica-cli-${MULTICA_CLI_VERSION}-linux-${TARGETARCH}.tar.gz" \
+ && release_url="https://github.com/multica-ai/multica/releases/download/v${MULTICA_CLI_VERSION}" \
  && curl --fail --location --silent --show-error \
-      --output /tmp/multica.tar.gz \
-      "https://github.com/multica-ai/multica/releases/download/v${MULTICA_CLI_VERSION}/multica-cli-${MULTICA_CLI_VERSION}-linux-${TARGETARCH}.tar.gz" \
+      --output "/tmp/${archive}" "${release_url}/${archive}" \
+ && curl --fail --location --silent --show-error \
+      --output /tmp/checksums.txt "${release_url}/checksums.txt" \
+ && cd /tmp \
+ && grep --fixed-strings "  ${archive}" /tmp/checksums.txt \
+      | sha256sum --check --strict \
  && mkdir -p /out \
- && tar -xzf /tmp/multica.tar.gz -C /out multica \
+ && tar -xzf "/tmp/${archive}" -C /out multica \
  && chmod 0555 /out/multica \
  && /out/multica version | grep --fixed-strings "multica ${MULTICA_CLI_VERSION}"
 

@@ -1,5 +1,7 @@
 /bin/
 /dist/
 /coverage.out
+__pycache__/
+*.py[cod]
 .DS_Store
 .idea/

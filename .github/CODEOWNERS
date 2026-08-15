@@ -1,0 +1,9 @@
+* @jskorlol
+
+/.github/ @jskorlol
+/scripts/ @jskorlol
+/Dockerfile @jskorlol
+/Makefile @jskorlol
+/VERSION @jskorlol
+/build/runtime-versions.env @jskorlol
+/SECURITY.md @jskorlol

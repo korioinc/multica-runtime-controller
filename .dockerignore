@@ -8,5 +8,6 @@
 !src/internal/**
 !scripts/
 !scripts/install-runtime-tools.sh
+!scripts/runtime-entrypoint.sh
 !scripts/verify-runtime-tools.sh
 **/*_test.go

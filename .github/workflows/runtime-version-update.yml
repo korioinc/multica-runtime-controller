@@ -1,0 +1,231 @@
+name: Runtime Version Update
+
+on:
+  schedule:
+    - cron: '0 */4 * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: runtime-version-update
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    outputs:
+      updates: ${{ steps.check.outputs.updates }}
+      has_updates: ${{ steps.check.outputs.has_updates }}
+    steps:
+      - name: Check out main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require the current release to be complete
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # jq programs and Markdown format strings are intentionally literal.
+          # shellcheck disable=SC2016
+          set -eu
+          version=$(cat VERSION)
+          revision=$(git rev-parse HEAD)
+          python3 scripts/runtime_versions.py release-preflight \
+            --version "$version" --revision "$revision" --live \
+            --allow-same-identity
+          state=$(python3 scripts/runtime_versions.py release-state \
+            --version "$version" --revision "$revision" --live \
+            --format json | jq -r .state)
+          [ "$state" = latest_digest_matched ] || {
+            printf 'current release is incomplete: %s\n' "$state" >&2
+            exit 1
+          }
+      - name: Check official stable sources
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # jq programs and Markdown format strings are intentionally literal.
+          # shellcheck disable=SC2016
+          set -eu
+          python3 scripts/runtime_versions.py check --format json >"$RUNNER_TEMP/versions.json"
+          updates=$(jq -c .updates "$RUNNER_TEMP/versions.json")
+          count=$(jq '.updates | length' "$RUNNER_TEMP/versions.json")
+          {
+            echo "updates=$updates"
+            if [ "$count" -eq 0 ]; then echo 'has_updates=false'; else echo 'has_updates=true'; fi
+          } >>"$GITHUB_OUTPUT"
+          if [ "$count" -eq 0 ]; then
+            printf "Outcome: \`up_to_date\`; updates: \`[]\`.\n" >>"$GITHUB_STEP_SUMMARY"
+          else
+            printf "Outcome: \`%s update(s)\`; details: \`%s\`.\n" \
+              "$count" "$updates" >>"$GITHUB_STEP_SUMMARY"
+          fi
+
+  propose:
+    name: propose
+    needs: resolve
+    if: needs.resolve.outputs.has_updates == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: automation
+    permissions:
+      contents: read
+    steps:
+      - name: Create repository-scoped App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.AUTOMATION_APP_ID }}
+          private-key: ${{ secrets.AUTOMATION_APP_PRIVATE_KEY }}
+          owner: korioinc
+          repositories: multica-runtime-controller
+          permission-contents: write
+          permission-pull-requests: write
+      - name: Resolve the authenticated App bot identity
+        id: bot
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+        run: |
+          set -eu
+          bot_login="${APP_SLUG}[bot]"
+          bot_id=$(gh api "/users/${APP_SLUG}%5Bbot%5D" --jq .id)
+          {
+            echo "login=$bot_login"
+            echo "email=${bot_id}+${bot_login}@users.noreply.github.com"
+          } >>"$GITHUB_OUTPUT"
+      - name: Check out latest main without persisted credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Revalidate the checked-out release boundary
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          version=$(cat VERSION)
+          revision=$(git rev-parse HEAD)
+          python3 scripts/runtime_versions.py release-preflight \
+            --version "$version" --revision "$revision" --live \
+            --allow-same-identity
+          state=$(python3 scripts/runtime_versions.py release-state \
+            --version "$version" --revision "$revision" --live \
+            --format json | jq -r .state)
+          [ "$state" = latest_digest_matched ] || {
+            printf 'checked-out release is incomplete: %s\n' "$state" >&2
+            exit 1
+          }
+      - name: Update the exact two version files
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          python3 scripts/runtime_versions.py update --write
+          python3 scripts/runtime_versions.py validate --base-ref origin/main
+          names=$(git diff --name-only origin/main -- | LC_ALL=C sort)
+          expected=$(printf '%s\n' VERSION build/runtime-versions.env | LC_ALL=C sort)
+          [ "$names" = "$expected" ] || {
+            printf 'unexpected updater diff:\n%s\n' "$names" >&2
+            exit 1
+          }
+      - name: Commit and push the bot-owned branch
+        env:
+          AUTOMATION_TOKEN: ${{ steps.app-token.outputs.token }}
+          BOT_LOGIN: ${{ steps.bot.outputs.login }}
+          BOT_EMAIL: ${{ steps.bot.outputs.email }}
+        run: |
+          set -eu
+          branch=automation/runtime-versions
+          git config user.name "$BOT_LOGIN"
+          git config user.email "$BOT_EMAIL"
+          git checkout -B "$branch"
+          git add VERSION build/runtime-versions.env
+          git commit -m 'chore: update runtime versions'
+          remote_sha=$(git ls-remote --heads origin "$branch" | awk '{print $1}')
+          if [ -n "$remote_sha" ]; then
+            existing=$(GH_TOKEN="$AUTOMATION_TOKEN" gh pr list --state open \
+              --head "$branch" --json number,author --limit 10)
+            [ "$(printf '%s' "$existing" | jq 'length')" -eq 1 ] || {
+              echo 'bot branch exists without exactly one open PR' >&2
+              exit 1
+            }
+            [ "$(printf '%s' "$existing" | jq -r '.[0].author.is_bot')" = true ] || {
+              echo 'existing updater branch is not App-owned' >&2
+              exit 1
+            }
+            remote_actor=$(GH_TOKEN="$AUTOMATION_TOKEN" \
+              gh api "repos/$GITHUB_REPOSITORY/commits/$remote_sha" \
+              --jq '[.author.login,.committer.login] | @tsv')
+            expected_actor=$(printf '%s\t%s' "$BOT_LOGIN" "$BOT_LOGIN")
+            [ "$remote_actor" = "$expected_actor" ] || {
+              echo 'existing updater branch head is not App-authored and App-committed' >&2
+              exit 1
+            }
+          fi
+          askpass=$RUNNER_TEMP/git-askpass
+          cat >"$askpass" <<'EOF'
+          #!/bin/sh
+          case "$1" in
+            *Username*) printf '%s\n' x-access-token ;;
+            *Password*) printf '%s\n' "$AUTOMATION_TOKEN" ;;
+            *) exit 1 ;;
+          esac
+          EOF
+          chmod 0700 "$askpass"
+          if [ -n "$remote_sha" ]; then
+            lease="--force-with-lease=refs/heads/$branch:$remote_sha"
+          else
+            lease="--force-with-lease=refs/heads/$branch:"
+          fi
+          GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0 \
+            git push "$lease" https://github.com/korioinc/multica-runtime-controller.git \
+              "HEAD:refs/heads/$branch"
+      - name: Create or update one PR and enable native auto-merge
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          UPDATES: ${{ needs.resolve.outputs.updates }}
+        run: |
+          # jq programs and Markdown format strings are intentionally literal.
+          # shellcheck disable=SC2016
+          set -eu
+          branch=automation/runtime-versions
+          prs=$(gh pr list --state open --head "$branch" \
+            --json number,author --limit 10)
+          count=$(printf '%s' "$prs" | jq 'length')
+          [ "$count" -le 1 ] || { echo 'duplicate updater PRs detected' >&2; exit 1; }
+          version=$(cat VERSION)
+          cat >"$RUNNER_TEMP/pr-body.md" <<EOF
+          ## Runtime version update
+
+          Automated stable-source changes: \`$UPDATES\`
+
+          Target controller release: \`$version\`
+
+          Changed files are restricted to \`VERSION\` and \`build/runtime-versions.env\`.
+          The PR must pass \`CI / verify\` and \`CI / runtime-image\`; the App has no ruleset bypass.
+          EOF
+          if [ "$count" -eq 0 ]; then
+            url=$(gh pr create --base main --head "$branch" \
+              --title "chore: release runtime $version" \
+              --body-file "$RUNNER_TEMP/pr-body.md")
+            number=${url##*/}
+          else
+            number=$(printf '%s' "$prs" | jq -r '.[0].number')
+            is_bot=$(printf '%s' "$prs" | jq -r '.[0].author.is_bot')
+            [ "$is_bot" = true ] || { echo 'existing updater PR is not App-owned' >&2; exit 1; }
+            gh pr edit "$number" --title "chore: release runtime $version" \
+              --body-file "$RUNNER_TEMP/pr-body.md"
+          fi
+          gh pr merge "$number" --auto --squash --delete-branch
+          printf "Updater PR: #%s; target release: \`%s\`.\n" \
+            "$number" "$version" >>"$GITHUB_STEP_SUMMARY"

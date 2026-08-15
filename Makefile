@@ -1,4 +1,4 @@
-.PHONY: build image image-push test test-race vet helm-lint helm-template helm-validate verify
+.PHONY: build image image-push runtime-version-test workflow-validate test test-race vet helm-lint helm-template helm-validate verify
 
 RUNTIME_VERSIONS_FILE := build/runtime-versions.env
 include $(RUNTIME_VERSIONS_FILE)
@@ -25,6 +25,11 @@ COMMIT ?= $(shell git rev-parse --short=12 HEAD)
 
 CHART := deploy/helm/multica-runtime-controller
 RENDERED := /tmp/multica-runtime-controller-rendered.yaml
+ACTIONLINT_VERSION := v1.7.12
+ACTIONLINT_WORKFLOWS := \
+	../.github/workflows/ci.yml \
+	../.github/workflows/release.yml \
+	../.github/workflows/runtime-version-update.yml
 
 build:
 	go -C $(GO_MODULE_DIR) build ./cmd/runtime ./cmd/provider-shim
@@ -47,6 +52,13 @@ image-push:
 		--tag $(IMAGE) \
 		.
 
+runtime-version-test:
+	python3 -m unittest -v scripts.tests.test_runtime_versions
+
+workflow-validate:
+	go -C $(GO_MODULE_DIR) run github.com/rhysd/actionlint/cmd/actionlint@$(ACTIONLINT_VERSION) $(ACTIONLINT_WORKFLOWS)
+	python3 scripts/runtime_versions.py validate-actions .github/workflows
+
 test:
 	go -C $(GO_MODULE_DIR) test ./...
 
@@ -65,4 +77,4 @@ helm-template:
 helm-validate: helm-template
 	go -C $(GO_MODULE_DIR) run github.com/yannh/kubeconform/cmd/kubeconform@v0.7.0 -strict -summary -kubernetes-version 1.36.0 $(RENDERED)
 
-verify: test test-race vet helm-lint helm-validate
+verify: runtime-version-test workflow-validate test test-race vet helm-lint helm-validate

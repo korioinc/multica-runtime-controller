@@ -5,20 +5,114 @@ on:
   push:
     branches: [main]
 
-permissions:
-  contents: read
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   verify:
+    name: verify
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-go@v6
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: src/go.mod
           cache: true
           cache-dependency-path: src/go.sum
-      - uses: azure/setup-helm@v4
+      - name: Set up Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:
           version: v4.2.2
-      - run: make verify
+      - name: Verify repository
+        run: make verify
+
+  runtime-image:
+    name: runtime-image
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Select image verification scope
+        id: scope
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -eu
+          if [ "$EVENT_NAME" = pull_request ]; then
+            base=$PR_BASE_SHA
+            cache_scope="runtime-pr-$PR_NUMBER"
+          else
+            base=$PUSH_BEFORE_SHA
+            cache_scope=runtime-main
+          fi
+          if [ -z "$base" ] || [ "$base" = 0000000000000000000000000000000000000000 ]; then
+            build=true
+          elif git diff --quiet "$base" HEAD -- \
+            Dockerfile .dockerignore VERSION build/runtime-versions.env scripts src; then
+            build=false
+          else
+            build=true
+          fi
+          {
+            echo "build=$build"
+            echo "cache_scope=$cache_scope"
+          } >>"$GITHUB_OUTPUT"
+          printf 'runtime image build required: %s\n' "$build" >>"$GITHUB_STEP_SUMMARY"
+      - name: Set up QEMU
+        if: steps.scope.outputs.build == 'true'
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+      - name: Set up Docker Buildx
+        if: steps.scope.outputs.build == 'true'
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - name: Resolve non-secret build arguments
+        if: steps.scope.outputs.build == 'true'
+        id: build-args
+        env:
+          REVISION: ${{ github.sha }}
+        run: |
+          set -eu
+          python3 scripts/runtime_versions.py build-args \
+            --format json --revision "$REVISION" \
+            | jq -r 'to_entries[] | "\(.key)=\(.value)"' >"$RUNNER_TEMP/build-args"
+          {
+            echo 'value<<EOF'
+            cat "$RUNNER_TEMP/build-args"
+            echo EOF
+          } >>"$GITHUB_OUTPUT"
+      - name: Build both runtime platforms without pushing
+        if: steps.scope.outputs.build == 'true'
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: false
+          build-args: ${{ steps.build-args.outputs.value }}
+          cache-from: |
+            type=gha,scope=runtime-main
+            type=gha,scope=${{ steps.scope.outputs.cache_scope }}
+          cache-to: type=gha,mode=max,scope=${{ steps.scope.outputs.cache_scope }}
+          provenance: false
+          sbom: false
+      - name: Record successful no-op
+        if: steps.scope.outputs.build != 'true'
+        run: printf '%s\n' 'No runtime image input changed; the required check is a successful no-op.' >>"$GITHUB_STEP_SUMMARY"
