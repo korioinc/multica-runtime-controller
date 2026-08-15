@@ -1,0 +1,12 @@
+**
+!src/
+!src/go.mod
+!src/go.sum
+!src/cmd/
+!src/cmd/**
+!src/internal/
+!src/internal/**
+!scripts/
+!scripts/install-runtime-tools.sh
+!scripts/verify-runtime-tools.sh
+**/*_test.go

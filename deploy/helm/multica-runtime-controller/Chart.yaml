@@ -1,0 +1,6 @@
+apiVersion: v2
+name: multica-runtime-controller
+description: Official Multica daemon with Kubernetes task Pod interception
+type: application
+version: 0.3.14
+appVersion: "0.3.13"

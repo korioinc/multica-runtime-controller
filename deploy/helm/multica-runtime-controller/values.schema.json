@@ -1,0 +1,210 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["multica", "runtime", "controller", "workspace"],
+  "$defs": {
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reference", "pullPolicy"],
+      "properties": {
+        "reference": {"type": "string", "pattern": "@sha256:[a-fA-F0-9]{64}$"},
+        "pullPolicy": {"type": "string", "enum": ["Always", "IfNotPresent", "Never"]}
+      }
+    },
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requests", "limits"],
+      "properties": {
+        "requests": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["cpu", "memory"],
+          "properties": {
+            "cpu": {"type": "string", "minLength": 1},
+            "memory": {"type": "string", "minLength": 1}
+          }
+        },
+        "limits": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["cpu", "memory"],
+          "properties": {
+            "cpu": {"type": "string", "minLength": 1},
+            "memory": {"type": "string", "minLength": 1}
+          }
+        }
+      }
+    },
+    "envFromRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "optional": {"type": "boolean"}
+      }
+    }
+  },
+  "properties": {
+    "replicaCount": {"const": 1},
+    "multica": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["baseURL", "controllerTokenSecret"],
+      "properties": {
+        "baseURL": {"type": "string", "pattern": "^https?://"},
+        "controllerTokenSecret": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "key"],
+          "properties": {
+            "name": {"type": "string", "minLength": 1},
+            "key": {"type": "string", "minLength": 1}
+          }
+        }
+      }
+    },
+    "runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name", "image", "capacity", "pollInterval", "heartbeatInterval",
+        "taskDeadline", "pi", "workerResources", "extraEnvFrom", "extraEnv", "extraVolumes", "extraVolumeMounts"
+      ],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "image": {"$ref": "#/$defs/image"},
+        "capacity": {"type": "integer", "minimum": 1, "maximum": 32},
+        "pollInterval": {"type": "string", "minLength": 2},
+        "heartbeatInterval": {"type": "string", "minLength": 2},
+        "taskDeadline": {"type": "string", "minLength": 2},
+        "pi": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["packages", "configMapName", "configMapItems"],
+          "properties": {
+            "packages": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "pattern": "^(npm:(?:@[A-Za-z0-9._-]+/[A-Za-z0-9._-]+|[A-Za-z0-9._-]+)(?:@[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?)?|(?:git:|https?://|ssh://|git://).+@(?:refs/tags/[^\\s]+|v?[0-9]+(?:\\.[0-9]+){0,2}(?:[._-][0-9A-Za-z][0-9A-Za-z._-]*)?|[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?))$"
+              }
+            },
+            "configMapName": {"type": "string", "maxLength": 253},
+            "configMapItems": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["key", "path"],
+                "properties": {
+                  "key": {"type": "string", "minLength": 1},
+                  "path": {"type": "string", "minLength": 1}
+                }
+              }
+            }
+          }
+        },
+        "workerResources": {"$ref": "#/$defs/resources"},
+        "extraEnvFrom": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "prefix": {"type": "string"},
+              "configMapRef": {"$ref": "#/$defs/envFromRef"},
+              "secretRef": {"$ref": "#/$defs/envFromRef"}
+            },
+            "oneOf": [
+              {"required": ["configMapRef"]},
+              {"required": ["secretRef"]}
+            ]
+          }
+        },
+        "extraEnv": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name"],
+            "properties": {
+              "name": {"type": "string", "minLength": 1}
+            },
+            "additionalProperties": true
+          }
+        },
+        "extraVolumes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name"],
+            "properties": {"name": {"type": "string", "minLength": 1}},
+            "additionalProperties": true
+          }
+        },
+        "extraVolumeMounts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "mountPath", "readOnly"],
+            "properties": {
+              "name": {"type": "string", "minLength": 1},
+              "mountPath": {"type": "string", "pattern": "^/"},
+              "subPath": {"type": "string"},
+              "readOnly": {"const": true}
+            },
+            "additionalProperties": true
+          }
+        }
+      }
+    },
+    "controller": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["image", "resources", "securityContext"],
+      "properties": {
+        "image": {"$ref": "#/$defs/image"},
+        "resources": {"type": "object"},
+        "securityContext": {"type": "object"}
+      }
+    },
+    "workspace": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["claimName", "storageClassName", "accessModes", "size"],
+      "properties": {
+        "claimName": {"type": "string", "minLength": 1},
+        "storageClassName": {"type": "string"},
+        "accessModes": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"type": "string", "enum": ["ReadWriteOnce", "ReadWriteMany"]}
+        },
+        "size": {"type": "string", "minLength": 1}
+      }
+    },
+    "podDisruptionBudget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "maxUnavailable"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "maxUnavailable": {"type": ["integer", "string"]}
+      }
+    },
+    "networkPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled"],
+      "properties": {
+        "enabled": {"type": "boolean"}
+      }
+    }
+  }
+}

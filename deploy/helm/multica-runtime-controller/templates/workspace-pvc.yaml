@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "multica-runtime-controller.workspaceClaimName" . }}
+  labels:
+    {{- include "multica-runtime-controller.labels" . | nindent 4 }}
+    app.kubernetes.io/component: workspace
+spec:
+  accessModes:
+    {{- toYaml .Values.workspace.accessModes | nindent 4 }}
+  volumeMode: Filesystem
+  resources:
+    requests:
+      storage: {{ .Values.workspace.size | quote }}
+{{- with .Values.workspace.storageClassName }}
+  storageClassName: {{ . | quote }}
+{{- end }}

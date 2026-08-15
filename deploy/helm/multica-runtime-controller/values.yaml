@@ -1,0 +1,79 @@
+replicaCount: 1
+
+multica:
+  baseURL: https://multica.example.com
+  controllerTokenSecret:
+    name: multica-runtime-controller-token
+    key: token
+
+runtime:
+  name: runtime-controller
+  image:
+    # Controller and task Pods use the same published image digest.
+    reference: docker.io/jskorlol/multica-runtime-controller@sha256:e49a3c3f34a7b97de7dacc094253d4b8c2aedd44dc5009919cac10ef3958bd54
+    pullPolicy: IfNotPresent
+  # The official Multica daemon detects the provider shims from PATH.
+  capacity: 20
+  pollInterval: 10s
+  heartbeatInterval: 15s
+  taskDeadline: 6h
+  pi:
+    # Pi packages execute arbitrary code with task credentials and workspace access.
+    # Each source is installed by Pi itself into its default ~/.pi/agent directory.
+    # An unversioned npm source resolves the latest release at install time; use
+    # an exact npm version when rollout reproducibility is required. Pin Git refs.
+    packages: []
+    # Optional non-secret Pi configuration copied into the persistent default
+    # Pi home before package installation. Authentication files must never be stored here.
+    configMapName: ""
+    configMapItems: []
+  workerResources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      cpu: "2"
+      memory: 4Gi
+  # Native Pod volume and volumeMount fragments mounted into the daemon and
+  # every intercepted task Pod. One projected volume may have multiple mounts.
+  # Keep mounts read-only. ConfigMap, Secret, and projected volumes are allowed.
+  # Kubernetes EnvFromSource fragments added to the daemon container. Provider
+  # credentials inherited by the daemon are forwarded to intercepted tasks.
+  extraEnvFrom: []
+  # Kubernetes EnvVar fragments added to the daemon container. Use this for
+  # explicit aliases such as mapping a provider Secret key to GH_TOKEN.
+  extraEnv: []
+  extraVolumes: []
+  extraVolumeMounts: []
+
+controller:
+  image:
+    reference: docker.io/jskorlol/multica-runtime-controller@sha256:e49a3c3f34a7b97de7dacc094253d4b8c2aedd44dc5009919cac10ef3958bd54
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+
+workspace:
+  claimName: multica-runtime-workspace
+  storageClassName: ""
+  accessModes:
+    - ReadWriteMany
+  size: 100Gi
+
+podDisruptionBudget:
+  enabled: true
+  maxUnavailable: 1
+
+networkPolicy:
+  enabled: true
