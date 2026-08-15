@@ -85,8 +85,8 @@ Four workflows own delivery:
 - `Development Image` runs only for pushes to `develop`. A read-only verify job
   must pass before a separate package-write job publishes the same multi-arch
   digest as `develop` and `develop-<full-commit-SHA>`. It uses its own
-  `runtime-develop` cache and never changes stable version tags, `latest`, or a
-  GitHub Release.
+  `runtime-develop` write cache, may restore the trusted `runtime-main` cache,
+  and never changes stable version tags, `latest`, or a GitHub Release.
 - `Release` runs when `VERSION` changes on `main`. Manual recovery requires the
   exact stable version and the original full 40-character revision.
 

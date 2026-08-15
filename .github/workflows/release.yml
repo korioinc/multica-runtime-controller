@@ -146,6 +146,15 @@ jobs:
           python3 scripts/runtime_versions.py release-state \
             --version "$VERSION" --revision "$REVISION" --live \
             --format github-output >>"$GITHUB_OUTPUT"
+      - name: Reclaim runner disk for the cold multi-platform build
+        if: steps.before.outputs.next_action == 'build_candidate'
+        run: |
+          set -euo pipefail
+          before_kb=$(df -Pk / | awk 'NR == 2 {print $4}')
+          sudo rm -rf -- /usr/local/lib/android /usr/share/dotnet /opt/ghc
+          after_kb=$(df -Pk / | awk 'NR == 2 {print $4}')
+          printf 'Reclaimed %s KiB; %s KiB available on /.\n' \
+            "$((after_kb - before_kb))" "$after_kb"
       - name: Set up QEMU
         if: steps.before.outputs.next_action == 'build_candidate'
         uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
