@@ -74,7 +74,7 @@ a `LICENSE` file is added by the repository owner. Report vulnerabilities only
 through the private process in [SECURITY.md](SECURITY.md), never in public
 issues, pull requests, logs, or artifacts.
 
-Three workflows own delivery:
+Four workflows own delivery:
 
 - `CI` is read-only and secret-free. `CI / verify` and `CI / runtime-image` are
   required for every pull request.
@@ -82,6 +82,11 @@ Three workflows own delivery:
   be dispatched manually. It reads only the fixed official Multica, Codex, and
   Pi sources, maintains one `automation/runtime-versions` pull request, and
   requests native squash auto-merge after both required checks pass.
+- `Development Image` runs only for pushes to `develop`. A read-only verify job
+  must pass before a separate package-write job publishes the same multi-arch
+  digest as `develop` and `develop-<full-commit-SHA>`. It uses its own
+  `runtime-develop` cache and never changes stable version tags, `latest`, or a
+  GitHub Release.
 - `Release` runs when `VERSION` changes on `main`. Manual recovery requires the
   exact stable version and the original full 40-character revision.
 
@@ -93,7 +98,9 @@ Requests read/write permissions and has no ruleset, workflow, package, or
 administration access. Release jobs publish to
 `ghcr.io/korioinc/multica-runtime-controller` with the ephemeral,
 repository-scoped `GITHUB_TOKEN`; no registry PAT or repository secret is
-required. Secret values must be entered through GitHub's secret UI or an
+required. The development publisher uses the same ephemeral credential in its
+package-write job and receives no Environment secret. Secret values must be
+entered through GitHub's secret UI or an
 interactive non-logging command and must never be placed in source, shell
 history, workflow inputs, build arguments, artifacts, or cache keys.
 
