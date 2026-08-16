@@ -1,8 +1,9 @@
 name: Development Image
+run-name: Development image ${{ github.event.client_payload.revision }}
 
 on:
-  push:
-    branches: [develop]
+  repository_dispatch:
+    types: [development-image]
 
 permissions: {}
 
@@ -13,14 +14,49 @@ concurrency:
 jobs:
   verify:
     name: verify
+    if: vars.RELEASE_AUTOMATION_ENABLED == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
       contents: read
+    outputs:
+      build_args: ${{ steps.build-args.outputs.value }}
+      revision: ${{ steps.context.outputs.revision }}
     steps:
+      - name: Resolve the exact development revision
+        id: context
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_REF: ${{ github.ref }}
+          EVENT_SHA: ${{ github.sha }}
+          INPUT_REVISION: ${{ github.event.client_payload.revision }}
+        run: |
+          set -euo pipefail
+          [ "$EVENT_REF" = refs/heads/main ]
+          live_main=$(gh api \
+            "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)
+          [ "$EVENT_SHA" = "$live_main" ] || {
+            printf 'trusted workflow moved: event=%s live-main=%s\n' \
+              "$EVENT_SHA" "$live_main" >&2
+            exit 1
+          }
+          revision=$INPUT_REVISION
+          case "$revision" in
+            *[!0-9a-f]*|'') echo 'revision must be lowercase hexadecimal' >&2; exit 1 ;;
+          esac
+          [ "${#revision}" -eq 40 ]
+          live_head=$(gh api \
+            "repos/$GITHUB_REPOSITORY/git/ref/heads/develop" --jq .object.sha)
+          [ "$live_head" = "$revision" ] || {
+            printf 'develop moved: live=%s input=%s\n' \
+              "$live_head" "$revision" >&2
+            exit 1
+          }
+          printf 'revision=%s\n' "$revision" >>"$GITHUB_OUTPUT"
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ steps.context.outputs.revision }}
           fetch-depth: 0
           persist-credentials: false
       - name: Set up Go
@@ -35,6 +71,20 @@ jobs:
           version: v4.2.2
       - name: Verify repository
         run: make verify
+      - name: Resolve non-secret build arguments without package credentials
+        id: build-args
+        env:
+          REVISION: ${{ steps.context.outputs.revision }}
+        run: |
+          set -eu
+          python3 scripts/runtime_versions.py build-args \
+            --format json --revision "$REVISION" \
+            | jq -r 'to_entries[] | "\(.key)=\(.value)"' >"$RUNNER_TEMP/build-args"
+          {
+            echo 'value<<EOF'
+            cat "$RUNNER_TEMP/build-args"
+            echo EOF
+          } >>"$GITHUB_OUTPUT"
 
   publish:
     name: publish
@@ -46,12 +96,12 @@ jobs:
       packages: write
     env:
       IMAGE: ghcr.io/korioinc/multica-runtime-controller
-      REVISION: ${{ github.sha }}
+      REVISION: ${{ needs.verify.outputs.revision }}
     steps:
       - name: Check out exact development revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ needs.verify.outputs.revision }}
           fetch-depth: 0
           persist-credentials: false
       - name: Reclaim runner disk for the cold multi-platform build
@@ -72,18 +122,6 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
-      - name: Resolve non-secret build arguments
-        id: build-args
-        run: |
-          set -eu
-          python3 scripts/runtime_versions.py build-args \
-            --format json --revision "$REVISION" \
-            | jq -r 'to_entries[] | "\(.key)=\(.value)"' >"$RUNNER_TEMP/build-args"
-          {
-            echo 'value<<EOF'
-            cat "$RUNNER_TEMP/build-args"
-            echo EOF
-          } >>"$GITHUB_OUTPUT"
       - name: Build and push development image
         id: build
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
@@ -93,8 +131,8 @@ jobs:
           push: true
           tags: |
             ${{ env.IMAGE }}:develop
-            ${{ env.IMAGE }}:develop-${{ github.sha }}
-          build-args: ${{ steps.build-args.outputs.value }}
+            ${{ env.IMAGE }}:develop-${{ needs.verify.outputs.revision }}
+          build-args: ${{ needs.verify.outputs.build_args }}
           cache-from: |
             type=gha,scope=runtime-develop
             type=gha,scope=runtime-main

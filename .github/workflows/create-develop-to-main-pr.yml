@@ -1,0 +1,599 @@
+name: Create develop into main PR
+
+on:
+  push:
+    branches: [main]
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [develop]
+  schedule:
+    - cron: '0 * * * *'
+  repository_dispatch:
+    types: [reconcile-develop]
+
+permissions: {}
+
+concurrency:
+  group: create-develop-to-main-pr
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: resolve
+    if: >-
+      vars.RELEASE_AUTOMATION_ENABLED == 'true' &&
+      (github.event_name != 'workflow_run' ||
+       (github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.event == 'push'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      develop_sha: ${{ steps.resolve.outputs.develop_sha }}
+      main_sha: ${{ steps.resolve.outputs.main_sha }}
+      mode: ${{ steps.resolve.outputs.mode }}
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - name: Check out the live develop branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: develop
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Resolve the next durable action
+        id: resolve
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_REVISION: ${{ github.event.client_payload.revision }}
+          FORCE_RELEASE: ${{ github.event.client_payload.force_release }}
+        run: |
+          # Markdown backticks in the step summary are intentionally literal.
+          # shellcheck disable=SC2016
+          set -euo pipefail
+          git fetch --force origin \
+            refs/heads/main:refs/remotes/origin/main \
+            refs/heads/develop:refs/remotes/origin/develop
+          develop_sha=$(git rev-parse origin/develop)
+
+          requested_revision=
+          if [ "$EVENT_NAME" = repository_dispatch ] && [ -n "$INPUT_REVISION" ]; then
+            requested_revision=$INPUT_REVISION
+          fi
+          if [ -n "$requested_revision" ]; then
+            case "$requested_revision" in
+              *[!0-9a-f]*) echo 'revision must be lowercase hexadecimal' >&2; exit 1 ;;
+            esac
+            [ "${#requested_revision}" -eq 40 ]
+            git merge-base --is-ancestor "$requested_revision" "$develop_sha" || {
+              printf 'requested revision %s is not an ancestor of live develop %s\n' \
+                "$requested_revision" "$develop_sha" >&2
+              exit 1
+            }
+          fi
+
+          main_sha=$(git rev-parse origin/main)
+          version=$(git show "$develop_sha:VERSION")
+          if [ -n "$FORCE_RELEASE" ]; then
+            if [ "$EVENT_NAME" != repository_dispatch ] || [ "$FORCE_RELEASE" != true ]; then
+              echo 'force_release is valid only as the literal true repository-dispatch payload' >&2
+              exit 1
+            fi
+          fi
+          if ! git cat-file -e \
+            origin/main:.github/workflows/create-develop-to-main-pr.yml 2>/dev/null || \
+            ! git show origin/main:.github/workflows/ci.yml \
+              | grep -Fq 'kind:'; then
+            mode='bootstrap'
+          elif ! git merge-base --is-ancestor "$main_sha" "$develop_sha"; then
+            mode='sync'
+          elif [ "$FORCE_RELEASE" = true ]; then
+            git diff --quiet origin/main "$develop_sha" || {
+              echo 'forced release requires identical main and develop trees' >&2
+              exit 1
+            }
+            main_version=$(git show origin/main:VERSION)
+            [ "$version" = "$main_version" ] || {
+              echo 'forced release requires identical main and develop versions' >&2
+              exit 1
+            }
+            version=$(python3 - "$main_version" <<'PY'
+          import sys
+
+          major, minor, patch = (int(part) for part in sys.argv[1].split("."))
+          print(f"{major}.{minor}.{patch + 1}")
+          PY
+            )
+            mode='patch'
+          elif git diff --quiet origin/main "$develop_sha"; then
+            mode='none'
+          else
+            main_version=$(git show origin/main:VERSION)
+            relation=$(python3 - "$main_version" "$version" <<'PY'
+          import re
+          import sys
+
+          pattern = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
+          values = []
+          for value in sys.argv[1:]:
+              match = pattern.fullmatch(value)
+              if match is None:
+                  raise SystemExit(f"invalid stable SemVer: {value}")
+              values.append(tuple(int(part) for part in match.groups()))
+          print("equal" if values[0] == values[1] else "greater" if values[1] > values[0] else "less")
+          PY
+            )
+            case "$relation" in
+              equal)
+                version=$(python3 - "$main_version" <<'PY'
+          import sys
+
+          major, minor, patch = (int(part) for part in sys.argv[1].split("."))
+          print(f"{major}.{minor}.{patch + 1}")
+          PY
+                )
+                mode='patch'
+                ;;
+              greater)
+                mode='promotion'
+                ;;
+              less)
+                printf 'develop VERSION is behind main VERSION\n' >&2
+                exit 1
+                ;;
+            esac
+          fi
+
+          {
+            printf 'develop_sha=%s\n' "$develop_sha"
+            printf 'main_sha=%s\n' "$main_sha"
+            printf 'mode=%s\n' "$mode"
+            printf 'version=%s\n' "$version"
+          } >>"$GITHUB_OUTPUT"
+          # shellcheck disable=SC2016
+          printf 'Reconciliation mode: `%s`; develop: `%s`; version: `%s`.\n' \
+            "$mode" "$develop_sha" "$version" >>"$GITHUB_STEP_SUMMARY"
+
+  write-sync:
+    name: write-sync
+    needs: resolve
+    if: needs.resolve.outputs.mode == 'sync'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      head_sha: ${{ steps.write.outputs.head_sha }}
+    steps:
+      - name: Check out the exact develop base
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.develop_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Write or reuse the bot-owned main ancestry merge
+        id: write
+        env:
+          AUTOMATION_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ needs.resolve.outputs.develop_sha }}
+          MAIN_SHA: ${{ needs.resolve.outputs.main_sha }}
+        run: |
+          # Markdown backticks in summaries are intentionally literal.
+          # shellcheck disable=SC2016
+          set -euo pipefail
+          git fetch --force origin "$MAIN_SHA"
+          live_develop=$(git ls-remote --heads origin develop | awk '{print $1}')
+          live_main=$(git ls-remote --heads origin main | awk '{print $1}')
+          [ "$live_develop" = "$BASE_SHA" ]
+          [ "$live_main" = "$MAIN_SHA" ]
+          if git merge-base --is-ancestor "$MAIN_SHA" "$BASE_SHA"; then
+            echo 'main is already an ancestor of develop' >&2
+            exit 1
+          fi
+
+          branch=automation/sync-main
+          remote_sha=$(git ls-remote --heads origin "$branch" | awk '{print $1}')
+          if [ -n "$remote_sha" ]; then
+            remote_commit=$(gh api \
+              "repos/$GITHUB_REPOSITORY/commits/$remote_sha")
+            printf '%s' "$remote_commit" | jq -e '
+              .author.login == "github-actions[bot]" and
+              .committer.login == "github-actions[bot]"
+            ' >/dev/null
+            git fetch --force origin \
+              "refs/heads/$branch:refs/remotes/origin/$branch"
+            [ "$(git rev-parse "origin/$branch")" = "$remote_sha" ]
+            parents=$(git rev-list --parents -n 1 "$remote_sha")
+            if [ "$parents" = "$remote_sha $BASE_SHA $MAIN_SHA" ] && \
+              git diff --quiet "$BASE_SHA" "$remote_sha"; then
+              printf 'head_sha=%s\n' "$remote_sha" >>"$GITHUB_OUTPUT"
+              # shellcheck disable=SC2016
+              printf 'Reused main ancestry head `%s`.\n' \
+                "$remote_sha" >>"$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            lease="--force-with-lease=refs/heads/$branch:$remote_sha"
+          else
+            lease="--force-with-lease=refs/heads/$branch:"
+          fi
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git checkout -B "$branch" "$BASE_SHA"
+          git merge --no-ff --no-edit "$MAIN_SHA"
+          head_sha=$(git rev-parse HEAD)
+          [ "$(git rev-list --parents -n 1 "$head_sha")" = \
+            "$head_sha $BASE_SHA $MAIN_SHA" ]
+          git diff --quiet "$BASE_SHA" "$head_sha"
+
+          askpass=$RUNNER_TEMP/git-askpass-sync
+          cat >"$askpass" <<'EOF'
+          #!/bin/sh
+          case "$1" in
+            *Username*) printf '%s\n' x-access-token ;;
+            *Password*) printf '%s\n' "$AUTOMATION_TOKEN" ;;
+            *) exit 1 ;;
+          esac
+          EOF
+          chmod 0700 "$askpass"
+          GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0 \
+            git push "$lease" "https://github.com/$GITHUB_REPOSITORY.git" \
+              "HEAD:refs/heads/$branch"
+          printf 'head_sha=%s\n' "$head_sha" >>"$GITHUB_OUTPUT"
+
+  propose-sync:
+    name: propose-sync
+    needs: [resolve, write-sync]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Create or update the main ancestry PR and dispatch trusted CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ needs.resolve.outputs.develop_sha }}
+          HEAD_SHA: ${{ needs.write-sync.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          branch=automation/sync-main
+          live_head=$(gh api \
+            "repos/$GITHUB_REPOSITORY/git/ref/heads/$branch" --jq .object.sha)
+          [ "$live_head" = "$HEAD_SHA" ]
+          prs=$(gh pr list --state open --base develop --head "$branch" \
+            --json number --limit 10)
+          count=$(printf '%s' "$prs" | jq 'length')
+          [ "$count" -le 1 ] || {
+            echo 'duplicate main ancestry pull requests detected' >&2
+            exit 1
+          }
+          cat >"$RUNNER_TEMP/sync-pr-body.md" <<'EOF'
+          Preserve the reviewed `main` commit as an ancestor of `develop` after a squash promotion.
+
+          This bot-owned PR has an empty tree diff, one two-parent merge commit, and must be merged with the merge-commit method after trusted exact-head CI.
+          EOF
+          if [ "$count" -eq 0 ]; then
+            url=$(gh pr create --base develop --head "$branch" \
+              --title 'chore: sync main ancestry into develop' \
+              --body-file "$RUNNER_TEMP/sync-pr-body.md")
+            number=${url##*/}
+          else
+            number=$(printf '%s' "$prs" | jq -r '.[0].number')
+            gh pr edit "$number" \
+              --title 'chore: sync main ancestry into develop' \
+              --body-file "$RUNNER_TEMP/sync-pr-body.md"
+          fi
+          pr=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$number")
+          printf '%s' "$pr" | jq -e \
+            --arg base "$BASE_SHA" \
+            --arg head "$HEAD_SHA" '
+              .state == "open" and
+              .base.ref == "develop" and
+              .base.sha == $base and
+              .head.ref == "automation/sync-main" and
+              .head.sha == $head and
+              .user.login == "github-actions[bot]" and
+              .commits == 1
+            ' >/dev/null
+          files=$(gh api --paginate \
+            "repos/$GITHUB_REPOSITORY/pulls/$number/files?per_page=100" \
+            --jq '.[].filename')
+          [ -z "$files" ]
+
+          title="CI automation sync-main PR-$number SHA-$HEAD_SHA"
+          runs=$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?branch=main&event=repository_dispatch&per_page=100")
+          if ! printf '%s' "$runs" | jq -e --arg title "$title" '
+            any(.workflow_runs[];
+              .display_title == $title and
+              (.status == "queued" or .status == "in_progress" or
+               .status == "waiting" or .status == "pending" or
+               .status == "requested"))
+          ' >/dev/null; then
+            jq -n \
+              --arg number "$number" \
+              --arg head "$HEAD_SHA" \
+              '{event_type:"automation-ci",client_payload:{kind:"sync-main",pull_request_number:$number,head_sha:$head}}' \
+              | gh api --method POST \
+                  "repos/$GITHUB_REPOSITORY/dispatches" \
+                  --input -
+          fi
+
+  write-patch:
+    name: write-patch
+    needs: resolve
+    if: needs.resolve.outputs.mode == 'patch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      head_sha: ${{ steps.write.outputs.head_sha }}
+    steps:
+      - name: Check out the exact develop base
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.develop_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Write one bot-owned release patch commit
+        id: write
+        env:
+          AUTOMATION_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ needs.resolve.outputs.develop_sha }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          live_develop=$(git ls-remote --heads origin develop | awk '{print $1}')
+          [ "$live_develop" = "$BASE_SHA" ] || {
+            printf 'develop moved: live=%s base=%s\n' \
+              "$live_develop" "$BASE_SHA" >&2
+            exit 1
+          }
+
+          branch=automation/release-patch
+          remote_sha=$(git ls-remote --heads origin "$branch" | awk '{print $1}')
+          if [ -n "$remote_sha" ]; then
+            remote_commit=$(gh api \
+              "repos/$GITHUB_REPOSITORY/commits/$remote_sha")
+            printf '%s' "$remote_commit" | jq -e '
+              .author.login == "github-actions[bot]" and
+              .committer.login == "github-actions[bot]"
+            ' >/dev/null
+            git fetch --force origin \
+              "refs/heads/$branch:refs/remotes/origin/$branch"
+            [ "$(git rev-parse "origin/$branch")" = "$remote_sha" ] || {
+              echo 'release-patch branch moved while resolving it' >&2
+              exit 1
+            }
+            parents=$(git rev-list --parents -n 1 "$remote_sha")
+            files=$(git diff --name-only "$BASE_SHA" "$remote_sha")
+            remote_version=$(git show "$remote_sha:VERSION")
+            if [ "$parents" = "$remote_sha $BASE_SHA" ] && \
+              [ "$files" = VERSION ] && [ "$remote_version" = "$VERSION" ]; then
+              printf 'head_sha=%s\n' "$remote_sha" >>"$GITHUB_OUTPUT"
+              # shellcheck disable=SC2016
+              printf 'Reused release-patch head `%s`.\n' \
+                "$remote_sha" >>"$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            lease="--force-with-lease=refs/heads/$branch:$remote_sha"
+          else
+            lease="--force-with-lease=refs/heads/$branch:"
+          fi
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git checkout -B "$branch" "$BASE_SHA"
+          printf '%s\n' "$VERSION" >VERSION
+          git add VERSION
+          git commit --no-gpg-sign -m "chore: prepare release $VERSION"
+
+          askpass=$RUNNER_TEMP/git-askpass
+          cat >"$askpass" <<'EOF'
+          #!/bin/sh
+          case "$1" in
+            *Username*) printf '%s\n' x-access-token ;;
+            *Password*) printf '%s\n' "$AUTOMATION_TOKEN" ;;
+            *) exit 1 ;;
+          esac
+          EOF
+          chmod 0700 "$askpass"
+          GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0 \
+            git push "$lease" "https://github.com/$GITHUB_REPOSITORY.git" \
+              "HEAD:refs/heads/$branch"
+          printf 'head_sha=%s\n' "$(git rev-parse HEAD)" >>"$GITHUB_OUTPUT"
+
+  propose-patch:
+    name: propose-patch
+    needs: [resolve, write-patch]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Create or update the develop release-patch PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ needs.resolve.outputs.develop_sha }}
+          HEAD_SHA: ${{ needs.write-patch.outputs.head_sha }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          branch=automation/release-patch
+          live_head=$(gh api \
+            "repos/$GITHUB_REPOSITORY/git/ref/heads/$branch" --jq .object.sha)
+          [ "$live_head" = "$HEAD_SHA" ]
+          prs=$(gh pr list --state open --base develop --head "$branch" \
+            --json number --limit 10)
+          count=$(printf '%s' "$prs" | jq 'length')
+          [ "$count" -le 1 ] || {
+            echo 'duplicate release-patch pull requests detected' >&2
+            exit 1
+          }
+          cat >"$RUNNER_TEMP/pr-body.md" <<EOF
+          Prepare controller release \`$VERSION\` on \`develop\`.
+
+          This bot-owned PR changes only \`VERSION\` and must pass exact-head CI before the trusted merge workflow can merge it.
+          EOF
+          if [ "$count" -eq 0 ]; then
+            url=$(gh pr create --base develop --head "$branch" \
+              --title "chore: prepare release $VERSION" \
+              --body-file "$RUNNER_TEMP/pr-body.md")
+            number=${url##*/}
+          else
+            number=$(printf '%s' "$prs" | jq -r '.[0].number')
+            gh pr edit "$number" --title "chore: prepare release $VERSION" \
+              --body-file "$RUNNER_TEMP/pr-body.md"
+          fi
+          pr=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$number")
+          printf '%s' "$pr" | jq -e \
+            --arg base "$BASE_SHA" \
+            --arg head "$HEAD_SHA" '
+              .state == "open" and
+              .base.ref == "develop" and
+              .base.sha == $base and
+              .head.ref == "automation/release-patch" and
+              .head.sha == $head and
+              .user.login == "github-actions[bot]" and
+              .commits == 1
+            ' >/dev/null
+          files=$(gh api --paginate \
+            "repos/$GITHUB_REPOSITORY/pulls/$number/files?per_page=100" \
+            --jq '.[].filename')
+          [ "$files" = VERSION ]
+
+          title="CI automation release-patch PR-$number SHA-$HEAD_SHA"
+          runs=$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?branch=main&event=repository_dispatch&per_page=100")
+          if printf '%s' "$runs" | jq -e --arg title "$title" '
+            any(.workflow_runs[];
+              .display_title == $title and
+              (.status == "queued" or .status == "in_progress" or
+               .status == "waiting" or .status == "pending" or
+               .status == "requested"))
+          ' >/dev/null; then
+            # shellcheck disable=SC2016
+            printf 'Exact-head CI is already active for `%s`.\n' \
+              "$HEAD_SHA" >>"$GITHUB_STEP_SUMMARY"
+          else
+            jq -n \
+              --arg number "$number" \
+              --arg head "$HEAD_SHA" \
+              '{event_type:"automation-ci",client_payload:{kind:"release-patch",pull_request_number:$number,head_sha:$head}}' \
+              | gh api --method POST \
+                  "repos/$GITHUB_REPOSITORY/dispatches" \
+                  --input -
+          fi
+
+  promote:
+    name: promote
+    needs: resolve
+    if: needs.resolve.outputs.mode == 'promotion'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Create or update the promotion PR and dispatch exact-head checks
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ needs.resolve.outputs.develop_sha }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          live_head=$(gh api \
+            "repos/$GITHUB_REPOSITORY/git/ref/heads/develop" --jq .object.sha)
+          [ "$live_head" = "$HEAD_SHA" ] || {
+            printf 'develop moved: live=%s resolved=%s\n' \
+              "$live_head" "$HEAD_SHA" >&2
+            exit 1
+          }
+
+          prs=$(gh pr list --state open --base main --head develop \
+            --json number --limit 10)
+          count=$(printf '%s' "$prs" | jq 'length')
+          [ "$count" -le 1 ] || {
+            echo 'duplicate develop-to-main pull requests detected' >&2
+            exit 1
+          }
+          cat >"$RUNNER_TEMP/pr-body.md" <<EOF
+          ## Develop promotion
+
+          Promote the current \`develop\` head \`$HEAD_SHA\` as controller release \`$VERSION\`.
+
+          The exact head must pass the source-pinned \`verify\` and \`runtime-image\` checks and receive the required human approval before squash merge. The resulting \`VERSION\` change on \`main\` starts the GHCR release workflow.
+          EOF
+          if [ "$count" -eq 0 ]; then
+            url=$(gh pr create --base main --head develop \
+              --title "release: promote develop v$VERSION" \
+              --body-file "$RUNNER_TEMP/pr-body.md")
+            number=${url##*/}
+          else
+            number=$(printf '%s' "$prs" | jq -r '.[0].number')
+            gh pr edit "$number" \
+              --title "release: promote develop v$VERSION" \
+              --body-file "$RUNNER_TEMP/pr-body.md"
+          fi
+
+          pr=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$number")
+          printf '%s' "$pr" | jq -e \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg head "$HEAD_SHA" '
+              .state == "open" and
+              .base.ref == "main" and
+              .head.ref == "develop" and
+              .head.repo.full_name == $repository and
+              .head.sha == $head
+            ' >/dev/null
+
+          ci_title="CI automation promotion PR-$number SHA-$HEAD_SHA"
+          ci_runs=$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?branch=main&event=repository_dispatch&per_page=100")
+          ci_state=$(printf '%s' "$ci_runs" | jq -r --arg title "$ci_title" '
+            [.workflow_runs[] | select(.display_title == $title)] | first |
+            if . == null then "absent"
+            elif .status == "queued" or .status == "in_progress" or
+              .status == "waiting" or .status == "pending" or
+              .status == "requested" then "active"
+            elif .conclusion == "success" then "success"
+            else "retry" end
+          ')
+          if [ "$ci_state" = absent ] || [ "$ci_state" = retry ]; then
+            jq -n \
+              --arg number "$number" \
+              --arg head "$HEAD_SHA" \
+              '{event_type:"automation-ci",client_payload:{kind:"promotion",pull_request_number:$number,head_sha:$head}}' \
+              | gh api --method POST \
+                  "repos/$GITHUB_REPOSITORY/dispatches" \
+                  --input -
+          fi
+
+          image_runs=$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/develop-image.yml/runs?branch=main&event=repository_dispatch&per_page=100")
+          image_state=$(printf '%s' "$image_runs" | jq -r --arg revision "$HEAD_SHA" '
+            [.workflow_runs[] |
+              select(.display_title == ("Development image " + $revision))] | first |
+            if . == null then "absent"
+            elif .status == "queued" or .status == "in_progress" or
+              .status == "waiting" or .status == "pending" or
+              .status == "requested" then "active"
+            elif .conclusion == "success" then "success"
+            else "retry" end
+          ')
+          if [ "$image_state" = absent ] || [ "$image_state" = retry ]; then
+            jq -n \
+              --arg revision "$HEAD_SHA" \
+              '{event_type:"development-image",client_payload:{revision:$revision}}' \
+              | gh api --method POST \
+                  "repos/$GITHUB_REPOSITORY/dispatches" \
+                  --input -
+          fi
+          printf 'Promotion PR #%s targets release %s at %s.\n' \
+            "$number" "$VERSION" "$HEAD_SHA" >>"$GITHUB_STEP_SUMMARY"

@@ -1,24 +1,20 @@
 name: CI
+run-name: >-
+  ${{ github.event_name == 'repository_dispatch'
+      && format('CI automation {0} PR-{1} SHA-{2}', github.event.client_payload.kind, github.event.client_payload.pull_request_number, github.event.client_payload.head_sha)
+      || format('CI {0}', github.event_name) }}
 
 on:
   pull_request:
   push:
-    branches: [main]
-  workflow_dispatch:
-    inputs:
-      pull_request_number:
-        description: Same-repository automation pull request number
-        required: true
-        type: string
-      head_sha:
-        description: Exact 40-character automation pull request head SHA
-        required: true
-        type: string
+    branches: [main, develop]
+  repository_dispatch:
+    types: [automation-ci]
 
 permissions: {}
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || inputs.pull_request_number || github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.client_payload.pull_request_number || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -30,7 +26,7 @@ jobs:
       contents: read
       pull-requests: read
     outputs:
-      automation: ${{ steps.resolve.outputs.automation }}
+      automation_kind: ${{ steps.resolve.outputs.automation_kind }}
       base_sha: ${{ steps.resolve.outputs.base_sha }}
       cache_scope: ${{ steps.resolve.outputs.cache_scope }}
       checkout_sha: ${{ steps.resolve.outputs.checkout_sha }}
@@ -41,18 +37,36 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           EVENT_NAME: ${{ github.event_name }}
+          EVENT_REF: ${{ github.ref }}
           EVENT_SHA: ${{ github.sha }}
           EVENT_ACTOR: ${{ github.actor }}
           EVENT_TRIGGERING_ACTOR: ${{ github.triggering_actor }}
-          INPUT_HEAD_SHA: ${{ inputs.head_sha }}
-          INPUT_PULL_REQUEST_NUMBER: ${{ inputs.pull_request_number }}
+          INPUT_HEAD_SHA: ${{ github.event.client_payload.head_sha }}
+          INPUT_KIND: ${{ github.event.client_payload.kind }}
+          INPUT_PULL_REQUEST_NUMBER: ${{ github.event.client_payload.pull_request_number }}
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PUSH_BEFORE_SHA: ${{ github.event.before }}
         run: |
           set -euo pipefail
           case "$EVENT_NAME" in
-            workflow_dispatch)
+            repository_dispatch)
+              [ "$EVENT_REF" = refs/heads/main ] || {
+                printf 'automation CI must run from trusted main, got %s\n' \
+                  "$EVENT_REF" >&2
+                exit 1
+              }
+              case "$EVENT_SHA" in
+                *[!0-9a-f]*|'') echo 'workflow SHA must be lowercase hexadecimal' >&2; exit 1 ;;
+              esac
+              [ "${#EVENT_SHA}" -eq 40 ]
+              live_main=$(gh api \
+                "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)
+              [ "$EVENT_SHA" = "$live_main" ] || {
+                printf 'trusted workflow moved: event=%s live-main=%s\n' \
+                  "$EVENT_SHA" "$live_main" >&2
+                exit 1
+              }
               case "$INPUT_HEAD_SHA" in
                 *[!0-9a-f]*|'') echo 'head_sha must be lowercase hexadecimal' >&2; exit 1 ;;
               esac
@@ -63,64 +77,187 @@ jobs:
               case "$INPUT_PULL_REQUEST_NUMBER" in
                 *[!0-9]*|'') echo 'pull_request_number must be numeric' >&2; exit 1 ;;
               esac
-              [ "$EVENT_SHA" = "$INPUT_HEAD_SHA" ] || {
-                printf 'dispatch ref moved: event=%s input=%s\n' \
-                  "$EVENT_SHA" "$INPUT_HEAD_SHA" >&2
-                exit 1
-              }
-              if ! { [ "$EVENT_ACTOR" = 'github-actions[bot]' ] && \
-                [ "$EVENT_TRIGGERING_ACTOR" = 'github-actions[bot]' ]; }; then
-                  printf 'unexpected dispatch actor: actor=%s triggering=%s\n' \
-                    "$EVENT_ACTOR" "$EVENT_TRIGGERING_ACTOR" >&2
-                  exit 1
-              fi
-
               pr=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$INPUT_PULL_REQUEST_NUMBER")
-              printf '%s' "$pr" | jq -e \
-                --arg repository "$GITHUB_REPOSITORY" \
-                --arg head "$INPUT_HEAD_SHA" '
-                  .state == "open" and
-                  .base.ref == "main" and
-                  .head.ref == "automation/runtime-versions" and
-                  .head.repo.full_name == $repository and
-                  .head.sha == $head and
-                  .user.login == "github-actions[bot]" and
-                  .commits == 1
-                ' >/dev/null
               base_sha=$(printf '%s' "$pr" | jq -r .base.sha)
+              case "$INPUT_KIND" in
+                runtime-update)
+                  if ! { [ "$EVENT_ACTOR" = 'github-actions[bot]' ] && \
+                    [ "$EVENT_TRIGGERING_ACTOR" = 'github-actions[bot]' ]; }; then
+                      printf 'unexpected runtime dispatch actor: actor=%s triggering=%s\n' \
+                        "$EVENT_ACTOR" "$EVENT_TRIGGERING_ACTOR" >&2
+                      exit 1
+                  fi
+                  printf '%s' "$pr" | jq -e \
+                    --arg repository "$GITHUB_REPOSITORY" \
+                    --arg head "$INPUT_HEAD_SHA" '
+                      .state == "open" and
+                      .base.ref == "develop" and
+                      .head.ref == "automation/runtime-versions" and
+                      .head.repo.full_name == $repository and
+                      .head.sha == $head and
+                      .user.login == "github-actions[bot]" and
+                      .commits == 1
+                    ' >/dev/null
+                  files=$(gh api --paginate \
+                    "repos/$GITHUB_REPOSITORY/pulls/$INPUT_PULL_REQUEST_NUMBER/files?per_page=100" \
+                    --jq '.[].filename' | LC_ALL=C sort)
+                  expected=$(printf '%s\n' VERSION build/runtime-versions.env | LC_ALL=C sort)
+                  [ "$files" = "$expected" ] || {
+                    printf 'unexpected runtime update files:\n%s\n' "$files" >&2
+                    exit 1
+                  }
+                  commit=$(gh api "repos/$GITHUB_REPOSITORY/commits/$INPUT_HEAD_SHA")
+                  printf '%s' "$commit" | jq -e '
+                    .author.login == "github-actions[bot]" and
+                    .committer.login == "github-actions[bot]"
+                  ' >/dev/null
+                  compare=$(gh api \
+                    "repos/$GITHUB_REPOSITORY/compare/develop...$INPUT_HEAD_SHA")
+                  printf '%s' "$compare" | jq -e '.behind_by == 0' >/dev/null
+                  cache_scope="runtime-update-$INPUT_PULL_REQUEST_NUMBER"
+                  ;;
+                release-patch)
+                  if ! { [ "$EVENT_ACTOR" = 'github-actions[bot]' ] && \
+                    [ "$EVENT_TRIGGERING_ACTOR" = 'github-actions[bot]' ]; }; then
+                      printf 'unexpected patch dispatch actor: actor=%s triggering=%s\n' \
+                        "$EVENT_ACTOR" "$EVENT_TRIGGERING_ACTOR" >&2
+                      exit 1
+                  fi
+                  printf '%s' "$pr" | jq -e \
+                    --arg repository "$GITHUB_REPOSITORY" \
+                    --arg head "$INPUT_HEAD_SHA" '
+                      .state == "open" and
+                      .base.ref == "develop" and
+                      .head.ref == "automation/release-patch" and
+                      .head.repo.full_name == $repository and
+                      .head.sha == $head and
+                      .user.login == "github-actions[bot]" and
+                      .commits == 1
+                    ' >/dev/null
+                  files=$(gh api --paginate \
+                    "repos/$GITHUB_REPOSITORY/pulls/$INPUT_PULL_REQUEST_NUMBER/files?per_page=100" \
+                    --jq '.[].filename')
+                  [ "$files" = VERSION ]
+                  commit=$(gh api "repos/$GITHUB_REPOSITORY/commits/$INPUT_HEAD_SHA")
+                  printf '%s' "$commit" | jq -e '
+                    .author.login == "github-actions[bot]" and
+                    .committer.login == "github-actions[bot]"
+                  ' >/dev/null
+                  compare=$(gh api \
+                    "repos/$GITHUB_REPOSITORY/compare/develop...$INPUT_HEAD_SHA")
+                  printf '%s' "$compare" | jq -e \
+                    '.behind_by == 0 and .ahead_by == 1' >/dev/null
+                  base_version=$(gh api \
+                    "repos/$GITHUB_REPOSITORY/contents/VERSION?ref=$base_sha" \
+                    --jq .content | tr -d '\n' | base64 --decode | tr -d '\n')
+                  head_version=$(gh api \
+                    "repos/$GITHUB_REPOSITORY/contents/VERSION?ref=$INPUT_HEAD_SHA" \
+                    --jq .content | tr -d '\n' | base64 --decode | tr -d '\n')
+                  python3 - "$base_version" "$head_version" <<'PY'
+          import re
+          import sys
 
-              files=$(gh api --paginate \
-                "repos/$GITHUB_REPOSITORY/pulls/$INPUT_PULL_REQUEST_NUMBER/files?per_page=100" \
-                --jq '.[].filename' | LC_ALL=C sort)
-              expected=$(printf '%s\n' VERSION build/runtime-versions.env | LC_ALL=C sort)
-              [ "$files" = "$expected" ] || {
-                printf 'unexpected automation PR files:\n%s\n' "$files" >&2
-                exit 1
-              }
+          pattern = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
+          values = []
+          for value in sys.argv[1:]:
+              match = pattern.fullmatch(value)
+              if match is None:
+                  raise SystemExit(f"invalid stable SemVer: {value}")
+              values.append(tuple(int(part) for part in match.groups()))
+          if values[1] != (values[0][0], values[0][1], values[0][2] + 1):
+              raise SystemExit("release patch must increment exactly once")
+          PY
+                  cache_scope="release-patch-$INPUT_PULL_REQUEST_NUMBER"
+                  ;;
+                sync-main)
+                  if ! { [ "$EVENT_ACTOR" = 'github-actions[bot]' ] && \
+                    [ "$EVENT_TRIGGERING_ACTOR" = 'github-actions[bot]' ]; }; then
+                      printf 'unexpected sync dispatch actor: actor=%s triggering=%s\n' \
+                        "$EVENT_ACTOR" "$EVENT_TRIGGERING_ACTOR" >&2
+                      exit 1
+                  fi
+                  printf '%s' "$pr" | jq -e \
+                    --arg repository "$GITHUB_REPOSITORY" \
+                    --arg head "$INPUT_HEAD_SHA" '
+                      .state == "open" and
+                      .base.ref == "develop" and
+                      .head.ref == "automation/sync-main" and
+                      .head.repo.full_name == $repository and
+                      .head.sha == $head and
+                      .user.login == "github-actions[bot]" and
+                      .commits == 1
+                    ' >/dev/null
+                  files=$(gh api --paginate \
+                    "repos/$GITHUB_REPOSITORY/pulls/$INPUT_PULL_REQUEST_NUMBER/files?per_page=100" \
+                    --jq '.[].filename')
+                  [ -z "$files" ] || {
+                    printf 'sync PR unexpectedly changes files:\n%s\n' "$files" >&2
+                    exit 1
+                  }
+                  commit=$(gh api "repos/$GITHUB_REPOSITORY/commits/$INPUT_HEAD_SHA")
+                  printf '%s' "$commit" | jq -e \
+                    --arg develop "$base_sha" \
+                    --arg main "$live_main" '
+                      .author.login == "github-actions[bot]" and
+                      .committer.login == "github-actions[bot]" and
+                      (.parents | length) == 2 and
+                      .parents[0].sha == $develop and
+                      .parents[1].sha == $main
+                    ' >/dev/null
+                  compare=$(gh api \
+                    "repos/$GITHUB_REPOSITORY/compare/develop...$INPUT_HEAD_SHA")
+                  printf '%s' "$compare" | jq -e \
+                    '.behind_by == 0 and .ahead_by == 1' >/dev/null
+                  cache_scope="sync-main-$INPUT_PULL_REQUEST_NUMBER"
+                  ;;
+                promotion)
+                  printf '%s' "$pr" | jq -e \
+                    --arg repository "$GITHUB_REPOSITORY" \
+                    --arg head "$INPUT_HEAD_SHA" '
+                      .state == "open" and
+                      .base.ref == "main" and
+                      .head.ref == "develop" and
+                      .head.repo.full_name == $repository and
+                      .head.sha == $head
+                    ' >/dev/null
+                  live_head=$(gh api \
+                    "repos/$GITHUB_REPOSITORY/git/ref/heads/develop" --jq .object.sha)
+                  [ "$live_head" = "$INPUT_HEAD_SHA" ] || {
+                    printf 'develop moved: live=%s input=%s\n' \
+                      "$live_head" "$INPUT_HEAD_SHA" >&2
+                      exit 1
+                  }
+                  live_main=$(gh api \
+                    "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)
+                  [ "$live_main" = "$base_sha" ] || {
+                    printf 'main moved: live=%s PR-base=%s\n' \
+                      "$live_main" "$base_sha" >&2
+                    exit 1
+                  }
+                  compare=$(gh api \
+                    "repos/$GITHUB_REPOSITORY/compare/main...$INPUT_HEAD_SHA")
+                  printf '%s' "$compare" | jq -e '.ahead_by > 0' >/dev/null
+                  cache_scope="promotion-$INPUT_PULL_REQUEST_NUMBER"
+                  ;;
+                *)
+                  printf 'unsupported automation kind: %s\n' "$INPUT_KIND" >&2
+                  exit 1
+                  ;;
+              esac
 
-              commit=$(gh api "repos/$GITHUB_REPOSITORY/commits/$INPUT_HEAD_SHA")
-              printf '%s' "$commit" | jq -e '
-                .author.login == "github-actions[bot]" and
-                .committer.login == "github-actions[bot]"
-              ' >/dev/null
-              compare=$(gh api \
-                "repos/$GITHUB_REPOSITORY/compare/main...$INPUT_HEAD_SHA")
-              printf '%s' "$compare" | jq -e '.behind_by == 0' >/dev/null
-
-              automation=true
+              automation_kind=$INPUT_KIND
               checkout_sha=$INPUT_HEAD_SHA
               pull_request_number=$INPUT_PULL_REQUEST_NUMBER
-              cache_scope="runtime-pr-$INPUT_PULL_REQUEST_NUMBER"
               ;;
             pull_request)
-              automation=false
+              automation_kind=none
               base_sha=$PR_BASE_SHA
               checkout_sha=$EVENT_SHA
               pull_request_number=$PR_NUMBER
               cache_scope="runtime-pr-$PR_NUMBER"
               ;;
             push)
-              automation=false
+              automation_kind=none
               base_sha=$PUSH_BEFORE_SHA
               checkout_sha=$EVENT_SHA
               pull_request_number=
@@ -133,7 +270,7 @@ jobs:
           esac
 
           {
-            printf 'automation=%s\n' "$automation"
+            printf 'automation_kind=%s\n' "$automation_kind"
             printf 'base_sha=%s\n' "$base_sha"
             printf 'cache_scope=%s\n' "$cache_scope"
             printf 'checkout_sha=%s\n' "$checkout_sha"
@@ -141,7 +278,7 @@ jobs:
           } >>"$GITHUB_OUTPUT"
 
   verify:
-    name: verify
+    name: ${{ github.event_name == 'repository_dispatch' && 'automation-verify' || 'verify' }}
     needs: context
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -165,7 +302,7 @@ jobs:
         with:
           version: v4.2.2
       - name: Validate the automation-only diff
-        if: needs.context.outputs.automation == 'true'
+        if: needs.context.outputs.automation_kind == 'runtime-update'
         env:
           BASE_SHA: ${{ needs.context.outputs.base_sha }}
         run: python3 scripts/runtime_versions.py validate --base-ref "$BASE_SHA" --automation-diff
@@ -173,7 +310,7 @@ jobs:
         run: make verify
 
   runtime-image:
-    name: runtime-image
+    name: ${{ github.event_name == 'repository_dispatch' && 'automation-runtime-image' || 'runtime-image' }}
     needs: context
     runs-on: ubuntu-latest
     timeout-minutes: 90
@@ -197,7 +334,9 @@ jobs:
             [ "$BASE_SHA" = 0000000000000000000000000000000000000000 ]; then
             build=true
           elif git diff --quiet "$BASE_SHA" HEAD -- \
-            Dockerfile .dockerignore VERSION build/runtime-versions.env scripts src; then
+            Dockerfile .dockerignore VERSION build/runtime-versions.env \
+            scripts/install-runtime-tools.sh scripts/runtime-entrypoint.sh \
+            scripts/verify-runtime-tools.sh src; then
             build=false
           else
             build=true
@@ -254,3 +393,63 @@ jobs:
       - name: Record successful no-op
         if: steps.scope.outputs.build != 'true'
         run: printf '%s\n' 'No runtime image input changed; the required check is a successful no-op.' >>"$GITHUB_STEP_SUMMARY"
+
+  publish-checks:
+    name: publish-checks
+    if: >-
+      github.event_name == 'repository_dispatch' &&
+      needs.verify.result == 'success' &&
+      needs.runtime-image.result == 'success'
+    needs: [context, verify, runtime-image]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      checks: write
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Publish source-pinned required checks on the exact PR head
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ needs.context.outputs.checkout_sha }}
+          PULL_REQUEST_NUMBER: ${{ needs.context.outputs.pull_request_number }}
+          WORKFLOW_SHA: ${{ github.sha }}
+        run: |
+          # jq programs and Markdown are intentionally literal.
+          # shellcheck disable=SC2016
+          set -euo pipefail
+          live_main=$(gh api \
+            "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)
+          [ "$WORKFLOW_SHA" = "$live_main" ] || {
+            printf 'trusted workflow moved: workflow=%s live-main=%s\n' \
+              "$WORKFLOW_SHA" "$live_main" >&2
+            exit 1
+          }
+          pr=$(gh api \
+            "repos/$GITHUB_REPOSITORY/pulls/$PULL_REQUEST_NUMBER")
+          printf '%s' "$pr" | jq -e --arg head "$HEAD_SHA" '
+            .state == "open" and .head.sha == $head
+          ' >/dev/null
+
+          details_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          for name in verify runtime-image; do
+            jq -n \
+              --arg name "$name" \
+              --arg head "$HEAD_SHA" \
+              --arg details_url "$details_url" \
+              --arg workflow_sha "$WORKFLOW_SHA" '
+                {
+                  name: $name,
+                  head_sha: $head,
+                  status: "completed",
+                  conclusion: "success",
+                  details_url: $details_url,
+                  output: {
+                    title: ("Trusted " + $name + " passed"),
+                    summary: ("Validated by the reviewed CI workflow at `" + $workflow_sha + "`.")
+                  }
+                }
+              ' | gh api --method POST \
+                -H 'Accept: application/vnd.github+json' \
+                "repos/$GITHUB_REPOSITORY/check-runs" --input - >/dev/null
+          done

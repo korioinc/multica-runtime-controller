@@ -3,7 +3,8 @@ name: Runtime Version Update
 on:
   schedule:
     - cron: '0 */4 * * *'
-  workflow_dispatch:
+  repository_dispatch:
+    types: [runtime-version-update]
 
 permissions: {}
 
@@ -14,6 +15,7 @@ concurrency:
 jobs:
   resolve:
     name: resolve
+    if: vars.RELEASE_AUTOMATION_ENABLED == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -22,10 +24,10 @@ jobs:
       updates: ${{ steps.check.outputs.updates }}
       has_updates: ${{ steps.check.outputs.has_updates }}
     steps:
-      - name: Check out main
+      - name: Check out develop
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: main
+          ref: develop
           fetch-depth: 0
           persist-credentials: false
       - name: Require the current release to be complete
@@ -35,8 +37,9 @@ jobs:
           # jq programs and Markdown format strings are intentionally literal.
           # shellcheck disable=SC2016
           set -eu
-          version=$(cat VERSION)
-          revision=$(git rev-parse HEAD)
+          git fetch --force origin refs/heads/main:refs/remotes/origin/main
+          revision=$(git rev-parse origin/main)
+          version=$(git show "$revision:VERSION")
           python3 scripts/runtime_versions.py release-preflight \
             --version "$version" --revision "$revision" --live \
             --allow-same-identity
@@ -76,14 +79,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
-      actions: write
       contents: write
       pull-requests: write
     steps:
-      - name: Check out latest main without persisted credentials
+      - name: Check out latest develop without persisted credentials
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: main
+          ref: develop
           fetch-depth: 0
           persist-credentials: false
       - name: Revalidate the checked-out release boundary
@@ -91,8 +93,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -eu
-          version=$(cat VERSION)
-          revision=$(git rev-parse HEAD)
+          git fetch --force origin refs/heads/main:refs/remotes/origin/main
+          revision=$(git rev-parse origin/main)
+          version=$(git show "$revision:VERSION")
           python3 scripts/runtime_versions.py release-preflight \
             --version "$version" --revision "$revision" --live \
             --allow-same-identity
@@ -110,7 +113,7 @@ jobs:
           set -eu
           python3 scripts/runtime_versions.py update --write
           python3 scripts/runtime_versions.py validate \
-            --base-ref origin/main --automation-diff
+            --base-ref origin/develop --automation-diff
       - name: Commit and push the bot-owned branch
         env:
           AUTOMATION_TOKEN: ${{ github.token }}
@@ -142,7 +145,7 @@ jobs:
                 .user.login == "github-actions[bot]" and
                 .head.ref == $branch and
                 .head.repo.full_name == $repository and
-                .base.ref == "main"
+                .base.ref == "develop"
               ' >/dev/null
             remote_commit=$(gh api "repos/$GITHUB_REPOSITORY/commits/$remote_sha")
             printf '%s' "$remote_commit" | jq -e '
@@ -193,7 +196,7 @@ jobs:
           The exact PR head must pass the \`verify\` and \`runtime-image\` jobs; no workflow has a ruleset bypass.
           EOF
           if [ "$count" -eq 0 ]; then
-            url=$(gh pr create --base main --head "$branch" \
+            url=$(gh pr create --base develop --head "$branch" \
               --title "chore: release runtime $version" \
               --body-file "$RUNNER_TEMP/pr-body.md")
             number=${url##*/}
@@ -212,19 +215,18 @@ jobs:
             --arg repository "$GITHUB_REPOSITORY" '
               .state == "open" and
               .user.login == "github-actions[bot]" and
-              .base.ref == "main" and
+              .base.ref == "develop" and
               .head.ref == $branch and
               .head.sha == $head and
               .head.repo.full_name == $repository
             ' >/dev/null
 
           jq -n \
-            --arg ref "$branch" \
             --arg number "$number" \
             --arg head "$head_sha" \
-            '{ref:$ref,inputs:{pull_request_number:$number,head_sha:$head}}' \
+            '{event_type:"automation-ci",client_payload:{kind:"runtime-update",pull_request_number:$number,head_sha:$head}}' \
             | gh api --method POST \
-                "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/dispatches" \
+                "repos/$GITHUB_REPOSITORY/dispatches" \
                 --input -
           printf "Updater PR: #%s; head: \`%s\`; target release: \`%s\`; CI dispatched.\n" \
             "$number" "$head_sha" "$version" >>"$GITHUB_STEP_SUMMARY"

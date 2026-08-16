@@ -4,20 +4,24 @@ on:
   workflow_run:
     workflows: [CI]
     types: [completed]
-    branches: [automation/runtime-versions]
+    branches: [main]
 
 permissions: {}
 
 concurrency:
-  group: runtime-version-auto-merge-${{ github.event.workflow_run.head_sha }}
+  group: runtime-version-auto-merge-${{ github.event.workflow_run.id }}
   cancel-in-progress: false
 
 jobs:
   merge:
     name: merge
     if: >-
+      vars.RELEASE_AUTOMATION_ENABLED == 'true' &&
       github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.event == 'workflow_dispatch'
+      github.event.workflow_run.event == 'repository_dispatch' &&
+      (startsWith(github.event.workflow_run.display_title, 'CI automation runtime-update ') ||
+       startsWith(github.event.workflow_run.display_title, 'CI automation release-patch ') ||
+       startsWith(github.event.workflow_run.display_title, 'CI automation sync-main '))
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -28,13 +32,13 @@ jobs:
       merge_sha: ${{ steps.merge.outputs.merge_sha }}
       pull_request_number: ${{ steps.merge.outputs.pull_request_number }}
     steps:
-      - name: Revalidate the triggering run and merge the exact PR head
+      - name: Revalidate trusted CI metadata and merge the exact PR head
         id: merge
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_ID: ${{ github.event.workflow_run.id }}
           RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
-          EVENT_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          EVENT_WORKFLOW_SHA: ${{ github.event.workflow_run.head_sha }}
           EVENT_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
           EVENT_ACTOR: ${{ github.event.workflow_run.actor.login }}
           EVENT_TRIGGERING_ACTOR: ${{ github.event.workflow_run.triggering_actor.login }}
@@ -48,14 +52,11 @@ jobs:
           case "$RUN_ATTEMPT" in
             *[!0-9]*|'') echo 'run attempt must be numeric' >&2; exit 1 ;;
           esac
-          case "$EVENT_HEAD_SHA" in
-            *[!0-9a-f]*|'') echo 'run head must be lowercase hexadecimal' >&2; exit 1 ;;
+          case "$EVENT_WORKFLOW_SHA" in
+            *[!0-9a-f]*|'') echo 'workflow SHA must be lowercase hexadecimal' >&2; exit 1 ;;
           esac
-          [ "${#EVENT_HEAD_SHA}" -eq 40 ] || {
-            echo 'run head must contain exactly 40 characters' >&2
-            exit 1
-          }
-          [ "$EVENT_HEAD_BRANCH" = automation/runtime-versions ]
+          [ "${#EVENT_WORKFLOW_SHA}" -eq 40 ]
+          [ "$EVENT_HEAD_BRANCH" = main ]
           [ "$EVENT_ACTOR" = 'github-actions[bot]' ]
           [ "$EVENT_TRIGGERING_ACTOR" = 'github-actions[bot]' ]
 
@@ -67,25 +68,66 @@ jobs:
             --argjson run_attempt "$RUN_ATTEMPT" \
             --argjson workflow_id "$expected_workflow_id" \
             --arg repository "$GITHUB_REPOSITORY" \
-            --arg head "$EVENT_HEAD_SHA" '
+            --arg workflow_sha "$EVENT_WORKFLOW_SHA" '
               .id == $run_id and
               .run_attempt == $run_attempt and
               .workflow_id == $workflow_id and
               .name == "CI" and
               .path == ".github/workflows/ci.yml" and
-              .event == "workflow_dispatch" and
+              .event == "repository_dispatch" and
               .status == "completed" and
               .conclusion == "success" and
               .repository.full_name == $repository and
-              .head_branch == "automation/runtime-versions" and
-              .head_sha == $head and
+              .head_branch == "main" and
+              .head_sha == $workflow_sha and
               .actor.login == "github-actions[bot]" and
               .triggering_actor.login == "github-actions[bot]"
             ' >/dev/null
+          live_main=$(gh api \
+            "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)
+          [ "$live_main" = "$EVENT_WORKFLOW_SHA" ] || {
+            printf 'trusted workflow moved: run=%s live-main=%s\n' \
+              "$EVENT_WORKFLOW_SHA" "$live_main" >&2
+            exit 1
+          }
+
+          identity=$(printf '%s' "$run" | jq -er '
+            .display_title |
+            capture("^CI automation (?<kind>runtime-update|release-patch|sync-main) PR-(?<number>[1-9][0-9]*) SHA-(?<head>[0-9a-f]{40})$") |
+            [.kind, .number, .head] | @tsv
+          ')
+          IFS=$'\t' read -r automation_kind pull_request_number automation_head <<EOF
+          $identity
+          EOF
+          case "$automation_head" in
+            *[!0-9a-f]*|'') echo 'automation head must be lowercase hexadecimal' >&2; exit 1 ;;
+          esac
+          [ "${#automation_head}" -eq 40 ]
+          case "$pull_request_number" in
+            *[!0-9]*|'') echo 'pull request number must be numeric' >&2; exit 1 ;;
+          esac
+
+          case "$automation_kind" in
+            runtime-update)
+              expected_branch=automation/runtime-versions
+              expected_files=$(printf '%s\n' VERSION build/runtime-versions.env | LC_ALL=C sort)
+              merge_method=squash
+              ;;
+            release-patch)
+              expected_branch=automation/release-patch
+              expected_files=VERSION
+              merge_method=squash
+              ;;
+            sync-main)
+              expected_branch=automation/sync-main
+              expected_files=
+              merge_method=merge
+              ;;
+          esac
 
           jobs_pages=$(gh api --paginate --slurp \
             "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT/jobs?per_page=100")
-          expected_names='["context","runtime-image","verify"]'
+          expected_names='["automation-runtime-image","automation-verify","context","publish-checks"]'
           actual_names=$(printf '%s' "$jobs_pages" | jq -c \
             '[.[].jobs[].name] | sort')
           [ "$actual_names" = "$expected_names" ] || {
@@ -94,63 +136,73 @@ jobs:
           }
           printf '%s' "$jobs_pages" | jq -e '
             [.[].jobs[]] as $jobs |
-            ($jobs | length) == 3 and
+            ($jobs | length) == 4 and
             all($jobs[]; .status == "completed" and .conclusion == "success")
           ' >/dev/null
 
-          prs=$(gh api \
-            -H 'Accept: application/vnd.github+json' \
-            "repos/$GITHUB_REPOSITORY/commits/$EVENT_HEAD_SHA/pulls")
-          matches=$(printf '%s' "$prs" | jq -c \
+          pr=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$pull_request_number")
+          printf '%s' "$pr" | jq -e \
+            --argjson number "$pull_request_number" \
             --arg repository "$GITHUB_REPOSITORY" \
-            --arg head "$EVENT_HEAD_SHA" '[
-              .[] | select(
-                .base.ref == "main" and
-                .head.ref == "automation/runtime-versions" and
-                .head.repo.full_name == $repository and
-                .head.sha == $head and
-                .user.login == "github-actions[bot]" and
-                .commits == 1
-              )
-            ]')
-          [ "$(printf '%s' "$matches" | jq 'length')" -eq 1 ] || {
-            echo 'expected exactly one matching updater PR' >&2
-            exit 1
-          }
-          pull_request_number=$(printf '%s' "$matches" | jq -r '.[0].number')
-          state=$(printf '%s' "$matches" | jq -r '.[0].state')
-          merged=$(printf '%s' "$matches" | jq -r '.[0].merged')
+            --arg branch "$expected_branch" \
+            --arg head "$automation_head" '
+              .number == $number and
+              .base.ref == "develop" and
+              .head.ref == $branch and
+              .head.repo.full_name == $repository and
+              .head.sha == $head and
+              .user.login == "github-actions[bot]" and
+              .commits == 1
+            ' >/dev/null
+          state=$(printf '%s' "$pr" | jq -r .state)
+          merged=$(printf '%s' "$pr" | jq -r .merged)
+          base_sha=$(printf '%s' "$pr" | jq -r .base.sha)
 
           files=$(gh api --paginate \
             "repos/$GITHUB_REPOSITORY/pulls/$pull_request_number/files?per_page=100" \
             --jq '.[].filename' | LC_ALL=C sort)
-          expected=$(printf '%s\n' VERSION build/runtime-versions.env | LC_ALL=C sort)
-          [ "$files" = "$expected" ] || {
-            printf 'unexpected updater PR files:\n%s\n' "$files" >&2
+          [ "$files" = "$expected_files" ] || {
+            printf 'unexpected automation PR files:\n%s\n' "$files" >&2
             exit 1
           }
-          commit=$(gh api "repos/$GITHUB_REPOSITORY/commits/$EVENT_HEAD_SHA")
+          commit=$(gh api "repos/$GITHUB_REPOSITORY/commits/$automation_head")
           printf '%s' "$commit" | jq -e '
             .author.login == "github-actions[bot]" and
             .committer.login == "github-actions[bot]"
           ' >/dev/null
+          if [ "$automation_kind" = sync-main ]; then
+            printf '%s' "$commit" | jq -e \
+              --arg develop "$base_sha" \
+              --arg main "$EVENT_WORKFLOW_SHA" '
+                (.parents | length) == 2 and
+                .parents[0].sha == $develop and
+                .parents[1].sha == $main
+              ' >/dev/null
+          fi
 
           if [ "$state" = open ] && [ "$merged" = false ]; then
             compare=$(gh api \
-              "repos/$GITHUB_REPOSITORY/compare/main...$EVENT_HEAD_SHA")
+              "repos/$GITHUB_REPOSITORY/compare/develop...$automation_head")
             printf '%s' "$compare" | jq -e '.behind_by == 0' >/dev/null
-            gh pr merge "$pull_request_number" \
-              --repo "$GITHUB_REPOSITORY" \
-              --squash --delete-branch \
-              --match-head-commit "$EVENT_HEAD_SHA"
+            if [ "$merge_method" = merge ]; then
+              gh pr merge "$pull_request_number" \
+                --repo "$GITHUB_REPOSITORY" \
+                --merge --delete-branch \
+                --match-head-commit "$automation_head"
+            else
+              gh pr merge "$pull_request_number" \
+                --repo "$GITHUB_REPOSITORY" \
+                --squash --delete-branch \
+                --match-head-commit "$automation_head"
+            fi
           elif [ "$state" != closed ] || [ "$merged" != true ]; then
-            echo 'updater PR is neither open nor already merged' >&2
+            echo 'automation PR is neither open nor already merged' >&2
             exit 1
           fi
 
           pr=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$pull_request_number")
           printf '%s' "$pr" | jq -e \
-            --arg head "$EVENT_HEAD_SHA" '
+            --arg head "$automation_head" '
               .state == "closed" and
               .merged == true and
               .head.sha == $head and
@@ -158,7 +210,7 @@ jobs:
             ' >/dev/null
           merge_sha=$(printf '%s' "$pr" | jq -r .merge_commit_sha)
           ancestry=$(gh api \
-            "repos/$GITHUB_REPOSITORY/compare/$merge_sha...main")
+            "repos/$GITHUB_REPOSITORY/compare/$merge_sha...develop")
           printf '%s' "$ancestry" | jq -e '
             (.status == "identical" or .status == "ahead") and .behind_by == 0
           ' >/dev/null
@@ -166,24 +218,23 @@ jobs:
             printf 'merge_sha=%s\n' "$merge_sha"
             printf 'pull_request_number=%s\n' "$pull_request_number"
           } >>"$GITHUB_OUTPUT"
-          printf 'Merged updater PR #%s at %s.\n' \
+          printf 'Merged automation PR #%s at %s.\n' \
             "$pull_request_number" "$merge_sha" >>"$GITHUB_STEP_SUMMARY"
 
-  dispatch-release:
-    name: dispatch-release
+  dispatch-develop:
+    name: dispatch-develop
     needs: merge
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
-      actions: write
-      contents: read
+      contents: write
     steps:
-      - name: Dispatch release for the exact merge identity
+      - name: Dispatch trusted reconciliation for the exact develop merge
         env:
           GH_TOKEN: ${{ github.token }}
           MERGE_SHA: ${{ needs.merge.outputs.merge_sha }}
         run: |
-          # jq programs and Python regular expressions are intentionally literal.
+          # jq programs are intentionally literal.
           # shellcheck disable=SC2016
           set -euo pipefail
           case "$MERGE_SHA" in
@@ -191,30 +242,16 @@ jobs:
           esac
           [ "${#MERGE_SHA}" -eq 40 ]
 
-          ancestry=$(gh api "repos/$GITHUB_REPOSITORY/compare/$MERGE_SHA...main")
+          ancestry=$(gh api "repos/$GITHUB_REPOSITORY/compare/$MERGE_SHA...develop")
           printf '%s' "$ancestry" | jq -e '
             (.status == "identical" or .status == "ahead") and .behind_by == 0
           ' >/dev/null
 
-          encoded=$(gh api \
-            "repos/$GITHUB_REPOSITORY/contents/VERSION?ref=$MERGE_SHA" --jq .content)
-          version=$(printf '%s' "$encoded" | tr -d '\n' | base64 --decode | tr -d '\n')
-          python3 - "$version" "$MERGE_SHA" <<'PY'
-          import re
-          import sys
-
-          if re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", sys.argv[1]) is None:
-              raise SystemExit("VERSION at merge is not stable SemVer")
-          if re.fullmatch(r"[0-9a-f]{40}", sys.argv[2]) is None:
-              raise SystemExit("merge revision is not a full lowercase SHA")
-          PY
-
           jq -n \
-            --arg version "$version" \
             --arg revision "$MERGE_SHA" \
-            '{ref:"main",inputs:{version:$version,revision:$revision}}' \
+            '{event_type:"reconcile-develop",client_payload:{revision:$revision}}' \
             | gh api --method POST \
-                "repos/$GITHUB_REPOSITORY/actions/workflows/release.yml/dispatches" \
+                "repos/$GITHUB_REPOSITORY/dispatches" \
                 --input -
-          printf 'Dispatched release %s for %s.\n' \
-            "$version" "$MERGE_SHA" >>"$GITHUB_STEP_SUMMARY"
+          printf 'Dispatched trusted reconciliation for %s.\n' \
+            "$MERGE_SHA" >>"$GITHUB_STEP_SUMMARY"

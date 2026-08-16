@@ -4,16 +4,8 @@ on:
   push:
     branches: [main]
     paths: [VERSION]
-  workflow_dispatch:
-    inputs:
-      version:
-        description: Stable release version (X.Y.Z)
-        required: true
-        type: string
-      revision:
-        description: Exact 40-character main revision
-        required: true
-        type: string
+  repository_dispatch:
+    types: [stable-release-recovery]
 
 permissions: {}
 
@@ -24,11 +16,13 @@ concurrency:
 jobs:
   plan:
     name: plan
+    if: vars.RELEASE_AUTOMATION_ENABLED == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: read
       packages: read
+      pull-requests: read
     outputs:
       version: ${{ steps.identity.outputs.version }}
       revision: ${{ steps.identity.outputs.revision }}
@@ -46,8 +40,8 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           EVENT_REVISION: ${{ github.sha }}
-          INPUT_VERSION: ${{ inputs.version }}
-          INPUT_REVISION: ${{ inputs.revision }}
+          INPUT_VERSION: ${{ github.event.client_payload.version }}
+          INPUT_REVISION: ${{ github.event.client_payload.revision }}
         run: |
           # jq programs and Markdown format strings are intentionally literal.
           # shellcheck disable=SC2016
@@ -57,10 +51,12 @@ jobs:
             revision=$EVENT_REVISION
             version=$(git show "$revision:VERSION")
           else
-            [ "$GITHUB_REF" = refs/heads/main ] || {
-              printf 'manual release workflow ref must be main, got %s\n' "$GITHUB_REF" >&2
+            if [ "$EVENT_NAME" != repository_dispatch ] || \
+              [ "$GITHUB_REF" != refs/heads/main ]; then
+              printf 'release recovery must run from main repository_dispatch, got %s/%s\n' \
+                "$EVENT_NAME" "$GITHUB_REF" >&2
               exit 1
-            }
+            fi
             revision=$INPUT_REVISION
             version=$INPUT_VERSION
           fi
@@ -77,6 +73,46 @@ jobs:
             printf 'version=%s\n' "$version"
             printf 'revision=%s\n' "$revision"
           } >>"$GITHUB_OUTPUT"
+      - name: Require the owner-reviewed develop promotion
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REVISION: ${{ steps.identity.outputs.revision }}
+        run: |
+          # jq programs are intentionally literal.
+          # shellcheck disable=SC2016
+          set -euo pipefail
+          prs=$(gh api \
+            -H 'Accept: application/vnd.github+json' \
+            "repos/$GITHUB_REPOSITORY/commits/$REVISION/pulls")
+          matches=$(printf '%s' "$prs" | jq -c \
+            --arg revision "$REVISION" '[
+              .[] | select(
+                .state == "closed" and
+                .merged == true and
+                .base.ref == "main" and
+                .head.ref == "develop" and
+                .user.login == "github-actions[bot]" and
+                .merge_commit_sha == $revision and
+                .merged_by.login == "jskorlol"
+              )
+            ]')
+          [ "$(printf '%s' "$matches" | jq 'length')" -eq 1 ] || {
+            echo 'release revision is not one owner-merged develop promotion' >&2
+            exit 1
+          }
+          number=$(printf '%s' "$matches" | jq -r '.[0].number')
+          head=$(printf '%s' "$matches" | jq -r '.[0].head.sha')
+          reviews=$(gh api --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/pulls/$number/reviews?per_page=100")
+          printf '%s' "$reviews" | jq -e --arg head "$head" '
+            any(.[][];
+              .user.login == "jskorlol" and
+              .state == "APPROVED" and
+              .commit_id == $head)
+          ' >/dev/null || {
+            echo 'develop promotion lacks an owner approval for its exact head' >&2
+            exit 1
+          }
       - name: Reconcile current release state
         id: state
         env:
