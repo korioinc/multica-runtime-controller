@@ -948,6 +948,7 @@ def validate_actions(directory: Path) -> dict[str, Any]:
         "secrets.",
         "environment:",
         "gh pr merge",
+        "python3 scripts/runtime_versions.py",
     ):
         if forbidden in updater:
             raise ResolverError(
@@ -968,8 +969,15 @@ def validate_actions(directory: Path) -> dict[str, Any]:
             '"repos/$GITHUB_REPOSITORY/dispatches"',
             "pull_request_number",
             "head_sha",
+            "TRUSTED_RESOLVER: ${{ runner.temp }}/trusted-runtime-versions.py",
+            "EVENT_WORKFLOW_SHA: ${{ github.sha }}",
+            'git show "$live_main:scripts/runtime_versions.py"',
+            'git hash-object "$TRUSTED_RESOLVER"',
+            'python3 "$TRUSTED_RESOLVER"',
         ),
     )
+    if updater.count('python3 "$TRUSTED_RESOLVER"') != 7:
+        raise ResolverError("updater_trusted_resolver_call_count_mismatch")
     propose = workflow_jobs["runtime-version-update.yml"].get("propose")
     if propose is None:
         raise ResolverError("updater_job_missing job=propose")
