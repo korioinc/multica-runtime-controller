@@ -78,7 +78,7 @@ jobs:
         run: |
           set -eu
           python3 scripts/runtime_versions.py build-args \
-            --format json --revision "$REVISION" \
+            --version develop --format json --revision "$REVISION" \
             | jq -r 'to_entries[] | "\(.key)=\(.value)"' >"$RUNNER_TEMP/build-args"
           {
             echo 'value<<EOF'

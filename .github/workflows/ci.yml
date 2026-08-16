@@ -101,7 +101,7 @@ jobs:
                   files=$(gh api --paginate \
                     "repos/$GITHUB_REPOSITORY/pulls/$INPUT_PULL_REQUEST_NUMBER/files?per_page=100" \
                     --jq '.[].filename' | LC_ALL=C sort)
-                  expected=$(printf '%s\n' VERSION build/runtime-versions.env | LC_ALL=C sort)
+                  expected=build/runtime-versions.env
                   [ "$files" = "$expected" ] || {
                     printf 'unexpected runtime update files:\n%s\n' "$files" >&2
                     exit 1
@@ -115,59 +115,6 @@ jobs:
                     "repos/$GITHUB_REPOSITORY/compare/develop...$INPUT_HEAD_SHA")
                   printf '%s' "$compare" | jq -e '.behind_by == 0' >/dev/null
                   cache_scope="runtime-update-$INPUT_PULL_REQUEST_NUMBER"
-                  ;;
-                release-patch)
-                  if ! { [ "$EVENT_ACTOR" = 'github-actions[bot]' ] && \
-                    [ "$EVENT_TRIGGERING_ACTOR" = 'github-actions[bot]' ]; }; then
-                      printf 'unexpected patch dispatch actor: actor=%s triggering=%s\n' \
-                        "$EVENT_ACTOR" "$EVENT_TRIGGERING_ACTOR" >&2
-                      exit 1
-                  fi
-                  printf '%s' "$pr" | jq -e \
-                    --arg repository "$GITHUB_REPOSITORY" \
-                    --arg head "$INPUT_HEAD_SHA" '
-                      .state == "open" and
-                      .base.ref == "develop" and
-                      .head.ref == "automation/release-patch" and
-                      .head.repo.full_name == $repository and
-                      .head.sha == $head and
-                      .user.login == "github-actions[bot]" and
-                      .commits == 1
-                    ' >/dev/null
-                  files=$(gh api --paginate \
-                    "repos/$GITHUB_REPOSITORY/pulls/$INPUT_PULL_REQUEST_NUMBER/files?per_page=100" \
-                    --jq '.[].filename')
-                  [ "$files" = VERSION ]
-                  commit=$(gh api "repos/$GITHUB_REPOSITORY/commits/$INPUT_HEAD_SHA")
-                  printf '%s' "$commit" | jq -e '
-                    .author.login == "github-actions[bot]" and
-                    .committer.login == "github-actions[bot]"
-                  ' >/dev/null
-                  compare=$(gh api \
-                    "repos/$GITHUB_REPOSITORY/compare/develop...$INPUT_HEAD_SHA")
-                  printf '%s' "$compare" | jq -e \
-                    '.behind_by == 0 and .ahead_by == 1' >/dev/null
-                  base_version=$(gh api \
-                    "repos/$GITHUB_REPOSITORY/contents/VERSION?ref=$base_sha" \
-                    --jq .content | tr -d '\n' | base64 --decode | tr -d '\n')
-                  head_version=$(gh api \
-                    "repos/$GITHUB_REPOSITORY/contents/VERSION?ref=$INPUT_HEAD_SHA" \
-                    --jq .content | tr -d '\n' | base64 --decode | tr -d '\n')
-                  python3 - "$base_version" "$head_version" <<'PY'
-          import re
-          import sys
-
-          pattern = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
-          values = []
-          for value in sys.argv[1:]:
-              match = pattern.fullmatch(value)
-              if match is None:
-                  raise SystemExit(f"invalid stable SemVer: {value}")
-              values.append(tuple(int(part) for part in match.groups()))
-          if values[1] != (values[0][0], values[0][1], values[0][2] + 1):
-              raise SystemExit("release patch must increment exactly once")
-          PY
-                  cache_scope="release-patch-$INPUT_PULL_REQUEST_NUMBER"
                   ;;
                 sync-main)
                   if ! { [ "$EVENT_ACTOR" = 'github-actions[bot]' ] && \
@@ -218,7 +165,8 @@ jobs:
                       .base.ref == "main" and
                       .head.ref == "develop" and
                       .head.repo.full_name == $repository and
-                      .head.sha == $head
+                      .head.sha == $head and
+                      .user.login == "github-actions[bot]"
                     ' >/dev/null
                   live_head=$(gh api \
                     "repos/$GITHUB_REPOSITORY/git/ref/heads/develop" --jq .object.sha)
@@ -352,7 +300,7 @@ jobs:
             [ "$BASE_SHA" = 0000000000000000000000000000000000000000 ]; then
             build=true
           elif git diff --quiet "$BASE_SHA" HEAD -- \
-            Dockerfile .dockerignore VERSION build/runtime-versions.env \
+            Dockerfile .dockerignore build/runtime-versions.env \
             scripts/install-runtime-tools.sh scripts/runtime-entrypoint.sh \
             scripts/verify-runtime-tools.sh src; then
             build=false
@@ -384,7 +332,7 @@ jobs:
         run: |
           set -eu
           python3 scripts/runtime_versions.py build-args \
-            --format json --revision "$REVISION" \
+            --version ci --format json --revision "$REVISION" \
             | jq -r 'to_entries[] | "\(.key)=\(.value)"' >"$RUNNER_TEMP/build-args"
           {
             echo 'value<<EOF'
@@ -430,6 +378,7 @@ jobs:
   publish-checks:
     name: publish-checks
     if: >-
+      vars.RELEASE_AUTOMATION_ENABLED == 'true' &&
       github.event_name == 'repository_dispatch' &&
       needs.verify.result == 'success' &&
       needs.runtime-image.result == 'success'
@@ -491,6 +440,7 @@ jobs:
     name: dispatch-merge
     if: >-
       always() &&
+      vars.RELEASE_AUTOMATION_ENABLED == 'true' &&
       github.event_name == 'repository_dispatch' &&
       needs.context.result == 'success' &&
       needs.verify.result == 'success' &&
@@ -515,7 +465,7 @@ jobs:
         run: |
           set -euo pipefail
           case "$AUTOMATION_KIND" in
-            runtime-update|release-patch|sync-main) ;;
+            runtime-update|sync-main) ;;
             *) printf 'unsupported merge kind: %s\n' "$AUTOMATION_KIND" >&2; exit 1 ;;
           esac
           case "$HEAD_SHA" in
