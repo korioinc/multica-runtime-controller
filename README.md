@@ -130,7 +130,9 @@ Six workflows own delivery:
   `main`. Recovery uses the `stable-release-recovery` repository-dispatch event
   with the exact stable version and full 40-character main revision. Candidate
   builds use the same native per-architecture fan-out and digest-based manifest
-  assembly as development publication.
+  assembly as development publication. The workflow validates the public
+  tag-rule shape visible to its scoped token; repository settings separately
+  enforce and admin-verify that the active tag ruleset has no bypass actors.
 
 The release, development publisher, updater, CI dispatcher, merge, and develop
 promotion dispatcher use only GitHub's ephemeral repository-scoped `GITHUB_TOKEN` with

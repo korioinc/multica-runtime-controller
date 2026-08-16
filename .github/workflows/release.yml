@@ -192,7 +192,6 @@ jobs:
             '[.[] | select(.target == "tag" and .enforcement == "active")][0].id')
           tag_ruleset=$(gh api "repos/$GITHUB_REPOSITORY/rulesets/$tag_id")
           printf '%s' "$tag_ruleset" | jq -e '
-            .bypass_actors == [] and
             .conditions.ref_name.include == ["refs/tags/v*"] and
             ([.rules[].type] | index("deletion") != null) and
             ([.rules[].type] | index("update") != null)' >/dev/null
@@ -303,7 +302,6 @@ jobs:
             '[.[] | select(.target == "tag" and .enforcement == "active")][0].id')
           tag_ruleset=$(gh api "repos/$GITHUB_REPOSITORY/rulesets/$tag_id")
           printf '%s' "$tag_ruleset" | jq -e '
-            .bypass_actors == [] and
             .conditions.ref_name.include == ["refs/tags/v*"] and
             ([.rules[].type] | index("deletion") != null) and
             ([.rules[].type] | index("update") != null)' >/dev/null
