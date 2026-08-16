@@ -111,16 +111,19 @@ jobs:
             runtime-update)
               expected_branch=automation/runtime-versions
               expected_files=$(printf '%s\n' VERSION build/runtime-versions.env | LC_ALL=C sort)
+              expected_commit_count=1
               merge_method=squash
               ;;
             release-patch)
               expected_branch=automation/release-patch
               expected_files=VERSION
+              expected_commit_count=1
               merge_method=squash
               ;;
             sync-main)
               expected_branch=automation/sync-main
               expected_files=
+              expected_commit_count=2
               merge_method=merge
               ;;
           esac
@@ -145,14 +148,15 @@ jobs:
             --argjson number "$pull_request_number" \
             --arg repository "$GITHUB_REPOSITORY" \
             --arg branch "$expected_branch" \
-            --arg head "$automation_head" '
+            --arg head "$automation_head" \
+            --argjson expected_commit_count "$expected_commit_count" '
               .number == $number and
               .base.ref == "develop" and
               .head.ref == $branch and
               .head.repo.full_name == $repository and
               .head.sha == $head and
               .user.login == "github-actions[bot]" and
-              .commits == 1
+              .commits == $expected_commit_count
             ' >/dev/null
           state=$(printf '%s' "$pr" | jq -r .state)
           merged=$(printf '%s' "$pr" | jq -r .merged)

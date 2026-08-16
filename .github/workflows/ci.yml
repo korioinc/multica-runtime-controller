@@ -185,7 +185,7 @@ jobs:
                       .head.repo.full_name == $repository and
                       .head.sha == $head and
                       .user.login == "github-actions[bot]" and
-                      .commits == 1
+                      .commits == 2
                     ' >/dev/null
                   files=$(gh api --paginate \
                     "repos/$GITHUB_REPOSITORY/pulls/$INPUT_PULL_REQUEST_NUMBER/files?per_page=100" \
@@ -207,7 +207,7 @@ jobs:
                   compare=$(gh api \
                     "repos/$GITHUB_REPOSITORY/compare/develop...$INPUT_HEAD_SHA")
                   printf '%s' "$compare" | jq -e \
-                    '.behind_by == 0 and .ahead_by == 1' >/dev/null
+                    '.behind_by == 0 and .ahead_by == 2' >/dev/null
                   cache_scope="sync-main-$INPUT_PULL_REQUEST_NUMBER"
                   ;;
                 promotion)
