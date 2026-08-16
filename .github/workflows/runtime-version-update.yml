@@ -53,27 +53,6 @@ jobs:
             >"$TRUSTED_RESOLVER"
           [ "$(git hash-object "$TRUSTED_RESOLVER")" = "$expected_blob" ]
           chmod 0555 "$TRUSTED_RESOLVER"
-      - name: Require the current release to be complete
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TRUSTED_RESOLVER: ${{ runner.temp }}/trusted-runtime-versions.py
-        run: |
-          # jq programs and Markdown format strings are intentionally literal.
-          # shellcheck disable=SC2016
-          set -eu
-          git fetch --force origin refs/heads/main:refs/remotes/origin/main
-          revision=$(git rev-parse origin/main)
-          version=$(git show "$revision:VERSION")
-          python3 -I "$TRUSTED_RESOLVER" --root "$TARGET_ROOT" release-preflight \
-            --version "$version" --revision "$revision" --live \
-            --allow-same-identity
-          state=$(python3 -I "$TRUSTED_RESOLVER" --root "$TARGET_ROOT" release-state \
-            --version "$version" --revision "$revision" --live \
-            --format json | jq -r .state)
-          [ "$state" = latest_digest_matched ] || {
-            printf 'current release is incomplete: %s\n' "$state" >&2
-            exit 1
-          }
       - name: Check official stable sources
         id: check
         env:
@@ -101,7 +80,9 @@ jobs:
   propose:
     name: propose
     needs: resolve
-    if: needs.resolve.outputs.has_updates == 'true'
+    if: >-
+      vars.RELEASE_AUTOMATION_ENABLED == 'true' &&
+      needs.resolve.outputs.has_updates == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -137,26 +118,7 @@ jobs:
             >"$TRUSTED_RESOLVER"
           [ "$(git hash-object "$TRUSTED_RESOLVER")" = "$expected_blob" ]
           chmod 0555 "$TRUSTED_RESOLVER"
-      - name: Revalidate the checked-out release boundary
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TRUSTED_RESOLVER: ${{ runner.temp }}/trusted-runtime-versions.py
-        run: |
-          set -eu
-          git fetch --force origin refs/heads/main:refs/remotes/origin/main
-          revision=$(git rev-parse origin/main)
-          version=$(git show "$revision:VERSION")
-          python3 -I "$TRUSTED_RESOLVER" --root "$TARGET_ROOT" release-preflight \
-            --version "$version" --revision "$revision" --live \
-            --allow-same-identity
-          state=$(python3 -I "$TRUSTED_RESOLVER" --root "$TARGET_ROOT" release-state \
-            --version "$version" --revision "$revision" --live \
-            --format json | jq -r .state)
-          [ "$state" = latest_digest_matched ] || {
-            printf 'checked-out release is incomplete: %s\n' "$state" >&2
-            exit 1
-          }
-      - name: Update the exact two version files
+      - name: Update the exact runtime environment file
         env:
           GH_TOKEN: ${{ github.token }}
           TRUSTED_RESOLVER: ${{ runner.temp }}/trusted-runtime-versions.py
@@ -177,7 +139,7 @@ jobs:
           git config user.name "$bot_login"
           git config user.email "$bot_email"
           git checkout -B "$branch"
-          git add VERSION build/runtime-versions.env
+          git add build/runtime-versions.env
           git commit --no-gpg-sign -m 'chore: update runtime versions'
 
           remote_sha=$(git ls-remote --heads origin "$branch" | awk '{print $1}')
@@ -235,25 +197,22 @@ jobs:
           prs=$(gh pr list --state open --head "$branch" --json number --limit 10)
           count=$(printf '%s' "$prs" | jq 'length')
           [ "$count" -le 1 ] || { echo 'duplicate updater PRs detected' >&2; exit 1; }
-          version=$(cat VERSION)
           cat >"$RUNNER_TEMP/pr-body.md" <<EOF
           ## Runtime version update
 
           Automated stable-source changes: \`$UPDATES\`
 
-          Target controller release: \`$version\`
-
-          Changed files are restricted to \`VERSION\` and \`build/runtime-versions.env\`.
+          The changed tracked file is exactly \`build/runtime-versions.env\`.
           The exact PR head must pass the \`verify\` and \`runtime-image\` jobs; no workflow has a ruleset bypass.
           EOF
           if [ "$count" -eq 0 ]; then
             url=$(gh pr create --base develop --head "$branch" \
-              --title "chore: release runtime $version" \
+              --title 'chore: update runtime versions' \
               --body-file "$RUNNER_TEMP/pr-body.md")
             number=${url##*/}
           else
             number=$(printf '%s' "$prs" | jq -r '.[0].number')
-            gh pr edit "$number" --title "chore: release runtime $version" \
+            gh pr edit "$number" --title 'chore: update runtime versions' \
               --body-file "$RUNNER_TEMP/pr-body.md"
           fi
 
@@ -279,5 +238,5 @@ jobs:
             | gh api --method POST \
                 "repos/$GITHUB_REPOSITORY/dispatches" \
                 --input -
-          printf "Updater PR: #%s; head: \`%s\`; target release: \`%s\`; CI dispatched.\n" \
-            "$number" "$head_sha" "$version" >>"$GITHUB_STEP_SUMMARY"
+          printf "Updater PR: #%s; head: \`%s\`; env-only CI dispatched.\n" \
+            "$number" "$head_sha" >>"$GITHUB_STEP_SUMMARY"

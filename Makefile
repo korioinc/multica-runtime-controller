@@ -31,6 +31,8 @@ ACTIONLINT_WORKFLOWS := \
 	../.github/workflows/create-develop-to-main-pr.yml \
 	../.github/workflows/develop-image.yml \
 	../.github/workflows/release.yml \
+	../.github/workflows/release-repair.yml \
+	../.github/workflows/release-repair-guard.yml \
 	../.github/workflows/runtime-version-update.yml \
 	../.github/workflows/runtime-version-auto-merge.yml
 

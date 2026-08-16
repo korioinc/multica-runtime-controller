@@ -3,7 +3,6 @@ name: Release
 on:
   push:
     branches: [main]
-    paths: [VERSION]
   repository_dispatch:
     types: [stable-release-recovery]
 
@@ -18,142 +17,167 @@ jobs:
     name: plan
     if: vars.RELEASE_AUTOMATION_ENABLED == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     permissions:
       contents: read
       packages: read
       pull-requests: read
     outputs:
+      eligible: ${{ steps.context.outputs.eligible }}
+      target_kind: ${{ steps.context.outputs.target_kind }}
       version: ${{ steps.identity.outputs.version }}
-      revision: ${{ steps.identity.outputs.revision }}
-      state: ${{ steps.state.outputs.state }}
-      next_action: ${{ steps.state.outputs.next_action }}
-      digest: ${{ steps.state.outputs.digest }}
+      revision: ${{ steps.context.outputs.revision }}
+      state: ${{ steps.identity.outputs.state }}
+      next_action: ${{ steps.identity.outputs.next_action }}
+      digest: ${{ steps.identity.outputs.digest }}
     steps:
-      - name: Check out trusted revision
+      - name: Check out the trusted main workflow
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Resolve immutable release identity
-        id: identity
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          EVENT_REVISION: ${{ github.sha }}
-          INPUT_VERSION: ${{ github.event.client_payload.version }}
-          INPUT_REVISION: ${{ github.event.client_payload.revision }}
-        run: |
-          # jq programs and Markdown format strings are intentionally literal.
-          # shellcheck disable=SC2016
-          set -eu
-          git fetch --force --tags origin
-          if [ "$EVENT_NAME" = push ]; then
-            revision=$EVENT_REVISION
-            version=$(git show "$revision:VERSION")
-          else
-            if [ "$EVENT_NAME" != repository_dispatch ] || \
-              [ "$GITHUB_REF" != refs/heads/main ]; then
-              printf 'release recovery must run from main repository_dispatch, got %s/%s\n' \
-                "$EVENT_NAME" "$GITHUB_REF" >&2
-              exit 1
-            fi
-            revision=$INPUT_REVISION
-            version=$INPUT_VERSION
-          fi
-          python3 - "$version" "$revision" <<'PY'
-          import re
-          import sys
-
-          if re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", sys.argv[1]) is None:
-              raise SystemExit("release version must be stable SemVer")
-          if re.fullmatch(r"[0-9a-f]{40}", sys.argv[2]) is None:
-              raise SystemExit("release revision must be a full lowercase SHA")
-          PY
-          {
-            printf 'version=%s\n' "$version"
-            printf 'revision=%s\n' "$revision"
-          } >>"$GITHUB_OUTPUT"
-      - name: Require the owner-reviewed develop promotion
+      - name: Resolve the exact release target and human boundary
+        id: context
         env:
           GH_TOKEN: ${{ github.token }}
-          REVISION: ${{ steps.identity.outputs.revision }}
+          EVENT_ACTOR: ${{ github.actor }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_REF: ${{ github.ref }}
+          EVENT_REVISION: ${{ github.sha }}
+          INPUT_REVISION: ${{ github.event.client_payload.revision }}
         run: |
           # jq programs are intentionally literal.
-          # shellcheck disable=SC2016
           set -euo pipefail
+          skip_push() {
+            kind=$1
+            reason=$2
+            {
+              echo 'eligible=false'
+              printf 'revision=%s\n' "$revision"
+              printf 'target_kind=%s\n' "$kind"
+            } >>"$GITHUB_OUTPUT"
+            printf "%s \`%s\`; release identity mutation skipped.\n" \
+              "$reason" "$revision" >>"$GITHUB_STEP_SUMMARY"
+            exit 0
+          }
+          git fetch --force --tags origin \
+            refs/heads/main:refs/remotes/origin/main
+          if [ "$EVENT_NAME" = push ]; then
+            revision=$EVENT_REVISION
+          else
+            [ "$EVENT_NAME" = repository_dispatch ]
+            [ "$EVENT_REF" = refs/heads/main ]
+            [ "$EVENT_ACTOR" = jskorlol ] || {
+              echo 'stable release recovery requires the canonical release principal' >&2
+              exit 1
+            }
+            revision=$INPUT_REVISION
+          fi
+          case "$revision" in
+            *[!0-9a-f]*|'') echo 'release revision must be lowercase hexadecimal' >&2; exit 1 ;;
+          esac
+          [ "${#revision}" -eq 40 ]
+          git cat-file -e "$revision^{commit}"
+          git merge-base --is-ancestor "$revision" origin/main
+          read -r commit merge_parent extra <<EOF
+          $(git rev-list --parents -n 1 "$revision")
+          EOF
+          [ "$commit" = "$revision" ]
+          [ -n "$merge_parent" ]
+          [ -z "$extra" ]
+
           prs=$(gh api \
             -H 'Accept: application/vnd.github+json' \
-            "repos/$GITHUB_REPOSITORY/commits/$REVISION/pulls")
+            "repos/$GITHUB_REPOSITORY/commits/$revision/pulls")
+          # shellcheck disable=SC2016
           matches=$(printf '%s' "$prs" | jq -c \
-            --arg revision "$REVISION" '[
+            --arg revision "$revision" '[
               .[] | select(
                 .state == "closed" and
                 .base.ref == "main" and
-                .head.ref == "develop" and
                 .user.login == "github-actions[bot]" and
                 .merge_commit_sha == $revision
               )
             ]')
-          [ "$(printf '%s' "$matches" | jq 'length')" -eq 1 ] || {
-            echo 'release revision is not one owner-merged develop promotion' >&2
+          if [ "$(printf '%s' "$matches" | jq 'length')" -ne 1 ]; then
+            if [ "$EVENT_NAME" = push ]; then
+              skip_push normal 'Unsupported direct main push'
+            fi
+            echo 'recovery target is not one supported bot-authored main PR' >&2
             exit 1
-          }
+          fi
           number=$(printf '%s' "$matches" | jq -r '.[0].number')
           promotion=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$number")
-          printf '%s' "$promotion" | jq -e \
-            --arg revision "$REVISION" '
-              .state == "closed" and
-              .merged == true and
-              .base.ref == "main" and
-              .head.ref == "develop" and
-              .user.login == "github-actions[bot]" and
-              .merge_commit_sha == $revision and
-              .merged_by.login == "jskorlol"
-            ' >/dev/null || {
-            echo 'promotion details do not match the release boundary' >&2
-            exit 1
-          }
-          head=$(printf '%s' "$promotion" | jq -r '.head.sha')
           reviews=$(gh api --paginate --slurp \
             "repos/$GITHUB_REPOSITORY/pulls/$number/reviews?per_page=100")
-          printf '%s' "$reviews" | jq -e --arg head "$head" '
-            any(.[][];
-              .user.login == "jskorlol" and
-              .state == "APPROVED" and
-              .commit_id == $head)
-          ' >/dev/null || {
-            echo 'develop promotion lacks an owner approval for its exact head' >&2
+          jq -n --arg merge_parent "$merge_parent" \
+            --argjson pull_request "$promotion" --argjson review_pages "$reviews" \
+            '{merge_parent:$merge_parent,pull_request:$pull_request,
+              reviews:[$review_pages[][]]}' \
+            >"$RUNNER_TEMP/release-provenance.json"
+          if ! provenance=$(python3 scripts/runtime_versions.py release-provenance \
+            --revision "$revision" \
+            --input-json "$RUNNER_TEMP/release-provenance.json" 2>"$RUNNER_TEMP/release-provenance.err"); then
+            if [ "$EVENT_NAME" = push ]; then
+              skip_push normal 'Unsupported main provenance'
+            fi
+            cat "$RUNNER_TEMP/release-provenance.err" >&2
             exit 1
-          }
-      - name: Reconcile current release state
-        id: state
+          fi
+          origin_kind=$(printf '%s' "$provenance" | jq -r .origin_kind)
+          eligible=$(printf '%s' "$provenance" | jq -r .eligible)
+          if [ "$EVENT_NAME" = push ]; then
+            target_kind=$origin_kind
+            if [ "$eligible" != true ]; then
+              skip_push "$target_kind" 'Classified control or peer repair'
+            fi
+          else
+            [ "$eligible" = true ] || {
+              echo 'recovery target is a control or peer repair commit' >&2
+              exit 1
+            }
+            target_kind=recovery
+          fi
+          {
+            echo 'eligible=true'
+            printf 'revision=%s\n' "$revision"
+            printf 'target_kind=%s\n' "$target_kind"
+          } >>"$GITHUB_OUTPUT"
+      - name: Resolve monotonic identity and earliest incomplete state
+        id: identity
+        if: steps.context.outputs.eligible == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ steps.identity.outputs.version }}
-          REVISION: ${{ steps.identity.outputs.revision }}
+          REVISION: ${{ steps.context.outputs.revision }}
+          TARGET_KIND: ${{ steps.context.outputs.target_kind }}
         run: |
-          # jq programs and Markdown format strings are intentionally literal.
-          # shellcheck disable=SC2016
-          set -eu
-          python3 scripts/runtime_versions.py release-state \
-            --version "$VERSION" --revision "$REVISION" --live \
+          set -euo pipefail
+          python3 scripts/runtime_versions.py release-identity \
+            --revision "$REVISION" --kind "$TARGET_KIND" --live \
             --format github-output >>"$GITHUB_OUTPUT"
-          state=$(python3 scripts/runtime_versions.py release-state \
-            --version "$VERSION" --revision "$REVISION" --live \
-            --format json | jq -r .state)
-          if [ "$state" = absent ]; then
-            mode=--require-absent
-          else
-            mode=--allow-same-identity
-          fi
-          python3 scripts/runtime_versions.py release-preflight \
-            --version "$VERSION" --revision "$REVISION" --live "$mode"
-          printf "Release identity: \`%s\` at \`%s\`; initial state: \`%s\`.\n" \
-            "$VERSION" "$REVISION" "$state" >>"$GITHUB_STEP_SUMMARY"
+          result=$(python3 scripts/runtime_versions.py release-identity \
+            --revision "$REVISION" --kind "$TARGET_KIND" --live --format json)
+          # shellcheck disable=SC2016
+          printf '%s' "$result" | jq -e \
+            --arg revision "$REVISION" \
+            '.revision == $revision and
+             (.state == "pending" or
+              .state == "reserved" or
+              .state == "candidate_private" or
+              .state == "candidate_verified" or
+              .state == "release_verified" or
+              .state == "latest_digest_matched")' >/dev/null
+          printf "Release target \`%s\` is \`%s\` in state \`%s\`.\n" \
+            "$REVISION" "$(printf '%s' "$result" | jq -r .version)" \
+            "$(printf '%s' "$result" | jq -r .state)" >>"$GITHUB_STEP_SUMMARY"
 
-  candidate-platform:
-    name: candidate-${{ matrix.architecture }}
-    if: needs.plan.outputs.next_action == 'build_candidate'
+  native-platform:
+    name: native-${{ matrix.architecture }}
+    if: >-
+      vars.RELEASE_AUTOMATION_ENABLED == 'true' &&
+      needs.plan.outputs.eligible == 'true' &&
+      (needs.plan.outputs.next_action == 'build_native' ||
+       needs.plan.outputs.next_action == 'rebuild_native')
     needs: plan
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
@@ -175,35 +199,21 @@ jobs:
       VERSION: ${{ needs.plan.outputs.version }}
       REVISION: ${{ needs.plan.outputs.revision }}
     steps:
-      - name: Check out trusted revision
+      - name: Check out the exact release source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.plan.outputs.revision }}
           fetch-depth: 0
           persist-credentials: false
-      - name: Verify public repository and immutable Git tag gate
+      - name: Revalidate the pre-reservation state
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          set -eu
-          gh api "repos/$GITHUB_REPOSITORY" --jq 'select(.visibility == "public") | .id' >/dev/null
-          rulesets=$(gh api "repos/$GITHUB_REPOSITORY/rulesets")
-          tag_id=$(printf '%s' "$rulesets" | jq -er \
-            '[.[] | select(.target == "tag" and .enforcement == "active")][0].id')
-          tag_ruleset=$(gh api "repos/$GITHUB_REPOSITORY/rulesets/$tag_id")
-          printf '%s' "$tag_ruleset" | jq -e '
-            .conditions.ref_name.include == ["refs/tags/v*"] and
-            ([.rules[].type] | index("deletion") != null) and
-            ([.rules[].type] | index("update") != null)' >/dev/null
-      - name: Require an absent version tag immediately before native build
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -eu
+          set -euo pipefail
           state=$(python3 scripts/runtime_versions.py release-state \
             --version "$VERSION" --revision "$REVISION" --live --format json)
           printf '%s' "$state" | jq -e \
-            '.state == "absent" and .next_action == "build_candidate"' >/dev/null
+            '.next_action == "build_native" or .next_action == "rebuild_native"' >/dev/null
       - name: Reclaim runner disk for the cold native build
         run: |
           set -euo pipefail
@@ -220,19 +230,19 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
-      - name: Resolve non-secret build arguments
+      - name: Resolve explicit non-secret build arguments
         id: build-args
         run: |
-          set -eu
+          set -euo pipefail
           python3 scripts/runtime_versions.py build-args \
-            --format json --revision "$REVISION" \
+            --version "$VERSION" --format json --revision "$REVISION" \
             | jq -r 'to_entries[] | "\(.key)=\(.value)"' >"$RUNNER_TEMP/build-args"
           {
             echo 'value<<EOF'
             cat "$RUNNER_TEMP/build-args"
             echo EOF
           } >>"$GITHUB_OUTPUT"
-      - name: Build and push the native version candidate by digest
+      - name: Build and push the native image by digest only
         id: build
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         env:
@@ -246,99 +256,264 @@ jobs:
           cache-to: type=gha,mode=max,scope=runtime-release-${{ matrix.architecture }}
           provenance: mode=max
           sbom: true
-      - name: Export the native digest
+      - name: Record target-bound native evidence
         env:
+          ARCHITECTURE: ${{ matrix.architecture }}
+          DECLARED_RUNNER: ${{ matrix.runner }}
           DIGEST: ${{ steps.build.outputs.digest }}
+          PLATFORM: ${{ matrix.platform }}
         run: |
-          set -eu
+          set -euo pipefail
           case "$DIGEST" in
             sha256:[0-9a-f][0-9a-f]*) ;;
             *) echo 'native build did not return a sha256 digest' >&2; exit 1 ;;
           esac
           [ "${#DIGEST}" -eq 71 ]
-          mkdir -p "$RUNNER_TEMP/digests"
-          printf '%s\n' "$DIGEST" >"$RUNNER_TEMP/digests/${{ matrix.architecture }}"
-      - name: Upload the native digest
+          mkdir -p "$RUNNER_TEMP/native-evidence"
+          jq -nc \
+            --arg architecture "$ARCHITECTURE" \
+            --arg digest "$DIGEST" \
+            --arg platform "$PLATFORM" \
+            --arg runner "$DECLARED_RUNNER" \
+            --arg revision "$REVISION" \
+            --arg source 'https://github.com/korioinc/multica-runtime-controller' \
+            '{architecture:$architecture,digest:$digest,platform:$platform,
+              runner:$runner,revision:$revision,source:$source}' \
+            >"$RUNNER_TEMP/native-evidence/$ARCHITECTURE.json"
+      - name: Upload native evidence
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: release-digest-${{ matrix.architecture }}
-          path: ${{ runner.temp }}/digests/${{ matrix.architecture }}
+          name: release-native-${{ matrix.architecture }}
+          path: ${{ runner.temp }}/native-evidence/${{ matrix.architecture }}.json
           if-no-files-found: error
           retention-days: 1
 
-  candidate:
-    name: candidate
+  reserve:
+    name: reserve
     if: >-
-      always() && needs.plan.result == 'success' &&
-      (needs.plan.outputs.next_action != 'build_candidate' ||
-       needs.candidate-platform.result == 'success')
-    needs: [plan, candidate-platform]
-    runs-on: ubuntu-24.04
+      always() && vars.RELEASE_AUTOMATION_ENABLED == 'true' &&
+      needs.plan.result == 'success' && needs.plan.outputs.eligible == 'true' &&
+      (needs.native-platform.result == 'success' ||
+       needs.native-platform.result == 'skipped')
+    needs: [plan, native-platform]
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
-      contents: read
-      packages: write
+      actions: read
+      contents: write
+      packages: read
     outputs:
-      digest: ${{ steps.state.outputs.digest }}
+      native_digests: ${{ steps.evidence.outputs.native_digests }}
+      state: ${{ steps.after.outputs.state }}
+      next_action: ${{ steps.after.outputs.next_action }}
     env:
-      IMAGE: ghcr.io/korioinc/multica-runtime-controller
       VERSION: ${{ needs.plan.outputs.version }}
       REVISION: ${{ needs.plan.outputs.revision }}
     steps:
-      - name: Check out trusted revision
+      - name: Check out the exact release source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.plan.outputs.revision }}
           fetch-depth: 0
           persist-credentials: false
-      - name: Verify public repository and immutable Git tag gate
+      - name: Download native evidence
+        if: needs.native-platform.result == 'success'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: release-native-*
+          path: ${{ runner.temp }}/native-evidence
+          merge-multiple: true
+      - name: Canonicalize native evidence
+        id: evidence
+        if: needs.native-platform.result == 'success'
+        run: |
+          set -euo pipefail
+          native_digests=$(jq -cs '
+            if length != 2 then error("native evidence count") else . end |
+            map({key:.architecture,value:del(.architecture)}) | from_entries |
+            if keys == ["amd64","arm64"] then . else error("native evidence keys") end
+          ' "$RUNNER_TEMP/native-evidence/amd64.json" \
+            "$RUNNER_TEMP/native-evidence/arm64.json")
+          printf 'native_digests=%s\n' "$native_digests" >>"$GITHUB_OUTPUT"
+      - name: Read current launcher blobs, ruleset and successful canary proofs
+        id: canaries
+        if: needs.native-platform.result == 'success'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          set -eu
-          gh api "repos/$GITHUB_REPOSITORY" --jq 'select(.visibility == "public") | .id' >/dev/null
+          # jq programs are intentionally literal.
+          # shellcheck disable=SC2016
+          set -euo pipefail
+          live_main=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)
+          git fetch --force origin "$live_main"
+          primary_blob=$(git rev-parse "$live_main:.github/workflows/release-repair.yml")
+          guard_blob=$(git rev-parse "$live_main:.github/workflows/release-repair-guard.yml")
           rulesets=$(gh api "repos/$GITHUB_REPOSITORY/rulesets")
-          tag_id=$(printf '%s' "$rulesets" | jq -er \
-            '[.[] | select(.target == "tag" and .enforcement == "active")][0].id')
-          tag_ruleset=$(gh api "repos/$GITHUB_REPOSITORY/rulesets/$tag_id")
-          printf '%s' "$tag_ruleset" | jq -e '
-            .conditions.ref_name.include == ["refs/tags/v*"] and
-            ([.rules[].type] | index("deletion") != null) and
-            ([.rules[].type] | index("update") != null)' >/dev/null
-      - name: Reconcile candidate state immediately before manifest assembly
+          main_id=
+          for candidate_id in $(printf '%s' "$rulesets" | jq -r \
+            '.[] | select(.target == "branch" and .enforcement == "active") | .id'); do
+            candidate=$(gh api "repos/$GITHUB_REPOSITORY/rulesets/$candidate_id")
+            if printf '%s' "$candidate" | jq -e \
+              '.conditions.ref_name.include == ["refs/heads/main"]' >/dev/null; then
+              [ -z "$main_id" ] || {
+                echo 'multiple active main rulesets' >&2
+                exit 1
+              }
+              main_id=$candidate_id
+            fi
+          done
+          [ -n "$main_id" ]
+          ruleset=$(gh api "repos/$GITHUB_REPOSITORY/rulesets/$main_id")
+          ruleset_digest="sha256:$(printf '%s' "$ruleset" | jq -Sc . | sha256sum | awk '{print $1}')"
+          launcher_blobs=$(jq -nc \
+            --arg primary "$primary_blob" --arg guard "$guard_blob" \
+            '{primary:$primary,guard:$guard}')
+
+          mkdir -p "$RUNNER_TEMP/canaries"
+          find_proof() {
+            workflow=$1
+            artifact_name=$2
+            output=$3
+            runs=$(gh api --paginate --slurp \
+              "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow/runs?event=workflow_dispatch&status=success&per_page=100")
+            run_ids=$(printf '%s' "$runs" | jq -r \
+              --arg head "$live_main" '.[] | .workflow_runs[] |
+                select(.head_sha == $head and .conclusion == "success") | .id')
+            for run_id in $run_ids; do
+              artifact_count=$(gh api \
+                "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/artifacts" \
+                --jq ".artifacts | map(select(.name == \"$artifact_name\" and .expired == false)) | length")
+              if [ "$artifact_count" -eq 1 ]; then
+                gh run download "$run_id" --name "$artifact_name" --dir "$RUNNER_TEMP/canaries/$workflow"
+                proof=$(find "$RUNNER_TEMP/canaries/$workflow" -type f -name '*.json' -print -quit)
+                [ -n "$proof" ]
+                cp "$proof" "$output"
+                return 0
+              fi
+            done
+            printf 'no current successful canary proof for %s at %s\n' \
+              "$workflow" "$live_main" >&2
+            return 1
+          }
+          find_proof release-repair.yml release-repair-primary-canary-proof \
+            "$RUNNER_TEMP/canaries/primary.json"
+          find_proof release-repair-guard.yml release-repair-guard-canary-proof \
+            "$RUNNER_TEMP/canaries/guard.json"
+          canary_proofs=$(jq -cs '
+            map({key:.launcher,value:.proof}) | from_entries |
+            if keys == ["guard","primary"] then . else error("canary proof keys") end
+          ' "$RUNNER_TEMP/canaries/primary.json" "$RUNNER_TEMP/canaries/guard.json")
+          {
+            printf 'launcher_blobs=%s\n' "$launcher_blobs"
+            printf 'ruleset_digest=%s\n' "$ruleset_digest"
+            printf 'canary_proofs=%s\n' "$canary_proofs"
+          } >>"$GITHUB_OUTPUT"
+      - name: Create or read back the immutable version reservation
+        if: needs.native-platform.result == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NATIVE_DIGESTS: ${{ steps.evidence.outputs.native_digests }}
+          CANARY_PROOFS: ${{ steps.canaries.outputs.canary_proofs }}
+          LAUNCHER_BLOBS: ${{ steps.canaries.outputs.launcher_blobs }}
+          RULESET_DIGEST: ${{ steps.canaries.outputs.ruleset_digest }}
+        run: |
+          set -euo pipefail
+          state=$(python3 scripts/runtime_versions.py release-state \
+            --version "$VERSION" --revision "$REVISION" --live \
+            --native-digests "$NATIVE_DIGESTS" \
+            --canary-proofs "$CANARY_PROOFS" \
+            --launcher-blobs "$LAUNCHER_BLOBS" \
+            --ruleset-digest "$RULESET_DIGEST" --format json)
+          printf '%s' "$state" | jq -e \
+            '.state == "native_built" and .next_action == "reserve_tag"' >/dev/null
+          if ! gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+            -f ref="refs/tags/v$VERSION" -f sha="$REVISION" >/dev/null 2>&1; then
+            live=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/v$VERSION" --jq .object.sha)
+            [ "$live" = "$REVISION" ] || {
+              printf 'immutable tag collision: expected=%s actual=%s\n' \
+                "$REVISION" "$live" >&2
+              exit 1
+            }
+          fi
+          live=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/v$VERSION" --jq .object.sha)
+          [ "$live" = "$REVISION" ]
+      - name: Verify reservation or later state
+        id: after
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NATIVE_DIGESTS: ${{ steps.evidence.outputs.native_digests }}
+        run: |
+          set -euo pipefail
+          git fetch --force --tags origin
+          args=
+          if [ -n "$NATIVE_DIGESTS" ]; then
+            args="--native-digests $NATIVE_DIGESTS"
+          fi
+          # NATIVE_DIGESTS is compact JSON generated by jq and contains no shell metacharacters.
+          # shellcheck disable=SC2086
+          python3 scripts/runtime_versions.py release-state \
+            --version "$VERSION" --revision "$REVISION" --live $args \
+            --format github-output >>"$GITHUB_OUTPUT"
+
+  candidate:
+    name: candidate
+    if: >-
+      always() && vars.RELEASE_AUTOMATION_ENABLED == 'true' &&
+      needs.plan.result == 'success' && needs.plan.outputs.eligible == 'true' &&
+      needs.reserve.result == 'success'
+    needs: [plan, reserve]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.after.outputs.digest }}
+    env:
+      IMAGE: ghcr.io/korioinc/multica-runtime-controller
+      VERSION: ${{ needs.plan.outputs.version }}
+      REVISION: ${{ needs.plan.outputs.revision }}
+      NATIVE_DIGESTS: ${{ needs.reserve.outputs.native_digests }}
+    steps:
+      - name: Check out the exact release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.revision }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Reconcile reserved state before numeric publication
         id: before
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
+          args=
+          if [ -n "$NATIVE_DIGESTS" ]; then
+            args="--native-digests $NATIVE_DIGESTS"
+          fi
+          # shellcheck disable=SC2086
           python3 scripts/runtime_versions.py release-state \
-            --version "$VERSION" --revision "$REVISION" --live \
+            --version "$VERSION" --revision "$REVISION" --live $args \
             --format github-output >>"$GITHUB_OUTPUT"
       - name: Set up Docker Buildx
-        if: steps.before.outputs.next_action == 'build_candidate'
+        if: steps.before.outputs.next_action == 'publish_numeric_candidate'
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
       - name: Log in to GHCR
-        if: steps.before.outputs.next_action == 'build_candidate'
+        if: steps.before.outputs.next_action == 'publish_numeric_candidate'
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
-      - name: Download both native digests
-        if: steps.before.outputs.next_action == 'build_candidate'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          pattern: release-digest-*
-          path: ${{ runner.temp }}/digests
-          merge-multiple: true
-      - name: Create and verify the version candidate manifest
-        if: steps.before.outputs.next_action == 'build_candidate'
+      - name: Create the numeric manifest from the verified native pair
+        if: steps.before.outputs.next_action == 'publish_numeric_candidate'
         run: |
           set -euo pipefail
+          [ -n "$NATIVE_DIGESTS" ]
           refs=()
           for architecture in amd64 arm64; do
-            file="$RUNNER_TEMP/digests/$architecture"
-            [ -f "$file" ]
-            digest=$(cat "$file")
+            digest=$(printf '%s' "$NATIVE_DIGESTS" | jq -er --arg architecture "$architecture" \
+              '.[$architecture].digest')
             case "$digest" in
               sha256:[0-9a-f][0-9a-f]*) ;;
               *) echo "invalid $architecture digest" >&2; exit 1 ;;
@@ -346,17 +521,10 @@ jobs:
             [ "${#digest}" -eq 71 ]
             refs+=("$IMAGE@$digest")
           done
-          docker buildx imagetools create \
-            --tag "$IMAGE:$VERSION" \
-            "${refs[@]}"
-          digest=
-          platforms=
+          docker buildx imagetools create --tag "$IMAGE:$VERSION" "${refs[@]}"
           verified=false
           attempt=1
           while [ "$attempt" -le 60 ]; do
-            digest=$(docker buildx imagetools inspect \
-              "$IMAGE:$VERSION" 2>/dev/null \
-              | awk '$1 == "Digest:" {print $2; exit}') || digest=
             platforms=$(docker buildx imagetools inspect --raw \
               "$IMAGE:$VERSION" 2>/dev/null | jq -c '
                 [.manifests[] |
@@ -365,8 +533,7 @@ jobs:
                          .platform.architecture == "arm64")) |
                  (.platform.os + "/" + .platform.architecture)] |
                 unique | sort') || platforms=
-            if [ -n "$digest" ] && \
-               [ "$platforms" = '["linux/amd64","linux/arm64"]' ]; then
+            if [ "$platforms" = '["linux/amd64","linux/arm64"]' ]; then
               verified=true
               break
             fi
@@ -378,52 +545,47 @@ jobs:
             echo 'release manifest did not converge' >&2
             exit 1
           }
-          case "$digest" in
-            sha256:[0-9a-f][0-9a-f]*) ;;
-            *) echo 'manifest creation did not return a sha256 digest' >&2; exit 1 ;;
-          esac
-          [ "${#digest}" -eq 71 ]
-      - name: Verify candidate identity
-        id: state
+      - name: Publish an existing linked package if necessary
+        if: steps.before.outputs.next_action == 'publish_package_visibility'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          set -eu
+          set -euo pipefail
+          gh api --method PATCH \
+            "orgs/korioinc/packages/container/multica-runtime-controller" \
+            -f visibility=public >/dev/null
+      - name: Verify the numeric candidate identity
+        id: after
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
           attempt=1
-          while :; do
-            if output=$(python3 scripts/runtime_versions.py release-state \
-              --version "$VERSION" --revision "$REVISION" --live \
-              --format github-output); then
-              state=$(printf '%s\n' "$output" | sed -n 's/^state=//p')
-              if [ "$state" != absent ]; then
-                printf '%s\n' "$output" >>"$GITHUB_OUTPUT"
-                break
+          while [ "$attempt" -le 60 ]; do
+            if result=$(python3 scripts/runtime_versions.py release-state \
+              --version "$VERSION" --revision "$REVISION" --live --format json); then
+              state=$(printf '%s' "$result" | jq -r .state)
+              if [ "$state" = candidate_verified ] || \
+                 [ "$state" = release_verified ] || \
+                 [ "$state" = latest_digest_matched ]; then
+                python3 scripts/runtime_versions.py release-state \
+                  --version "$VERSION" --revision "$REVISION" --live \
+                  --format github-output >>"$GITHUB_OUTPUT"
+                exit 0
               fi
             fi
-            [ "$attempt" -lt 5 ] || exit 1
-            sleep $((attempt * 5))
+            [ "$attempt" -lt 60 ] || break
+            sleep 5
             attempt=$((attempt + 1))
           done
-      - name: Verify public GHCR package before release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -eu
-          package=$(gh api \
-            "orgs/korioinc/packages/container/multica-runtime-controller")
-          printf '%s' "$package" | jq -e '
-            .name == "multica-runtime-controller" and
-            .package_type == "container" and
-            .visibility == "public"' >/dev/null
-          state=$(python3 scripts/runtime_versions.py release-state \
-            --version "$VERSION" --revision "$REVISION" --live --format json)
-          printf '%s' "$state" | jq -e '
-            .state == "candidate_verified" or
-            .state == "release_verified" or
-            .state == "latest_digest_matched"' >/dev/null
+          echo 'numeric candidate did not converge' >&2
+          exit 1
 
   finalize:
     name: finalize
+    if: >-
+      vars.RELEASE_AUTOMATION_ENABLED == 'true' &&
+      needs.plan.outputs.eligible == 'true'
     needs: [plan, candidate]
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -431,22 +593,22 @@ jobs:
       contents: write
       packages: read
     outputs:
-      digest: ${{ steps.state.outputs.digest }}
+      digest: ${{ steps.after.outputs.digest }}
     env:
       VERSION: ${{ needs.plan.outputs.version }}
       REVISION: ${{ needs.plan.outputs.revision }}
     steps:
-      - name: Check out trusted revision
+      - name: Check out the exact release source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.plan.outputs.revision }}
           fetch-depth: 0
           persist-credentials: false
-      - name: Create the GitHub Release after image verification
+      - name: Create the GitHub Release for the existing immutable tag
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          set -eu
+          set -euo pipefail
           state_json=$(python3 scripts/runtime_versions.py release-state \
             --version "$VERSION" --revision "$REVISION" --live --format json)
           state=$(printf '%s' "$state_json" | jq -r .state)
@@ -464,27 +626,35 @@ jobs:
 
           Runtime CLIs: Multica \`$MULTICA_CLI_VERSION\`, Codex \`$CODEX_VERSION\`, Pi \`$PI_VERSION\`
 
-          The image was published with max-mode provenance and an SBOM. The manifest digest is authoritative; the version tag is never overwritten by automation, and \`latest\` is promoted only after this release exists.
+          The immutable Git tag was reserved after both native builds and before this numeric manifest. The manifest digest is authoritative; automation never overwrites or deletes a stable identity.
           EOF
-            gh release create "v$VERSION" --target "$REVISION" \
+            gh release create "v$VERSION" --verify-tag --target "$REVISION" \
               --title "v$VERSION" --notes-file "$RUNNER_TEMP/release-notes.md"
-          elif [ "$state" != release_verified ] && [ "$state" != latest_digest_matched ]; then
+          elif [ "$state" != release_verified ] && \
+               [ "$state" != latest_digest_matched ]; then
             printf 'unexpected state before finalize: %s\n' "$state" >&2
             exit 1
           fi
       - name: Verify finalized release identity
-        id: state
+        id: after
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          set -eu
+          set -euo pipefail
           git fetch --force --tags origin
+          result=$(python3 scripts/runtime_versions.py release-state \
+            --version "$VERSION" --revision "$REVISION" --live --format json)
+          printf '%s' "$result" | jq -e \
+            '.state == "release_verified" or .state == "latest_digest_matched"' >/dev/null
           python3 scripts/runtime_versions.py release-state \
             --version "$VERSION" --revision "$REVISION" --live \
             --format github-output >>"$GITHUB_OUTPUT"
 
   promote:
     name: promote
+    if: >-
+      vars.RELEASE_AUTOMATION_ENABLED == 'true' &&
+      needs.plan.outputs.eligible == 'true'
     needs: [plan, finalize]
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -495,7 +665,7 @@ jobs:
       VERSION: ${{ needs.plan.outputs.version }}
       REVISION: ${{ needs.plan.outputs.revision }}
     steps:
-      - name: Check out trusted revision
+      - name: Check out the exact release source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.plan.outputs.revision }}
@@ -506,6 +676,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           python3 scripts/runtime_versions.py release-state \
             --version "$VERSION" --revision "$REVISION" --live \
             --format github-output >>"$GITHUB_OUTPUT"
@@ -524,6 +695,7 @@ jobs:
         env:
           DIGEST: ${{ steps.before.outputs.digest }}
         run: |
+          set -euo pipefail
           docker buildx imagetools create \
             --tag ghcr.io/korioinc/multica-runtime-controller:latest \
             "ghcr.io/korioinc/multica-runtime-controller@$DIGEST"
@@ -531,9 +703,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # jq programs and Markdown format strings are intentionally literal.
-          # shellcheck disable=SC2016
-          set -eu
+          set -euo pipefail
           result=$(python3 scripts/runtime_versions.py release-state \
             --version "$VERSION" --revision "$REVISION" --live --format json)
           printf '%s' "$result" | jq -e \

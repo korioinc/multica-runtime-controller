@@ -49,6 +49,12 @@ SOURCE_URLS = {
 }
 SEMVER_PATTERN = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
 REVISION_PATTERN = re.compile(r"^[0-9a-f]{40}$")
+REPAIR_PROVENANCE_PATTERN = re.compile(
+    r"^release-repair issue=(?P<issue>[1-9][0-9]*) "
+    r"nonce=(?P<nonce>[a-z0-9-]{12,64}) "
+    r"mode=(?P<mode>replacement|control|guard-repair|primary-repair) "
+    r"target=(?P<target>[0-9a-f]{40}) source=(?P<source>[0-9a-f]{40})$"
+)
 DIGEST_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 ASSIGNMENT_PATTERN = re.compile(r"^([A-Z][A-Z0-9_]*)=(.*)$")
 REGISTRY_STABLE_TAG_PATTERN = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
@@ -61,6 +67,10 @@ class ResolverError(RuntimeError):
 
 class ReleaseConflict(RuntimeError):
     """An immutable release identity conflicts with requested state."""
+
+
+class RepairConflict(RuntimeError):
+    """A durable repair checkpoint, seal, or live surface failed closed."""
 
 
 @dataclass(frozen=True, order=True)
@@ -325,89 +335,78 @@ def _write_temp(path: Path, content: bytes) -> Path:
 
 def update_files(
     env_path: Path,
-    version_path: Path,
     fetch: Callable[[str, int], dict[str, Any]] = live_fetcher,
 ) -> dict[str, Any]:
     original_env = env_path.read_bytes()
-    original_version = version_path.read_bytes()
     current = parse_env_bytes(original_env)
-    version = read_version(version_path)
     result = resolve_versions(current, fetch)
     if not result["updates"]:
-        result["release"] = {"from": str(version), "to": str(version)}
         return result
-    next_version = version.next_patch()
     next_env = _render_env(original_env, result["latest"])
-    next_version_bytes = f"{next_version}\n".encode("ascii")
     parse_env_bytes(next_env)
-    SemVer.parse(next_version_bytes.decode("ascii").strip(), field="VERSION")
     env_temp = _write_temp(env_path, next_env)
-    version_temp = _write_temp(version_path, next_version_bytes)
     try:
         os.replace(env_temp, env_path)
-        os.replace(version_temp, version_path)
     except OSError as exc:
         env_path.write_bytes(original_env)
-        version_path.write_bytes(original_version)
         raise ResolverError(f"atomic_write rollback_complete cause={type(exc).__name__}") from exc
     finally:
         env_temp.unlink(missing_ok=True)
-        version_temp.unlink(missing_ok=True)
-    result["release"] = {"from": str(version), "to": str(next_version)}
     return result
 
 
-def build_args(env_path: Path, version_path: Path, revision: str | None = None) -> dict[str, str]:
+def build_args(
+    env_path: Path,
+    version_path: Path,
+    revision: str | None = None,
+    *,
+    version: str | None = None,
+) -> dict[str, str]:
     assignments = parse_env_bytes(env_path.read_bytes())
-    version = read_version(version_path)
+    if version is None:
+        release_version = str(read_version(version_path))
+    elif version in {"ci", "develop"}:
+        release_version = version
+    else:
+        release_version = str(SemVer.parse(version, field="build_version"))
     if revision is None:
         revision = _run("git", "rev-parse", "HEAD").stdout.strip()
     if not REVISION_PATTERN.fullmatch(revision):
         raise ResolverError("COMMIT must be a full 40-hex revision")
-    return assignments | {"VERSION": str(version), "COMMIT": revision}
+    return assignments | {"VERSION": release_version, "COMMIT": revision}
 
 
 def validate_repository(base_ref: str | None, *, automation_diff: bool = False) -> dict[str, Any]:
     current_env = parse_env_bytes(ENV_PATH.read_bytes())
-    current_version = read_version(VERSION_PATH)
     result: dict[str, Any] = {
-        "version": str(current_version),
         "runtime_fields": len(current_env),
         "base_ref": base_ref,
     }
     if base_ref is None:
         return result
     base_env_result = _run("git", "show", f"{base_ref}:{ENV_PATH}", check=False)
-    base_version_result = _run("git", "show", f"{base_ref}:{VERSION_PATH}", check=False)
+    if base_env_result.returncode != 0:
+        raise ResolverError("base_runtime_versions_missing")
     changed_fields: list[str] = []
-    if base_env_result.returncode == 0:
-        base_env = parse_env_bytes(base_env_result.stdout.encode("utf-8"))
-        changed_fields = [
-            field
-            for field in sorted(set(base_env) | set(current_env))
-            if base_env.get(field) != current_env.get(field)
-        ]
-        unexpected = set(changed_fields) - set(REQUESTED_FIELDS)
-        if unexpected:
-            raise ResolverError(f"unexpected_runtime_fields fields={','.join(sorted(unexpected))}")
-        for field in changed_fields:
-            if SemVer.parse(current_env[field], field=field) <= SemVer.parse(base_env[field], field=field):
-                raise ResolverError(f"runtime_version_not_increased field={field}")
-    if changed_fields:
-        if base_version_result.returncode != 0:
-            raise ResolverError("base_VERSION_missing_for_runtime_update")
-        base_version = SemVer.parse(base_version_result.stdout.strip(), field="base_VERSION")
-        if current_version != base_version.next_patch():
-            raise ResolverError(
-                f"VERSION_patch_mismatch base={base_version} current={current_version}"
-            )
+    base_env = parse_env_bytes(base_env_result.stdout.encode("utf-8"))
+    changed_fields = [
+        field
+        for field in sorted(set(base_env) | set(current_env))
+        if base_env.get(field) != current_env.get(field)
+    ]
+    unexpected = set(changed_fields) - set(REQUESTED_FIELDS)
+    if unexpected:
+        raise ResolverError(f"unexpected_runtime_fields fields={','.join(sorted(unexpected))}")
+    for field in changed_fields:
+        if SemVer.parse(current_env[field], field=field) <= SemVer.parse(base_env[field], field=field):
+            raise ResolverError(f"runtime_version_not_increased field={field}")
     if automation_diff:
         names = {
             line
             for line in _run("git", "diff", "--name-only", base_ref, "--").stdout.splitlines()
             if line
         }
-        expected = {str(VERSION_PATH), str(ENV_PATH)}
+        expected = {str(ENV_PATH)}
         if names != expected:
             raise ResolverError(
                 f"automation_diff_mismatch expected={sorted(expected)} actual={sorted(names)}"
@@ -448,6 +447,87 @@ def _check_digest(value: Mapping[str, Any], expected: str, kind: str) -> None:
         raise ReleaseConflict(f"{kind}_digest_mismatch")
 
 
+def _stable_version_set(values: list[Any], *, kind: str) -> set[SemVer]:
+    versions: set[SemVer] = set()
+    for raw in values:
+        if kind == "release" and isinstance(raw, dict):
+            if raw.get("draft") is True or raw.get("prerelease") is True:
+                continue
+            raw = raw.get("tag_name")
+        elif kind == "registry" and isinstance(raw, dict):
+            raw = raw.get("name")
+        if not isinstance(raw, str):
+            continue
+        candidate = raw[1:] if raw.startswith("v") else raw
+        if SEMVER_PATTERN.fullmatch(candidate):
+            versions.add(SemVer.parse(candidate))
+    return versions
+
+
+def _terminal_stable_versions(surfaces: Mapping[str, Any]) -> set[SemVer]:
+    tag_versions = _stable_version_set(list(surfaces.get("git_tags", [])), kind="tag")
+    release_versions = _stable_version_set(
+        list(surfaces.get("github_releases", [])), kind="release"
+    )
+    registry_versions = _stable_version_set(
+        list(surfaces.get("registry_tags", [])), kind="registry"
+    )
+    return tag_versions & release_versions & registry_versions
+
+
+def _validate_native_digests(
+    surfaces: Mapping[str, Any], revision: str
+) -> dict[str, Mapping[str, Any]] | None:
+    raw = surfaces.get("native_digests")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict) or set(raw) != {"amd64", "arm64"}:
+        raise ReleaseConflict("native_digest_set_mismatch")
+    expected = {
+        "amd64": ("linux/amd64", "ubuntu-24.04"),
+        "arm64": ("linux/arm64", "ubuntu-24.04-arm"),
+    }
+    for architecture, (platform, runner) in expected.items():
+        result = raw[architecture]
+        if not isinstance(result, dict):
+            raise ReleaseConflict(f"native_digest_schema architecture={architecture}")
+        digest = result.get("digest")
+        if not isinstance(digest, str) or not DIGEST_PATTERN.fullmatch(digest):
+            raise ReleaseConflict(f"native_digest_invalid architecture={architecture}")
+        if result.get("platform") != platform:
+            raise ReleaseConflict(f"native_platform_mismatch architecture={architecture}")
+        if result.get("runner") != runner:
+            raise ReleaseConflict(f"native_runner_mismatch architecture={architecture}")
+        if result.get("revision") != revision:
+            raise ReleaseConflict(f"native_revision_mismatch architecture={architecture}")
+        if result.get("source") != IMAGE_SOURCE:
+            raise ReleaseConflict(f"native_source_mismatch architecture={architecture}")
+    return raw
+
+
+def _validate_canary_proofs(surfaces: Mapping[str, Any]) -> None:
+    proofs = surfaces.get("canary_proofs")
+    blobs = surfaces.get("launcher_blobs")
+    ruleset_digest = surfaces.get("ruleset_digest")
+    if not isinstance(proofs, dict) or set(proofs) != {"primary", "guard"}:
+        raise ReleaseConflict("repair_canary_proof_set_mismatch")
+    if not isinstance(blobs, dict) or set(blobs) != {"primary", "guard"}:
+        raise ReleaseConflict("launcher_blob_set_mismatch")
+    if not isinstance(ruleset_digest, str) or not DIGEST_PATTERN.fullmatch(ruleset_digest):
+        raise ReleaseConflict("ruleset_digest_invalid")
+    for launcher in ("primary", "guard"):
+        blob = blobs[launcher]
+        proof = proofs[launcher]
+        if not isinstance(blob, str) or not REVISION_PATTERN.fullmatch(blob):
+            raise ReleaseConflict(f"launcher_blob_invalid launcher={launcher}")
+        if not isinstance(proof, dict) or proof.get("conclusion") != "success":
+            raise ReleaseConflict(f"canary_not_successful launcher={launcher}")
+        if proof.get("launcher_blob_sha") != blob:
+            raise ReleaseConflict(f"canary_blob_mismatch launcher={launcher}")
+        if proof.get("ruleset_digest") != ruleset_digest:
+            raise ReleaseConflict(f"canary_ruleset_mismatch launcher={launcher}")
+
+
 def plan_release_state(
     surfaces: Mapping[str, Any], version: str, revision: str
 ) -> dict[str, str]:
@@ -458,12 +538,34 @@ def plan_release_state(
     tag = surfaces.get("git_tag")
     release = surfaces.get("github_release")
     latest = surfaces.get("latest")
+    native_digests = _validate_native_digests(surfaces, revision)
+
+    if tag is not None:
+        _check_revision(tag, revision, "tag")
+        if tag.get("tag_name") != f"v{parsed_version}":
+            raise ReleaseConflict("tag_version_mismatch")
+
     if image is None:
-        if tag is not None or release is not None:
+        if release is not None:
             raise ReleaseConflict("release_without_candidate")
         if latest is not None and latest.get("version") == str(parsed_version):
             raise ReleaseConflict("latest_without_candidate")
-        return {"state": "absent", "next_action": "build_candidate"}
+        if tag is not None:
+            return {
+                "state": "reserved",
+                "next_action": (
+                    "publish_numeric_candidate"
+                    if native_digests is not None
+                    else "rebuild_native"
+                ),
+            }
+        if native_digests is None:
+            return {"state": "pending", "next_action": "build_native"}
+        _validate_canary_proofs(surfaces)
+        return {"state": "native_built", "next_action": "reserve_tag"}
+
+    if tag is None:
+        raise ReleaseConflict("candidate_without_reservation")
     if not isinstance(image, dict):
         raise ReleaseConflict("candidate_schema")
     if image.get("revision") != revision or image.get("version") != str(parsed_version):
@@ -488,8 +590,6 @@ def plan_release_state(
             "next_action": "publish_package_visibility",
             "digest": digest,
         }
-    if tag is not None:
-        _check_revision(tag, revision, "tag")
     if release is None:
         if latest is not None and latest.get("digest") == digest:
             raise ReleaseConflict("latest_before_release")
@@ -515,6 +615,629 @@ def plan_release_state(
     }
 
 
+def classify_release_provenance(
+    pull_request: Mapping[str, Any],
+    reviews: list[Mapping[str, Any]],
+    revision: str,
+    *,
+    merge_parent: str,
+) -> dict[str, Any]:
+    """Classify a merged main PR without allowing repair commits to become targets."""
+
+    if REVISION_PATTERN.fullmatch(revision) is None:
+        raise ReleaseConflict("revision_not_full_sha")
+    if REVISION_PATTERN.fullmatch(merge_parent) is None:
+        raise ReleaseConflict("merge_parent_not_full_sha")
+    try:
+        number = pull_request["number"]
+        base = pull_request["base"]
+        head = pull_request["head"]
+        author = pull_request["user"]
+        merged_by = pull_request["merged_by"]
+    except (KeyError, TypeError) as exc:
+        raise ReleaseConflict("pull_request_shape_invalid") from exc
+    if not isinstance(number, int) or isinstance(number, bool) or number < 1:
+        raise ReleaseConflict("pull_request_number_invalid")
+    if not all(isinstance(value, Mapping) for value in (base, head, author, merged_by)):
+        raise ReleaseConflict("pull_request_shape_invalid")
+    base_repo = base.get("repo")
+    head_repo = head.get("repo")
+    head_sha = head.get("sha")
+    if (
+        pull_request.get("state") != "closed"
+        or pull_request.get("merged") is not True
+        or base.get("ref") != "main"
+        or not isinstance(base_repo, Mapping)
+        or base_repo.get("full_name") != REPOSITORY
+        or not isinstance(head_repo, Mapping)
+        or head_repo.get("full_name") != REPOSITORY
+        or author.get("login") != "github-actions[bot]"
+        or pull_request.get("merge_commit_sha") != revision
+        or merged_by.get("login") != "jskorlol"
+        or not isinstance(head_sha, str)
+        or REVISION_PATTERN.fullmatch(head_sha) is None
+    ):
+        raise ReleaseConflict("pull_request_provenance_invalid")
+    if not any(
+        isinstance(review, Mapping)
+        and isinstance(review.get("user"), Mapping)
+        and review["user"].get("login") == "jskorlol"
+        and review.get("state") == "APPROVED"
+        and review.get("commit_id") == head_sha
+        for review in reviews
+    ):
+        raise ReleaseConflict("exact_head_approval_missing")
+
+    head_ref = head.get("ref")
+    if head_ref == "develop":
+        return {"eligible": True, "origin_kind": "normal", "pr_number": number}
+    body = pull_request.get("body")
+    marker = REPAIR_PROVENANCE_PATTERN.fullmatch(body if isinstance(body, str) else "")
+    if marker is None:
+        raise ReleaseConflict("unsupported_main_provenance")
+    mode = marker.group("mode")
+    nonce = marker.group("nonce")
+    prefix = "automation/release-repair-guard-" if mode == "primary-repair" else "automation/release-repair-"
+    if head_ref != f"{prefix}{nonce}":
+        raise ReleaseConflict("repair_branch_nonce_mismatch")
+    if mode == "replacement" and merge_parent != marker.group("target"):
+        raise ReleaseConflict("repair_base_target_mismatch")
+    if mode == "replacement":
+        return {"eligible": True, "origin_kind": "replacement", "pr_number": number}
+    return {"eligible": False, "origin_kind": "control", "pr_number": number}
+
+
+def plan_release_identity(
+    surfaces: Mapping[str, Any],
+    revision: str,
+    *,
+    target_kind: str = "normal",
+) -> dict[str, Any]:
+    if not REVISION_PATTERN.fullmatch(revision):
+        raise ReleaseConflict("revision_not_full_sha")
+    if target_kind not in {"normal", "replacement", "recovery", "control"}:
+        raise ReleaseConflict(f"unsupported_target_kind kind={target_kind}")
+
+    active = surfaces.get("active_target")
+    allocation = "proposed"
+    if active is None:
+        if target_kind not in {"normal", "replacement", "recovery"}:
+            raise ReleaseConflict("repair_without_active_target")
+        terminal_versions = _terminal_stable_versions(surfaces)
+        terminal_maximum = max(terminal_versions) if terminal_versions else None
+        union_versions = set(_stable_versions(surfaces))
+        unresolved = {
+            version
+            for version in union_versions
+            if terminal_maximum is None or version > terminal_maximum
+        }
+        if unresolved:
+            raise ReleaseConflict(
+                "external_nonterminal_identity versions="
+                + ",".join(str(version) for version in sorted(unresolved))
+            )
+        version = terminal_maximum.next_patch() if terminal_maximum else SemVer(0, 0, 1)
+    else:
+        if not isinstance(active, dict):
+            raise ReleaseConflict("active_target_schema")
+        active_revision = active.get("revision")
+        active_version_raw = active.get("version")
+        active_state = active.get("state")
+        if not isinstance(active_revision, str) or not REVISION_PATTERN.fullmatch(active_revision):
+            raise ReleaseConflict("active_target_revision_invalid")
+        if not isinstance(active_version_raw, str):
+            raise ReleaseConflict("active_target_version_invalid")
+        version = SemVer.parse(active_version_raw, field="active_target_version")
+        if active_state not in {
+            "pending",
+            "native_built",
+            "reserved",
+            "candidate_private",
+            "candidate_verified",
+            "release_verified",
+            "latest_digest_matched",
+        }:
+            raise ReleaseConflict("active_target_state_invalid")
+        allocation = "reused"
+        if target_kind == "normal" and active_revision != revision:
+            raise ReleaseConflict("active_release_blocks_normal_target")
+        if target_kind == "replacement":
+            if active_state not in {"pending", "native_built"}:
+                raise ReleaseConflict("replacement_after_reservation")
+        elif target_kind in {"recovery", "control"}:
+            if active_revision != revision:
+                raise ReleaseConflict("recovery_target_mismatch")
+            if target_kind == "control" and active_state in {"pending", "native_built"}:
+                raise ReleaseConflict("control_repair_before_reservation")
+
+    state = plan_release_state(surfaces, str(version), revision)
+    return {
+        "target_kind": target_kind,
+        "allocation": allocation,
+        "version": str(version),
+        "revision": revision,
+        **state,
+    }
+
+
+def plan_release_inventory(surfaces: Mapping[str, Any]) -> dict[str, Any]:
+    terminal_versions = _terminal_stable_versions(surfaces)
+    terminal_maximum = max(terminal_versions) if terminal_versions else None
+    active = surfaces.get("active_target")
+    if active is None:
+        union_versions = set(_stable_versions(surfaces))
+        unresolved = {
+            version
+            for version in union_versions
+            if terminal_maximum is None or version > terminal_maximum
+        }
+        if unresolved:
+            raise ReleaseConflict(
+                "external_nonterminal_identity versions="
+                + ",".join(str(version) for version in sorted(unresolved))
+            )
+        return {
+            "active": False,
+            "state": "terminal",
+            "terminal_maximum": str(terminal_maximum) if terminal_maximum else None,
+        }
+    if not isinstance(active, dict):
+        raise ReleaseConflict("active_target_schema")
+    revision = active.get("revision")
+    version = active.get("version")
+    state = active.get("state")
+    if not isinstance(revision, str) or not REVISION_PATTERN.fullmatch(revision):
+        raise ReleaseConflict("active_target_revision_invalid")
+    parsed_version = SemVer.parse(version, field="active_target_version")
+    if state not in {
+        "pending",
+        "native_built",
+        "reserved",
+        "candidate_private",
+        "candidate_verified",
+        "release_verified",
+    }:
+        raise ReleaseConflict("active_target_state_invalid")
+    return {
+        "active": True,
+        "revision": revision,
+        "version": str(parsed_version),
+        "state": state,
+        "terminal_maximum": str(terminal_maximum) if terminal_maximum else None,
+    }
+
+
+REPAIR_CHECKPOINT_FIELDS = {
+    "schema_version",
+    "nonce",
+    "mode",
+    "target_revision",
+    "source_revision",
+    "main_revision",
+    "workflows",
+    "quiesced_workflow_ids",
+    "ruleset_digest",
+    "initial_surface_hash",
+}
+REPAIR_SEAL_FIELDS = {
+    "phase",
+    "issue_number",
+    "nonce",
+    "body_hash",
+    "baseline",
+    "baseline_hash",
+    "main_revision",
+    "ruleset_digest",
+}
+REPAIR_BOT = "github-actions[bot]"
+REPAIR_LAUNCHERS = {
+    "primary": ".github/workflows/release-repair.yml",
+    "guard": ".github/workflows/release-repair-guard.yml",
+}
+
+
+def canonical_repair_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+
+
+def repair_sha256(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _repair_full_revision(value: Any, field: str) -> str:
+    if not isinstance(value, str) or not REVISION_PATTERN.fullmatch(value):
+        raise RepairConflict(f"{field}_not_full_revision")
+    return value
+
+
+def _repair_digest(value: Any, field: str) -> str:
+    if not isinstance(value, str) or not DIGEST_PATTERN.fullmatch(value):
+        raise RepairConflict(f"{field}_invalid")
+    return value
+
+
+def _repair_workflows(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list) or not value:
+        raise RepairConflict("workflow_inventory_empty")
+    normalized: list[dict[str, Any]] = []
+    seen_ids: set[int] = set()
+    seen_paths: set[str] = set()
+    for item in value:
+        if not isinstance(item, dict) or set(item) != {
+            "workflow_id",
+            "path",
+            "original_state",
+        }:
+            raise RepairConflict("workflow_inventory_schema")
+        workflow_id = item["workflow_id"]
+        path = item["path"]
+        original_state = item["original_state"]
+        if not isinstance(workflow_id, int) or workflow_id <= 0 or workflow_id in seen_ids:
+            raise RepairConflict("workflow_id_invalid_or_duplicate")
+        if (
+            not isinstance(path, str)
+            or not path.startswith(".github/workflows/")
+            or path in seen_paths
+        ):
+            raise RepairConflict("workflow_path_invalid_or_duplicate")
+        if original_state not in {"active", "disabled_manually"}:
+            raise RepairConflict("workflow_original_state_invalid")
+        seen_ids.add(workflow_id)
+        seen_paths.add(path)
+        normalized.append(
+            {
+                "workflow_id": workflow_id,
+                "path": path,
+                "original_state": original_state,
+            }
+        )
+    return sorted(normalized, key=lambda item: item["workflow_id"])
+
+
+def make_repair_checkpoint(
+    *,
+    request: Mapping[str, Any],
+    workflows: Any,
+    quiesced_workflow_ids: Any,
+    ruleset_digest: Any,
+    initial_surface: Any,
+) -> dict[str, Any]:
+    required = {
+        "nonce",
+        "mode",
+        "target_revision",
+        "source_revision",
+        "main_revision",
+    }
+    if set(request) != required:
+        raise RepairConflict("checkpoint_request_schema")
+    nonce = request["nonce"]
+    mode = request["mode"]
+    if not isinstance(nonce, str) or not re.fullmatch(r"[A-Za-z0-9._-]{8,80}", nonce):
+        raise RepairConflict("checkpoint_nonce_invalid")
+    if mode not in {"replacement", "control", "guard-repair", "primary-repair"}:
+        raise RepairConflict("checkpoint_mode_invalid")
+    normalized_workflows = _repair_workflows(workflows)
+    inventory_ids = {item["workflow_id"] for item in normalized_workflows}
+    if (
+        not isinstance(quiesced_workflow_ids, list)
+        or not quiesced_workflow_ids
+        or any(not isinstance(item, int) for item in quiesced_workflow_ids)
+        or len(quiesced_workflow_ids) != len(set(quiesced_workflow_ids))
+        or not set(quiesced_workflow_ids) <= inventory_ids
+    ):
+        raise RepairConflict("quiesced_workflow_ids_invalid")
+    return {
+        "schema_version": 1,
+        "nonce": nonce,
+        "mode": mode,
+        "target_revision": _repair_full_revision(
+            request["target_revision"], "target_revision"
+        ),
+        "source_revision": _repair_full_revision(
+            request["source_revision"], "source_revision"
+        ),
+        "main_revision": _repair_full_revision(request["main_revision"], "main_revision"),
+        "workflows": normalized_workflows,
+        "quiesced_workflow_ids": sorted(quiesced_workflow_ids),
+        "ruleset_digest": _repair_digest(ruleset_digest, "ruleset_digest"),
+        "initial_surface_hash": "sha256:"
+        + repair_sha256(canonical_repair_json(initial_surface)),
+    }
+
+
+def make_repair_seal(
+    *,
+    issue_number: int,
+    nonce: str,
+    body_hash: str,
+    baseline: Any,
+    main_revision: str,
+    ruleset_digest: str,
+) -> dict[str, Any]:
+    if not isinstance(issue_number, int) or issue_number <= 0:
+        raise RepairConflict("seal_issue_number_invalid")
+    if not re.fullmatch(r"[A-Za-z0-9._-]{8,80}", nonce):
+        raise RepairConflict("seal_nonce_invalid")
+    if not re.fullmatch(r"[0-9a-f]{64}", body_hash):
+        raise RepairConflict("seal_body_hash_invalid")
+    baseline_hash = repair_sha256(canonical_repair_json(baseline))
+    return {
+        "phase": "quiesced",
+        "issue_number": issue_number,
+        "nonce": nonce,
+        "body_hash": f"sha256:{body_hash}",
+        "baseline": baseline,
+        "baseline_hash": f"sha256:{baseline_hash}",
+        "main_revision": _repair_full_revision(main_revision, "seal_main_revision"),
+        "ruleset_digest": _repair_digest(ruleset_digest, "seal_ruleset_digest"),
+    }
+
+
+def _parse_canonical_repair_json(value: Any, kind: str) -> dict[str, Any]:
+    if not isinstance(value, str):
+        raise RepairConflict(f"{kind}_body_not_text")
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise RepairConflict(f"{kind}_body_invalid_json") from exc
+    if not isinstance(parsed, dict) or canonical_repair_json(parsed) != value:
+        raise RepairConflict(f"{kind}_body_not_canonical")
+    return parsed
+
+
+def _validate_repair_edit_boundary(state: Mapping[str, Any], mode: str) -> None:
+    launcher = state.get("launcher")
+    changed_files = state.get("changed_files")
+    if launcher not in REPAIR_LAUNCHERS or not isinstance(changed_files, list):
+        raise RepairConflict("repair_edit_boundary_schema")
+    launcher_files = set(REPAIR_LAUNCHERS.values()) & set(changed_files)
+    if REPAIR_LAUNCHERS[launcher] in launcher_files:
+        raise RepairConflict("repair_launcher_self_edit")
+    if len(launcher_files) > 1:
+        raise RepairConflict("repair_dual_launcher_edit")
+    expected_peer = "guard" if launcher == "primary" else "primary"
+    expected_mode = f"{expected_peer}-repair"
+    if mode.endswith("-repair") and (
+        mode != expected_mode or changed_files != [REPAIR_LAUNCHERS[expected_peer]]
+    ):
+        raise RepairConflict("repair_peer_allowlist_mismatch")
+
+
+def _validate_repair_surface_delta(
+    baseline: Mapping[str, Any], current: Mapping[str, Any], nonce: str
+) -> None:
+    required = {"refs", "pull_requests", "releases", "package", "check_runs"}
+    if not required <= set(baseline) or set(current) != required:
+        raise RepairConflict("repair_surface_schema")
+    if current["releases"] != baseline["releases"] or current["package"] != baseline["package"]:
+        raise RepairConflict("repair_stable_surface_delta")
+
+    def keyed(values: Any, field: str, kind: str) -> dict[Any, Any]:
+        if not isinstance(values, list) or any(not isinstance(item, dict) for item in values):
+            raise RepairConflict(f"repair_{kind}_schema")
+        result = {item.get(field): item for item in values}
+        if None in result or len(result) != len(values):
+            raise RepairConflict(f"repair_{kind}_identity_duplicate")
+        return result
+
+    before_refs = keyed(baseline["refs"], "ref", "ref")
+    after_refs = keyed(current["refs"], "ref", "ref")
+    allowed_refs = {
+        "refs/heads/main",
+        f"refs/heads/automation/release-repair-{nonce}",
+        f"refs/heads/automation/release-repair-guard-{nonce}",
+        f"refs/heads/automation/release-repair-canary-{nonce}-primary",
+        f"refs/heads/automation/release-repair-canary-{nonce}-guard",
+    }
+    changed_refs = {
+        ref
+        for ref in set(before_refs) | set(after_refs)
+        if before_refs.get(ref) != after_refs.get(ref)
+    }
+    if not changed_refs <= allowed_refs:
+        raise RepairConflict("repair_unexpected_ref_delta")
+
+    before_prs = keyed(baseline["pull_requests"], "number", "pull_request")
+    after_prs = keyed(current["pull_requests"], "number", "pull_request")
+    if not set(before_prs) <= set(after_prs):
+        raise RepairConflict("repair_pull_request_removed")
+    allowed_heads = {
+        f"automation/release-repair-{nonce}",
+        f"automation/release-repair-guard-{nonce}",
+        f"automation/release-repair-canary-{nonce}-primary",
+        f"automation/release-repair-canary-{nonce}-guard",
+    }
+    for number, value in after_prs.items():
+        if number in before_prs:
+            if value != before_prs[number]:
+                raise RepairConflict("repair_existing_pull_request_changed")
+        elif value.get("head") not in allowed_heads:
+            raise RepairConflict("repair_unexpected_pull_request_delta")
+
+    before_checks = keyed(baseline["check_runs"], "id", "check_run")
+    after_checks = keyed(current["check_runs"], "id", "check_run")
+    before_main = before_refs.get("refs/heads/main", {}).get("sha")
+    after_main = after_refs.get("refs/heads/main", {}).get("sha")
+    if not before_main or not after_main:
+        raise RepairConflict("repair_main_ref_missing")
+    if before_main == after_main:
+        if before_checks != after_checks:
+            raise RepairConflict("repair_check_run_delta_without_main_merge")
+        return
+    if len(after_checks) != 2 or {
+        value.get("name") for value in after_checks.values()
+    } != {"verify", "runtime-image"}:
+        raise RepairConflict("repair_required_check_run_set_mismatch")
+    for value in after_checks.values():
+        if (
+            value.get("name") not in {"verify", "runtime-image"}
+            or value.get("app_id") != 15368
+            or value.get("head_sha") != after_main
+            or value.get("status") != "completed"
+            or value.get("conclusion") != "success"
+        ):
+            raise RepairConflict("repair_unexpected_check_run_delta")
+
+
+def plan_repair_resume(state: Mapping[str, Any]) -> dict[str, Any]:
+    if state.get("actor") != "jskorlol":
+        raise RepairConflict("repair_actor_mismatch")
+    if state.get("permission_status") != 200:
+        raise RepairConflict("repair_permission_failure")
+    if state.get("gate_enabled") is not False:
+        raise RepairConflict("release_automation_gate_not_false")
+    if state.get("gate_dominated") is not True:
+        raise RepairConflict("repair_gate_dominance_invalid")
+    if state.get("checkpoint_created_before_mutation") is not True:
+        raise RepairConflict("repair_checkpoint_order_invalid")
+    if state.get("drain_started_before_disable") is not False:
+        raise RepairConflict("repair_disable_drain_order_invalid")
+
+    request = state.get("request")
+    if not isinstance(request, dict) or set(request) != {
+        "nonce",
+        "mode",
+        "target_revision",
+        "source_revision",
+        "main_revision",
+        "body_hash",
+        "issue_number",
+        "seal_hash",
+        "seal_id",
+    }:
+        raise RepairConflict("repair_resume_request_schema")
+    checkpoints = state.get("checkpoints")
+    if not isinstance(checkpoints, list) or len(checkpoints) != 1:
+        raise RepairConflict("repair_checkpoint_cardinality")
+    issue = checkpoints[0]
+    if (
+        not isinstance(issue, dict)
+        or issue.get("number") != request["issue_number"]
+        or issue.get("author") != REPAIR_BOT
+        or issue.get("state") not in {"open", "closed"}
+    ):
+        raise RepairConflict("repair_checkpoint_identity_or_edit")
+    checkpoint = _parse_canonical_repair_json(issue.get("body"), "checkpoint")
+    if set(checkpoint) != REPAIR_CHECKPOINT_FIELDS:
+        raise RepairConflict("repair_checkpoint_schema")
+    body_hash = repair_sha256(issue["body"])
+    if request["body_hash"] != body_hash:
+        raise RepairConflict("repair_checkpoint_hash_mismatch")
+    for field in ("nonce", "mode", "target_revision", "source_revision", "main_revision"):
+        if checkpoint.get(field) != request[field]:
+            raise RepairConflict(f"repair_checkpoint_{field}_mismatch")
+    if checkpoint.get("schema_version") != 1:
+        raise RepairConflict("repair_checkpoint_schema_version")
+    inventory = _repair_workflows(state.get("workflow_inventory"))
+    if checkpoint.get("workflows") != inventory:
+        raise RepairConflict("repair_workflow_inventory_changed")
+    if checkpoint.get("ruleset_digest") != state.get("ruleset_digest"):
+        raise RepairConflict("repair_ruleset_digest_changed")
+    _validate_repair_edit_boundary(state, checkpoint["mode"])
+    if issue["state"] == "closed":
+        return {
+            "issue_number": issue["number"],
+            "body_hash": body_hash,
+            "nonce": checkpoint["nonce"],
+            "next_action": "reopen_checkpoint",
+        }
+
+    current_surface = state.get("surface")
+    if not isinstance(current_surface, dict):
+        raise RepairConflict("repair_surface_not_mapping")
+    seals = state.get("seals")
+    if not isinstance(seals, list) or len(seals) > 1:
+        raise RepairConflict("repair_seal_cardinality")
+    states = state.get("current_workflow_states")
+    if not isinstance(states, dict) or set(states) != {
+        str(item["workflow_id"]) for item in inventory
+    }:
+        raise RepairConflict("repair_workflow_state_schema")
+    quiesced = {str(item) for item in checkpoint["quiesced_workflow_ids"]}
+    disabled = {item for item in quiesced if states.get(item) == "disabled_manually"}
+    active_runs = state.get("active_runs")
+    if not isinstance(active_runs, int) or active_runs < 0:
+        raise RepairConflict("repair_active_run_count_invalid")
+
+    result: dict[str, Any] = {
+        "issue_number": issue["number"],
+        "body_hash": body_hash,
+        "nonce": checkpoint["nonce"],
+    }
+    if not seals:
+        if request["seal_id"] != 0 or request["seal_hash"] != "":
+            raise RepairConflict("repair_missing_seal_identity_mismatch")
+        expected_initial = "sha256:" + repair_sha256(canonical_repair_json(current_surface))
+        if checkpoint["initial_surface_hash"] != expected_initial:
+            raise RepairConflict("repair_pre_seal_surface_delta")
+        if disabled != quiesced:
+            return result | {"next_action": "disable_and_drain"}
+        if active_runs:
+            return result | {"next_action": "cancel_and_drain"}
+        return result | {"next_action": "create_quiesced_seal"}
+
+    if active_runs:
+        raise RepairConflict("repair_nonzero_run_after_seal")
+    seal_record = seals[0]
+    if (
+        not isinstance(seal_record, dict)
+        or seal_record.get("id") != request["seal_id"]
+        or seal_record.get("author") != REPAIR_BOT
+        or seal_record.get("created_at") != seal_record.get("updated_at")
+    ):
+        raise RepairConflict("repair_seal_identity_or_edit")
+    seal = _parse_canonical_repair_json(seal_record.get("body"), "seal")
+    if set(seal) != REPAIR_SEAL_FIELDS:
+        raise RepairConflict("repair_seal_schema")
+    seal_hash = repair_sha256(seal_record["body"])
+    if seal_hash != request["seal_hash"]:
+        raise RepairConflict("repair_seal_hash_mismatch")
+    if (
+        seal.get("phase") != "quiesced"
+        or seal.get("issue_number") != issue["number"]
+        or seal.get("nonce") != checkpoint["nonce"]
+        or seal.get("body_hash") != f"sha256:{body_hash}"
+        or seal.get("main_revision") != checkpoint["main_revision"]
+        or seal.get("ruleset_digest") != checkpoint["ruleset_digest"]
+    ):
+        raise RepairConflict("repair_seal_chain_mismatch")
+    baseline = seal.get("baseline")
+    if not isinstance(baseline, dict) or seal.get("baseline_hash") != (
+        "sha256:" + repair_sha256(canonical_repair_json(baseline))
+    ):
+        raise RepairConflict("repair_sealed_baseline_hash_mismatch")
+    expected_mapping = [
+        {"workflow_id": item["workflow_id"], "original_state": item["original_state"]}
+        for item in inventory
+    ]
+    if baseline.get("workflow_states") != expected_mapping:
+        raise RepairConflict("repair_sealed_mapping_mismatch")
+    _validate_repair_surface_delta(baseline, current_surface, checkpoint["nonce"])
+    result |= {"seal_id": seal_record["id"], "seal_hash": seal_hash}
+
+    pr_state = state.get("repair_pr_state")
+    if pr_state == "absent":
+        return result | {"next_action": "propose_repair"}
+    if pr_state == "open":
+        return result | {"next_action": "await_human_merge"}
+    if pr_state != "merged":
+        raise RepairConflict("repair_pr_state_invalid")
+    canaries = state.get("canaries")
+    if not isinstance(canaries, dict) or set(canaries) != {"primary", "guard"}:
+        raise RepairConflict("repair_canary_state_schema")
+    if "failure" in canaries.values():
+        return result | {"next_action": "re_disable_staged_launcher"}
+    if set(canaries.values()) != {"success"}:
+        return result | {"next_action": "run_peer_canaries"}
+    original_states = {
+        str(item["workflow_id"]): item["original_state"] for item in inventory
+    }
+    if states != original_states:
+        return result | {"next_action": "restore_exact_mapping"}
+    return result | {"next_action": "close_checkpoint"}
+
+
 def preflight_release(
     surfaces: Mapping[str, Any],
     version: str,
@@ -532,10 +1255,12 @@ def preflight_release(
     if maximum is not None and maximum > requested:
         raise ReleaseConflict(f"external_maximum_ahead next_patch={maximum.next_patch()}")
     if require_absent:
-        if state["state"] != "absent" or (maximum is not None and maximum >= requested):
+        if state["state"] not in {"pending", "native_built"} or (
+            maximum is not None and maximum >= requested
+        ):
             raise ReleaseConflict("release_version_already_exists")
     else:
-        if state["state"] == "absent":
+        if state["state"] in {"pending", "native_built"}:
             raise ReleaseConflict("recovery_identity_absent")
         if maximum is not None and maximum != requested:
             raise ReleaseConflict("recovery_version_not_live_maximum")
@@ -548,15 +1273,11 @@ def preflight_release(
     }
 
 
-def validate_revision(version: str, revision: str, *, require_main_ancestor: bool) -> None:
-    SemVer.parse(version, field="release_version")
+def validate_revision(revision: str, *, require_main_ancestor: bool) -> None:
     if not REVISION_PATTERN.fullmatch(revision):
         raise ReleaseConflict("revision_not_full_sha")
     if _run("git", "cat-file", "-e", f"{revision}^{{commit}}", check=False).returncode != 0:
         raise ReleaseConflict("revision_not_found")
-    version_result = _run("git", "show", f"{revision}:VERSION", check=False)
-    if version_result.returncode != 0 or version_result.stdout != f"{version}\n":
-        raise ReleaseConflict("VERSION_at_revision_mismatch")
     if require_main_ancestor:
         main_ref = "origin/main" if _run("git", "show-ref", "--verify", "--quiet", "refs/remotes/origin/main", check=False).returncode == 0 else "main"
         if _run("git", "merge-base", "--is-ancestor", revision, main_ref, check=False).returncode != 0:
@@ -772,6 +1493,88 @@ def live_release_surfaces(version: str) -> dict[str, Any]:
     }
 
 
+def live_identity_surfaces(revision: str) -> dict[str, Any]:
+    git_tags = _run("git", "tag", "--list").stdout.splitlines()
+    releases_payload = _github_paginated_releases()
+    github_releases = [
+        {
+            "tag_name": release.get("tag_name"),
+            "draft": release.get("draft"),
+            "prerelease": release.get("prerelease"),
+        }
+        for release in releases_payload
+        if isinstance(release.get("tag_name"), str)
+    ]
+    package_payload = _github_package()
+    package = None
+    if isinstance(package_payload, dict):
+        package = {
+            "name": package_payload.get("name"),
+            "package_type": package_payload.get("package_type"),
+            "visibility": package_payload.get("visibility"),
+        }
+    registry_tags = _ghcr_tags() if package is not None else []
+    latest = _registry_image("latest") if "latest" in registry_tags else None
+    base: dict[str, Any] = {
+        "git_tags": git_tags,
+        "github_releases": github_releases,
+        "registry_tags": registry_tags,
+        "package": package,
+        "version_image": None,
+        "git_tag": None,
+        "github_release": None,
+        "latest": latest,
+        "active_target": None,
+    }
+    union = set(_stable_versions(base))
+    if not union:
+        return base
+    highest = max(union)
+    active = live_release_surfaces(str(highest))
+    tag = active.get("git_tag")
+    if tag is None:
+        return base
+    active_revision = tag.get("revision")
+    if not isinstance(active_revision, str) or not REVISION_PATTERN.fullmatch(active_revision):
+        raise ReleaseConflict("active_target_revision_invalid")
+    active_state = plan_release_state(active, str(highest), active_revision)["state"]
+    if active_state == "latest_digest_matched" and active_revision != revision:
+        return base
+    active["active_target"] = {
+        "revision": active_revision,
+        "version": str(highest),
+        "state": active_state,
+    }
+    if active_revision != revision:
+        return active
+    return active
+
+
+def merge_release_evidence(
+    surfaces: Mapping[str, Any],
+    *,
+    native_digests: str | None = None,
+    canary_proofs: str | None = None,
+    launcher_blobs: str | None = None,
+    ruleset_digest: str | None = None,
+) -> dict[str, Any]:
+    merged = dict(surfaces)
+    for field, raw in (
+        ("native_digests", native_digests),
+        ("canary_proofs", canary_proofs),
+        ("launcher_blobs", launcher_blobs),
+    ):
+        if raw is None:
+            continue
+        value = json.loads(raw)
+        if not isinstance(value, dict):
+            raise ReleaseConflict(f"{field}_schema")
+        merged[field] = value
+    if ruleset_digest is not None:
+        merged["ruleset_digest"] = ruleset_digest
+    return merged
+
+
 def validate_actions(directory: Path) -> dict[str, Any]:
     workflows = sorted((*directory.glob("*.yml"), *directory.glob("*.yaml")))
     if not workflows:
@@ -801,6 +1604,14 @@ def validate_actions(directory: Path) -> dict[str, Any]:
                     f"workflow_contract_missing file={file_name} fragment={fragment}"
                 )
 
+    def require_exact_jobs(file_name: str, expected: set[str]) -> None:
+        actual = set(workflow_jobs[file_name])
+        if actual != expected:
+            raise ResolverError(
+                f"workflow_job_inventory_mismatch file={file_name} "
+                f"expected={','.join(sorted(expected))} actual={','.join(sorted(actual))}"
+            )
+
     for path in workflows:
         text = path.read_text(encoding="utf-8")
         workflow_texts[path.name] = text
@@ -812,6 +1623,8 @@ def validate_actions(directory: Path) -> dict[str, Any]:
             raise ResolverError(f"forbidden_event file={path} event=pull_request_target")
         if re.search(r"(?m)^\s*(?:set\s+-x|printenv)(?:\s|$)", text):
             raise ResolverError(f"forbidden_debug_command file={path}")
+        if "secrets." in text or re.search(r"(?m)^\s+environment:\s*", text):
+            raise ResolverError(f"workflow_secret_or_environment_forbidden file={path}")
         lines = text.splitlines()
         for index, line in enumerate(lines):
             match = ACTION_USES_PATTERN.match(line)
@@ -856,7 +1669,11 @@ def validate_actions(directory: Path) -> dict[str, Any]:
             if not re.search(r"(?m)^    permissions:(?:\s*\{\})?\s*$", block):
                 raise ResolverError(f"job_permissions_missing file={path} job={job_name}")
         workflow_jobs[path.name] = blocks
-        if re.search(r"(?m)^  workflow_dispatch:\s*$", text):
+        if re.search(r"(?m)^  workflow_dispatch:\s*$", text) and path.name not in {
+            "create-develop-to-main-pr.yml",
+            "release-repair.yml",
+            "release-repair-guard.yml",
+        }:
             raise ResolverError(
                 f"privileged_ref_selectable_dispatch_forbidden file={path}"
             )
@@ -867,12 +1684,19 @@ def validate_actions(directory: Path) -> dict[str, Any]:
     required_workflows = {
         "ci.yml",
         "create-develop-to-main-pr.yml",
+        "develop-image.yml",
+        "release.yml",
+        "release-repair.yml",
+        "release-repair-guard.yml",
         "runtime-version-update.yml",
         "runtime-version-auto-merge.yml",
     }
     missing = sorted(required_workflows - set(workflow_texts))
     if missing:
         raise ResolverError(f"required_workflow_missing files={','.join(missing)}")
+    unexpected = sorted(set(workflow_texts) - required_workflows)
+    if unexpected:
+        raise ResolverError(f"unexpected_workflow files={','.join(unexpected)}")
 
     ci = workflow_texts["ci.yml"]
     if "docker/setup-qemu-action" in ci or "platforms: linux/amd64,linux/arm64" in ci:
@@ -888,7 +1712,6 @@ def validate_actions(directory: Path) -> dict[str, Any]:
             "  repository_dispatch:",
             "types: [automation-ci]",
             "runtime-update",
-            "release-patch",
             "sync-main",
             "promotion",
             ".commits >= 2",
@@ -914,6 +1737,8 @@ def validate_actions(directory: Path) -> dict[str, Any]:
             "platforms: ${{ matrix.platform }}",
             "scope=runtime-main-${{ matrix.architecture }}",
             "scope=${{ steps.scope.outputs.cache_scope }}-${{ matrix.architecture }}",
+            "expected=build/runtime-versions.env",
+            "--version ci --format json",
             '"repos/$GITHUB_REPOSITORY/check-runs"',
             "head_sha: $head",
             "ref: ${{ needs.context.outputs.checkout_sha }}",
@@ -924,6 +1749,7 @@ def validate_actions(directory: Path) -> dict[str, Any]:
             "dispatch-merge:",
             "needs: [context, verify, runtime-image, publish-checks]",
             "needs.context.outputs.automation_kind != 'promotion'",
+            "vars.RELEASE_AUTOMATION_ENABLED == 'true'",
             "SOURCE_RUN_ID: ${{ github.run_id }}",
             "SOURCE_RUN_ATTEMPT: ${{ github.run_attempt }}",
             '{event_type:"automation-merge",client_payload:',
@@ -942,6 +1768,7 @@ def validate_actions(directory: Path) -> dict[str, Any]:
         },
         "dispatch-merge": {"contents": "write"},
     }
+    require_exact_jobs("ci.yml", set(expected_ci_permissions))
     for job_name, expected in expected_ci_permissions.items():
         block = workflow_jobs["ci.yml"].get(job_name)
         if block is None:
@@ -975,6 +1802,8 @@ def validate_actions(directory: Path) -> dict[str, Any]:
             "github.token",
             "automation/runtime-versions",
             "--base develop",
+            "git add build/runtime-versions.env",
+            "The changed tracked file is exactly",
             'kind:"runtime-update"',
             '{event_type:"automation-ci",client_payload:{kind:"runtime-update"',
             '"repos/$GITHUB_REPOSITORY/dispatches"',
@@ -988,7 +1817,9 @@ def validate_actions(directory: Path) -> dict[str, Any]:
             'python3 -I "$TRUSTED_RESOLVER" --root "$TARGET_ROOT"',
         ),
     )
-    if updater.count('python3 -I "$TRUSTED_RESOLVER" --root "$TARGET_ROOT"') != 7:
+    if re.search(r"(?m)(^|[^-])\bVERSION\b", updater):
+        raise ResolverError("updater_must_not_reference_VERSION")
+    if updater.count('python3 -I "$TRUSTED_RESOLVER" --root "$TARGET_ROOT"') != 3:
         raise ResolverError("updater_trusted_resolver_call_count_mismatch")
     propose = workflow_jobs["runtime-version-update.yml"].get("propose")
     if propose is None:
@@ -1002,6 +1833,9 @@ def validate_actions(directory: Path) -> dict[str, Any]:
         raise ResolverError(
             f"updater_job_permissions_mismatch expected={expected_propose} actual={actual_propose}"
         )
+    if "vars.RELEASE_AUTOMATION_ENABLED == 'true'" not in propose:
+        raise ResolverError("updater_propose_activation_gate_missing")
+    require_exact_jobs("runtime-version-update.yml", {"resolve", "propose"})
 
     merge_workflow = workflow_texts["runtime-version-auto-merge.yml"]
     for forbidden in (
@@ -1016,6 +1850,8 @@ def validate_actions(directory: Path) -> dict[str, Any]:
         "./scripts/",
         "actions/workflows/release.yml/dispatches",
         "workflow_run:",
+        "release-patch",
+        "VERSION",
     ):
         if forbidden in merge_workflow:
             raise ResolverError(
@@ -1029,7 +1865,6 @@ def validate_actions(directory: Path) -> dict[str, Any]:
             "types: [automation-merge]",
             "vars.RELEASE_AUTOMATION_ENABLED == 'true'",
             "github.event.client_payload.kind == 'runtime-update'",
-            "github.event.client_payload.kind == 'release-patch'",
             "github.event.client_payload.kind == 'sync-main'",
             "EVENT_WORKFLOW_SHA",
             "INPUT_WORKFLOW_SHA",
@@ -1039,7 +1874,6 @@ def validate_actions(directory: Path) -> dict[str, Any]:
             '.name == $title',
             "CI automation",
             "automation/runtime-versions",
-            "automation/release-patch",
             "automation/sync-main",
             '$kind == "sync-main" and .commits >= 2',
             '$kind != "sync-main" and .commits == 1',
@@ -1059,8 +1893,8 @@ def validate_actions(directory: Path) -> dict[str, Any]:
             "--merge --delete-branch",
             "--squash --delete-branch",
             'event == "repository_dispatch"',
-            '{event_type:"reconcile-develop",client_payload:{revision:$revision}}',
-            '"repos/$GITHUB_REPOSITORY/dispatches"',
+            '{ref:"main",inputs:{revision:$revision}}',
+            'actions/workflows/create-develop-to-main-pr.yml/dispatches',
         ),
     )
     expected_merge_permissions = {
@@ -1068,7 +1902,7 @@ def validate_actions(directory: Path) -> dict[str, Any]:
         "contents": "write",
         "pull-requests": "write",
     }
-    expected_dispatch_permissions = {"contents": "write"}
+    expected_dispatch_permissions = {"actions": "write", "contents": "read"}
     for job_name, expected in (
         ("merge", expected_merge_permissions),
         ("dispatch-develop", expected_dispatch_permissions),
@@ -1082,6 +1916,9 @@ def validate_actions(directory: Path) -> dict[str, Any]:
                 f"merge_workflow_permissions_mismatch job={job_name} "
                 f"expected={expected} actual={actual}"
             )
+        if "vars.RELEASE_AUTOMATION_ENABLED == 'true'" not in block:
+            raise ResolverError(f"merge_workflow_activation_gate_missing job={job_name}")
+    require_exact_jobs("runtime-version-auto-merge.yml", {"merge", "dispatch-develop"})
 
     promotion = workflow_texts["create-develop-to-main-pr.yml"]
     for forbidden in (
@@ -1089,6 +1926,10 @@ def validate_actions(directory: Path) -> dict[str, Any]:
         "git merge origin/main",
         "--head \"$GITHUB_REPOSITORY_OWNER:develop\"",
         "cancel-in-progress: true",
+        "release-patch",
+        "FORCE_RELEASE",
+        "VERSION",
+        "gh pr merge",
     ):
         if forbidden in promotion:
             raise ResolverError(
@@ -1098,48 +1939,44 @@ def validate_actions(directory: Path) -> dict[str, Any]:
         "create-develop-to-main-pr.yml",
         promotion,
         (
-            "branches: [develop]",
             "branches: [main]",
             "vars.RELEASE_AUTOMATION_ENABLED == 'true'",
             "cron: '0 * * * *'",
-            "  repository_dispatch:",
-            "types: [reconcile-develop]",
-            "FORCE_RELEASE: ${{ github.event.client_payload.force_release }}",
-            "forced release requires identical main and develop trees",
+            "  workflow_dispatch:",
+            "revision:",
+            '[ "$EVENT_REF" = refs/heads/main ]',
+            '[ "$EVENT_SHA" = "$live_workflow_sha" ]',
             "cancel-in-progress: false",
-            "mode='bootstrap'",
-            "mode='sync'",
-            "automation/release-patch",
+            "mode=sync",
+            "mode=wait-release",
+            "mode=promotion",
+            "release-inventory --live --format json",
             "automation/sync-main",
-            ".commits >= 2",
             "git merge --no-ff --no-edit \"$MAIN_SHA\"",
+            'git rev-parse HEAD^1',
+            'git rev-parse HEAD^2',
             "gh pr create --base develop --head \"$branch\"",
-            'kind:"release-patch"',
-            'kind:"sync-main"',
             "gh pr create --base main --head develop",
-            'kind:"promotion"',
-            '{event_type:"automation-ci",client_payload:',
-            '{event_type:"development-image",client_payload:',
+            "automation never merges main",
+            '{event_type:"automation-ci",client_payload:{kind:$kind',
+            '{event_type:"development-image",client_payload:{revision:$revision}}',
             '"repos/$GITHUB_REPOSITORY/dispatches"',
         ),
     )
     expected_promotion_permissions = {
-        "resolve": {"contents": "read"},
+        "resolve": {"contents": "read", "packages": "read"},
         "write-sync": {"contents": "write"},
         "propose-sync": {
-            "contents": "write",
-            "pull-requests": "write",
-        },
-        "write-patch": {"contents": "write"},
-        "propose-patch": {
-            "contents": "write",
+            "contents": "read",
             "pull-requests": "write",
         },
         "promote": {
-            "contents": "write",
+            "contents": "read",
             "pull-requests": "write",
         },
+        "dispatch": {"contents": "write"},
     }
+    require_exact_jobs("create-develop-to-main-pr.yml", set(expected_promotion_permissions))
     for job_name, expected in expected_promotion_permissions.items():
         block = workflow_jobs["create-develop-to-main-pr.yml"].get(job_name)
         if block is None:
@@ -1150,11 +1987,8 @@ def validate_actions(directory: Path) -> dict[str, Any]:
                 f"promotion_job_permissions_mismatch job={job_name} "
                 f"expected={expected} actual={actual}"
             )
-        if job_name in {"propose-sync", "propose-patch", "promote"} and \
-                "GH_REPO: ${{ github.repository }}" not in block:
-            raise ResolverError(
-                f"promotion_job_repository_context_missing job={job_name}"
-            )
+        if job_name != "resolve" and "vars.RELEASE_AUTOMATION_ENABLED == 'true'" not in block:
+            raise ResolverError(f"promotion_job_activation_gate_missing job={job_name}")
 
     development = workflow_texts.get("develop-image.yml")
     if development is None:
@@ -1178,6 +2012,7 @@ def validate_actions(directory: Path) -> dict[str, Any]:
             '--tag "$IMAGE:develop-$REVISION"',
             "build_args: ${{ steps.build-args.outputs.value }}",
             "build-args: ${{ needs.verify.outputs.build_args }}",
+            "--version develop --format json",
             "publish-platform:",
             "architecture: amd64",
             "runner: ubuntu-24.04",
@@ -1204,6 +2039,7 @@ def validate_actions(directory: Path) -> dict[str, Any]:
         "publish-platform": {"contents": "read", "packages": "write"},
         "publish": {"packages": "write"},
     }
+    require_exact_jobs("develop-image.yml", set(expected_development_permissions))
     for job_name, expected in expected_development_permissions.items():
         block = workflow_jobs["develop-image.yml"].get(job_name)
         if block is None:
@@ -1224,21 +2060,34 @@ def validate_actions(directory: Path) -> dict[str, Any]:
         raise ResolverError("release_native_platform_build_required")
     if ".bypass_actors == []" in release:
         raise ResolverError("release_requires_private_ruleset_field")
+    for forbidden in (
+        "paths: [VERSION]",
+        "INPUT_VERSION:",
+        'git show "$revision:VERSION"',
+        "build_candidate",
+        "candidate-platform:",
+    ):
+        if forbidden in release:
+            raise ResolverError(f"release_legacy_identity_fragment fragment={forbidden}")
     require_fragments(
         "release.yml",
         release,
         (
+            "  push:\n    branches: [main]",
             "  repository_dispatch:",
             "types: [stable-release-recovery]",
-            "INPUT_VERSION: ${{ github.event.client_payload.version }}",
             "INPUT_REVISION: ${{ github.event.client_payload.revision }}",
+            "EVENT_ACTOR: ${{ github.actor }}",
+            '[ "$EVENT_ACTOR" = jskorlol ]',
             "pull-requests: read",
             'promotion=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$number")',
-            '.merged_by.login == "jskorlol"',
-            '.user.login == "jskorlol"',
-            '.state == "APPROVED"',
-            ".commit_id == $head",
-            "candidate-platform:",
+            "release-provenance",
+            "origin_kind=$(printf '%s' \"$provenance\" | jq -r .origin_kind)",
+            "eligible=$(printf '%s' \"$provenance\" | jq -r .eligible)",
+            "target_kind=recovery",
+            "release-identity",
+            "--kind \"$TARGET_KIND\" --live",
+            "native-platform:",
             "architecture: amd64",
             "runner: ubuntu-24.04",
             "platform: linux/amd64",
@@ -1251,19 +2100,42 @@ def validate_actions(directory: Path) -> dict[str, Any]:
             "oci-artifact=true",
             "push-by-digest=true",
             "name-canonical=true",
-            "release-digest-${{ matrix.architecture }}",
+            "release-native-${{ matrix.architecture }}",
             "actions/upload-artifact@",
             "actions/download-artifact@",
+            "reserve:",
+            'ref="refs/tags/v$VERSION"',
+            'sha="$REVISION"',
+            "release-repair-primary-canary-proof",
+            "release-repair-guard-canary-proof",
+            "--native-digests \"$NATIVE_DIGESTS\"",
+            ".state == \"native_built\" and .next_action == \"reserve_tag\"",
+            "publish_numeric_candidate",
             "docker buildx imagetools create",
             'while [ "$attempt" -le 60 ]',
             "release manifest did not converge",
+            "gh release create \"v$VERSION\" --verify-tag",
+            "promote_latest",
         ),
     )
+    release_order = (
+        release.index("  native-platform:"),
+        release.index("  reserve:"),
+        release.index("  candidate:"),
+        release.index("  finalize:"),
+        release.index("  promote:"),
+    )
+    if release_order != tuple(sorted(release_order)):
+        raise ResolverError("release_stage_order_mismatch")
     expected_release_permissions = {
         "plan": {"contents": "read", "packages": "read", "pull-requests": "read"},
-        "candidate-platform": {"contents": "read", "packages": "write"},
+        "native-platform": {"contents": "read", "packages": "write"},
+        "reserve": {"actions": "read", "contents": "write", "packages": "read"},
         "candidate": {"contents": "read", "packages": "write"},
+        "finalize": {"contents": "write", "packages": "read"},
+        "promote": {"contents": "read", "packages": "write"},
     }
+    require_exact_jobs("release.yml", set(expected_release_permissions))
     for job_name, expected in expected_release_permissions.items():
         block = workflow_jobs["release.yml"].get(job_name)
         if block is None:
@@ -1274,6 +2146,192 @@ def validate_actions(directory: Path) -> dict[str, Any]:
                 f"release_job_permissions_mismatch job={job_name} "
                 f"expected={expected} actual={actual}"
             )
+        if job_name != "plan" and "vars.RELEASE_AUTOMATION_ENABLED == 'true'" not in block:
+            raise ResolverError(f"release_job_activation_gate_missing job={job_name}")
+
+    repair_permissions = {
+        "authorize": {"actions": "read", "contents": "read", "issues": "read"},
+        "canary": {"checks": "write", "contents": "write", "pull-requests": "write"},
+        "checkpoint": {"actions": "read", "contents": "read", "issues": "write"},
+        "quiesce": {"actions": "write", "contents": "read", "issues": "read"},
+        "seal": {"actions": "read", "contents": "read", "issues": "write"},
+        "validate-source": {"contents": "read", "issues": "read"},
+        "propose": {"contents": "write", "pull-requests": "write"},
+        "verify-source": {"contents": "read"},
+        "runtime-image-source": {"contents": "read"},
+        "publish-checks": {
+            "checks": "write",
+            "contents": "read",
+            "pull-requests": "read",
+        },
+        "await-merge": {"contents": "read", "pull-requests": "read"},
+        "restore": {"actions": "write", "contents": "read", "issues": "read"},
+        "close-checkpoint": {"actions": "read", "contents": "read", "issues": "write"},
+    }
+    common_repair_fragments = (
+        "  workflow_dispatch:",
+        "inputs.mode == 'canary' && format('release-repair-canary-{0}', inputs.nonce)",
+        "cancel-in-progress: false",
+        '[ "$EVENT_ACTOR" = jskorlol ]',
+        "if [ \"$EVENT_ACTOR\" = 'github-actions[bot]' ]; then",
+        '[ "$EVENT_REF" = refs/heads/main ]',
+        '[ "$EVENT_SHA" = "$live_main" ]',
+        "release-repair-checkpoint",
+        '[ "$count" -le 1 ]',
+        'existing=$(printf \'%s\' "$open" | jq -c',
+        '[ "$(printf \'%s\' "$body" | jq -r .nonce)" = "$NONCE" ]',
+        '[ "$(printf \'%s\' "$issue" | jq -r .user.login)" = \'github-actions[bot]\' ]',
+        '[.labels[].name] | sort == ["release-repair-checkpoint"]',
+        'completion="release repair restored nonce=$NONCE"',
+        '-f state=open',
+        "Reconcile an unknown API result by exact readback below.",
+        "quiesced_workflow_ids",
+        "live_workflows=$(gh api --paginate --slurp",
+        "expected_inventory=$(printf '%s' \"$body\" | jq -cS",
+        '$current.current_state == $original.original_state or',
+        "actions/workflows/$id/disable",
+        "disabled_manually",
+        "status == \"queued\" or .status == \"in_progress\"",
+        "baseline_b64=",
+        "actual_initial=\"sha256:$(printf '%s' \"$initial_surface\"",
+        '.initial_surface_hash)" = "$actual_initial"',
+        "https://ghcr.io/token?service=ghcr.io",
+        "/v2/korioinc/multica-runtime-controller/tags/list?n=10000",
+        'tolower($1) == "docker-content-digest:"',
+        "manifests:$manifests",
+        '"repos/$GITHUB_REPOSITORY/rulesets?per_page=100"',
+        '.conditions.ref_name.include == ["refs/heads/main"]',
+        'ruleset_digest="sha256:$(printf \'%s\' "$main_ruleset"',
+        'phase quiesced',
+        "created_at",
+        "updated_at",
+        "issue=$ISSUE_NUMBER",
+        'head_sha:$head,status:"completed",conclusion:"success"',
+        'expected_body="release-repair issue=$ISSUE_NUMBER nonce=$NONCE mode=$MODE target=$TARGET_REVISION source=$SOURCE_REVISION"',
+        '.body == $body',
+        '.title == $title',
+        '.head.repo.full_name == $repository',
+        '.base.repo.full_name == $repository',
+        '(.parents | length) == 1',
+        '.parents[0].sha == $base',
+        '.user.login == "jskorlol"',
+        '.state == "APPROVED"',
+        '.commit_id == $head',
+        "actions/variables/RELEASE_AUTOMATION_ENABLED",
+        "dispatch_canary",
+        "validate_sealed_surface() {",
+        "validate_sealed_surface pre-restore",
+        "validate_sealed_surface post-canary",
+        "validate_sealed_surface post-restore",
+        "canary cleanup left an open pull request",
+        '--arg issue "$ISSUE_NUMBER"',
+        "issue_number:$issue",
+        "body_hash:$body_hash",
+        "seal_id:$seal_id",
+        "seal_hash:$seal_hash",
+        "Clean deterministic canary residue before retry",
+        '"refs/heads/automation/release-repair-canary-" + $nonce',
+        "Recognize a merged repair PR even after branch deletion",
+        "validate_repair_commit",
+        ".tree.sha == $tree",
+        "  verify-source:",
+        "  runtime-image-source:",
+        "needs: [authorize, checkpoint, validate-source, propose, verify-source, runtime-image-source]",
+        "ref: ${{ needs.propose.outputs.head_sha }}",
+        'git show "$MAIN_REVISION:scripts/runtime_versions.py"',
+        '"$RUNNER_TEMP/trusted-runtime-versions.py"',
+        '"$GITHUB_WORKSPACE/.github/workflows"',
+        "run: make verify",
+        "push: false",
+        '.status == "completed" and .conclusion == "success"',
+        "original_state",
+        "state=closed",
+    )
+    for file_name in ("release-repair.yml", "release-repair-guard.yml"):
+        repair = workflow_texts.get(file_name)
+        if repair is None:
+            raise ResolverError(f"required_workflow_missing files={file_name}")
+        for forbidden in (
+            "download-artifact@",
+            "actions/cache@",
+            "secrets.",
+            "environment:",
+            "packages: write",
+        ):
+            if forbidden in repair:
+                raise ResolverError(
+                    f"repair_workflow_forbidden_fragment file={file_name} fragment={forbidden}"
+                )
+        for job_name, block in workflow_jobs[file_name].items():
+            if job_name in {"verify-source", "runtime-image-source"}:
+                continue
+            for forbidden in ("actions/checkout@", "python3 scripts/", "./scripts/", "make "):
+                if forbidden in block:
+                    raise ResolverError(
+                        f"repair_privileged_job_executes_repository file={file_name} "
+                        f"job={job_name} fragment={forbidden}"
+                    )
+        require_fragments(file_name, repair, common_repair_fragments)
+        require_exact_jobs(file_name, set(repair_permissions))
+        order = tuple(
+            repair.index(f"  {job}:")
+            for job in (
+                "authorize",
+                "checkpoint",
+                "quiesce",
+                "seal",
+                "validate-source",
+                "propose",
+                "publish-checks",
+                "await-merge",
+                "restore",
+                "close-checkpoint",
+            )
+        )
+        if order != tuple(sorted(order)):
+            raise ResolverError(f"repair_transaction_order_mismatch file={file_name}")
+        for job_name, expected in repair_permissions.items():
+            block = workflow_jobs[file_name].get(job_name)
+            if block is None:
+                raise ResolverError(f"repair_job_missing file={file_name} job={job_name}")
+            actual = permissions_for(block)
+            if actual != expected:
+                raise ResolverError(
+                    f"repair_job_permissions_mismatch file={file_name} job={job_name} "
+                    f"expected={expected} actual={actual}"
+                )
+    primary = workflow_texts["release-repair.yml"]
+    guard = workflow_texts["release-repair-guard.yml"]
+    require_fragments(
+        "release-repair.yml",
+        primary,
+        (
+            "options: [canary, replacement, control, guard-repair, resume]",
+            "release-repair-primary-canary-proof",
+            '[".github/workflows/release-repair-guard.yml"]',
+            'if [ "$TRANSACTION_MODE" = guard-repair ]',
+            "TARGET_REVISION: ${{ needs.checkpoint.outputs.target_revision }}",
+            '"repos/$GITHUB_REPOSITORY/git/matching-refs/tags/v"',
+            '[ "$TARGET_REVISION" = "$MAIN_REVISION" ]',
+            'stable_target_count=$(printf \'%s\' "$stable_tags" | jq --arg target "$TARGET_REVISION"',
+            '[ "$stable_target_count" -eq 0 ]',
+            '[ "$stable_target_count" -eq 1 ]',
+        ),
+    )
+    require_fragments(
+        "release-repair-guard.yml",
+        guard,
+        (
+            "options: [canary, primary-repair, resume]",
+            "release-repair-guard-canary-proof",
+            '[".github/workflows/release-repair.yml"]',
+            'if [ "$TRANSACTION_MODE" = primary-repair ]',
+        ),
+    )
+    if "replacement)" in guard or "control)" in guard or "guard-repair" in guard:
+        raise ResolverError("guard_workflow_mode_widened")
+    if '[".github/workflows/release-repair.yml",".github/workflows/release-repair-guard.yml"]' in primary + guard:
+        raise ResolverError("repair_both_launcher_edit_allowed")
     if checkout_count == 0:
         raise ResolverError("no_checkout_steps_found")
     return {"workflows": len(workflows), "external_actions": action_count, "checkouts": checkout_count}
@@ -1319,6 +2377,7 @@ def build_parser() -> argparse.ArgumentParser:
     args_parser = commands.add_parser("build-args")
     args_parser.add_argument("--format", choices=("json", "github-output"), default="json")
     args_parser.add_argument("--revision")
+    args_parser.add_argument("--version")
 
     preflight = commands.add_parser("release-preflight")
     preflight.add_argument("--version", required=True)
@@ -1330,6 +2389,27 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--require-absent", action="store_true")
     mode.add_argument("--allow-same-identity", action="store_true")
 
+    identity = commands.add_parser("release-identity")
+    identity.add_argument("--revision", required=True)
+    identity.add_argument(
+        "--kind", choices=("normal", "replacement", "recovery", "control"), default="normal"
+    )
+    source = identity.add_mutually_exclusive_group(required=True)
+    source.add_argument("--live", action="store_true")
+    source.add_argument("--offline-fixture")
+    identity.add_argument("--format", choices=("json", "github-output"), default="json")
+
+    provenance = commands.add_parser("release-provenance")
+    provenance.add_argument("--revision", required=True)
+    provenance.add_argument("--input-json", required=True)
+    provenance.add_argument("--format", choices=("json", "github-output"), default="json")
+
+    inventory = commands.add_parser("release-inventory")
+    source = inventory.add_mutually_exclusive_group(required=True)
+    source.add_argument("--live", action="store_true")
+    source.add_argument("--offline-fixture")
+    inventory.add_argument("--format", choices=("json", "github-output"), default="json")
+
     state = commands.add_parser("release-state")
     state.add_argument("--version", required=True)
     state.add_argument("--revision", required=True)
@@ -1337,6 +2417,11 @@ def build_parser() -> argparse.ArgumentParser:
     source.add_argument("--live", action="store_true")
     source.add_argument("--offline-fixture")
     state.add_argument("--format", choices=("json", "github-output"), default="json")
+    for release_command in (preflight, state, identity):
+        release_command.add_argument("--native-digests")
+        release_command.add_argument("--canary-proofs")
+        release_command.add_argument("--launcher-blobs")
+        release_command.add_argument("--ruleset-digest")
 
     actions = commands.add_parser("validate-actions")
     actions.add_argument("directory", type=Path)
@@ -1354,7 +2439,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if arguments.command == "update":
             result = update_files(
-                ENV_PATH, VERSION_PATH, _fetcher_from_argument(arguments.offline_fixture)
+                ENV_PATH, _fetcher_from_argument(arguments.offline_fixture)
             )
             print(json.dumps(result, indent=2, sort_keys=True))
             return 0
@@ -1368,23 +2453,72 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 0
         if arguments.command == "build-args":
-            result = build_args(ENV_PATH, VERSION_PATH, arguments.revision)
+            if arguments.version is None:
+                print(
+                    "::warning title=Phase-A compatibility::VERSION fallback is deprecated; "
+                    "pass --version",
+                    file=sys.stderr,
+                )
+            result = build_args(
+                ENV_PATH, VERSION_PATH, arguments.revision, version=arguments.version
+            )
             if arguments.format == "github-output":
                 _emit_github_output(result)
             else:
                 print(json.dumps(result, indent=2))
             return 0
-        if arguments.command in {"release-preflight", "release-state"}:
-            live = getattr(arguments, "live", False) or not arguments.offline_fixture
-            validate_revision(
-                arguments.version, arguments.revision, require_main_ancestor=bool(live)
-            )
+        if arguments.command == "release-inventory":
             surfaces = (
-                live_release_surfaces(arguments.version)
-                if live
+                live_identity_surfaces("0" * 40)
+                if arguments.live
                 else _load_fixture(arguments.offline_fixture)
             )
-            if arguments.command == "release-preflight":
+            result = plan_release_inventory(surfaces)
+            if arguments.format == "github-output":
+                _emit_github_output(result)
+            else:
+                print(json.dumps(result, indent=2, sort_keys=True))
+            return 0
+        if arguments.command == "release-provenance":
+            payload = _load_fixture(arguments.input_json)
+            pull_request = payload.get("pull_request")
+            reviews = payload.get("reviews")
+            merge_parent = payload.get("merge_parent")
+            if (
+                not isinstance(pull_request, Mapping)
+                or not isinstance(reviews, list)
+                or not isinstance(merge_parent, str)
+            ):
+                raise ReleaseConflict("release_provenance_input_invalid")
+            result = classify_release_provenance(
+                pull_request, reviews, arguments.revision, merge_parent=merge_parent
+            )
+            if arguments.format == "github-output":
+                _emit_github_output(result)
+            else:
+                print(json.dumps(result, indent=2, sort_keys=True))
+            return 0
+        if arguments.command in {"release-preflight", "release-state", "release-identity"}:
+            live = getattr(arguments, "live", False) or not arguments.offline_fixture
+            validate_revision(arguments.revision, require_main_ancestor=bool(live))
+            if live and arguments.command == "release-identity":
+                surfaces = live_identity_surfaces(arguments.revision)
+            elif live:
+                surfaces = live_release_surfaces(arguments.version)
+            else:
+                surfaces = _load_fixture(arguments.offline_fixture)
+            surfaces = merge_release_evidence(
+                surfaces,
+                native_digests=arguments.native_digests,
+                canary_proofs=arguments.canary_proofs,
+                launcher_blobs=arguments.launcher_blobs,
+                ruleset_digest=arguments.ruleset_digest,
+            )
+            if arguments.command == "release-identity":
+                result = plan_release_identity(
+                    surfaces, arguments.revision, target_kind=arguments.kind
+                )
+            elif arguments.command == "release-preflight":
                 result = preflight_release(
                     surfaces,
                     arguments.version,

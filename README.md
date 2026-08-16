@@ -41,11 +41,15 @@ Controller and task Pods use the same immutable image digest. The image contains
 The image never compiles Multica from a local source checkout.
 
 Pinned runtime, extension, cloud CLI, Multica, and provider versions live in
-`build/runtime-versions.env`. The root `VERSION` file owns the controller
-release version. A reviewed manual toolchain change updates both files in one
-commit; the four-hour automation changes only `MULTICA_CLI_VERSION`,
-`CODEX_VERSION`, and `PI_VERSION`, and increments the `VERSION` patch once.
-The Make targets pass every value to the Dockerfile as an explicit build arg.
+`build/runtime-versions.env`. The four-hour automation changes only
+`MULTICA_CLI_VERSION`, `CODEX_VERSION`, and `PI_VERSION`. Production release
+identity is allocated from the terminal Git tag, GitHub Release, and GHCR
+inventory after a reviewed `develop`-to-`main` merge; runtime pin maintenance
+does not allocate or increment a stable version. Every current workflow passes
+an explicit `ci`, `develop`, or stable version to the image build. During the
+two-phase workflow cutover only, the root `VERSION` file remains a bounded
+old-`main` compatibility sentinel and an omitted `build-args --version` emits a
+deprecation marker. Phase B removes both together.
 
 ```bash
 # Build and load the host architecture for local verification.
@@ -76,7 +80,7 @@ a `LICENSE` file is added by the repository owner. Report vulnerabilities only
 through the private process in [SECURITY.md](SECURITY.md), never in public
 issues, pull requests, logs, or artifacts.
 
-Six workflows own delivery:
+Eight workflows own delivery:
 
 - `CI` is secret-free. Its build and verification jobs are read-only, and its
   literal `verify` and `runtime-image` jobs are the required checks for every
@@ -86,7 +90,7 @@ Six workflows own delivery:
   `repository_dispatch` event so GitHub always loads the reviewed default-branch
   copy against an exact bot PR head; the workflow rejects a moved trusted ref
   or mismatched pull request. After a successful bot-PR attempt, one isolated
-  contents-write job emits an `automation-merge` repository dispatch carrying
+  dispatch job emits an `automation-merge` repository dispatch carrying
   that exact run ID, attempt, workflow SHA, PR, and head SHA.
 - `Runtime Version Update` runs at minute 0 every four hours UTC and can also
   be started with the `runtime-version-update` repository-dispatch event. It
@@ -102,21 +106,18 @@ Six workflows own delivery:
   actors, repository, branch, head,
   current pull request, files, commit identity, and the exact successful CI
   jobs without checking out or executing pull request code. A least-privilege
-  merge job performs matched-head squash merges for runtime updates and
-  release-patch PRs into protected `develop`. A main-ancestry sync PR is the
-  sole merge-commit case. A separate contents-write job sends a trusted
-  repository-dispatch reconciliation for the exact merge SHA.
+  merge job performs matched-head squash merges for env-only runtime updates
+  into protected `develop`. A main-ancestry sync PR is the sole merge-commit
+  case. A separate Actions-write job dispatches the trusted default-branch
+  reconciler for the exact merge SHA.
 - `Create develop into main PR` runs only from the reviewed `main` copy: after
   successful `develop` push CI, after `main` pushes, once per hour, and on an
-  exact-revision repository dispatch. A force-release payload can create the
-  first patch after bootstrap only when the two branch trees are identical.
-  After each squash promotion it first preserves the
-  new `main` commit in `develop` through one empty-tree, two-parent sync PR.
-  When source changed without a release version, it creates one bot-owned
-  `automation/release-patch` PR that changes only `VERSION`. It then maintains
-  one `develop` into `main` promotion PR and dispatches trusted exact-head CI.
-  The promotion requires repository-owner approval; this workflow never
-  merges it.
+  exact-revision workflow dispatch. It derives one of `sync`, `wait-release`,
+  `none`, or `promotion` from live ancestry and release inventory. A sync PR
+  restores `main` ancestry to `develop`; otherwise, only a terminal release may
+  lead to one direct bot-owned `develop`-to-`main` promotion PR and trusted
+  exact-head CI. The promotion requires repository-owner approval; this
+  workflow never merges it.
 - `Development Image` is repository-dispatch-only and always loads the reviewed
   default-branch workflow with the exact live `develop` SHA as input. A read-only verify job
   resolves all build arguments before separate native amd64 and arm64
@@ -126,13 +127,23 @@ Six workflows own delivery:
   `runtime-develop-<architecture>` write cache and may restore the matching
   trusted `runtime-main-<architecture>` cache. The workflow never changes
   stable version tags, `latest`, or a GitHub Release.
-- `Release` runs when the reviewed develop promotion changes `VERSION` on
-  `main`. Recovery uses the `stable-release-recovery` repository-dispatch event
-  with the exact stable version and full 40-character main revision. Candidate
-  builds use the same native per-architecture fan-out and digest-based manifest
-  assembly as development publication. The workflow validates the public
-  tag-rule shape visible to its scoped token; repository settings separately
-  enforce and admin-verify that the active tag ruleset has no bypass actors.
+- `Release` evaluates every new `main` revision, accepts only an exact
+  bot-authored promotion with an exact-head `jskorlol` approval and merge, and
+  allocates the next patch from the complete stable inventory. Recovery uses
+  the `stable-release-recovery` repository-dispatch event with the exact full
+  revision. Native amd64 and arm64 proofs plus current launcher canaries precede
+  immutable tag reservation; only then may the numeric manifest, GitHub
+  Release, and `latest` be published in that order.
+- `Release Repair` is the primary protected repair launcher. With the rollout
+  gate read back as false, it creates and verifies one canonical checkpoint
+  Issue, disables and drains the recorded workflow set, seals the post-drain
+  surface in one immutable hash-chained Issue comment, and proposes only its
+  mode-specific protected PR. It never edits itself.
+- `Release Repair Guard` is the independent peer launcher. It owns recovery of
+  the primary launcher and shares the same checkpoint lock, seal, nonce, and
+  exact restore mapping. Either peer stages and canaries a repaired launcher;
+  a failed canary re-disables it, and the Issue closes only after both canaries
+  and exact original workflow-state restoration succeed.
 
 The release, development publisher, updater, CI dispatcher, merge, and develop
 promotion dispatcher use only GitHub's ephemeral repository-scoped `GITHUB_TOKEN` with
@@ -143,8 +154,13 @@ execution, or cache restore. Tokens must never be placed in source, shell
 history, workflow inputs, build arguments, artifacts, or cache keys.
 
 The non-secret repository variable `RELEASE_AUTOMATION_ENABLED` is the rollout
-gate. Bootstrap installs the reviewed workflows first; operators set it to
-`true` only after both branch rulesets are active and verified.
+gate. Bootstrap and repair read back literal `false` before mutation. Operators
+set and read back `true` only after both launcher blobs and the current ruleset
+have successful canary proof and the checkpoint's original workflow mapping is
+restored. A retry supplies the same Issue number, canonical body hash, seal ID,
+seal hash, and nonce; an edited or duplicate Issue/seal, unexpected ref, PR,
+check, package, or release delta, nonzero drained run, widened gate, or 403
+fails closed.
 
 GitHub creates an approval-required ordinary workflow run for pull requests
 opened or updated by `GITHUB_TOKEN`. Automation therefore sends a second,

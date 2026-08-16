@@ -1,0 +1,1461 @@
+name: Release Repair
+run-name: Release repair ${{ inputs.mode }} ${{ inputs.nonce }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: canary, replacement, control, guard-repair, or resume
+        required: true
+        type: choice
+        options: [canary, replacement, control, guard-repair, resume]
+      target_revision:
+        description: Active release target SHA
+        required: false
+        type: string
+      source_revision:
+        description: Replacement or repair source SHA
+        required: false
+        type: string
+      main_revision:
+        description: Exact main SHA at authorization
+        required: true
+        type: string
+      nonce:
+        description: Unique lowercase transaction nonce
+        required: true
+        type: string
+      issue_number:
+        description: Existing checkpoint issue for resume
+        required: false
+        type: string
+      body_hash:
+        description: Existing immutable checkpoint body SHA-256
+        required: false
+        type: string
+      seal_id:
+        description: Existing authoritative seal comment ID
+        required: false
+        type: string
+      seal_hash:
+        description: Existing authoritative seal SHA-256
+        required: false
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: ${{ inputs.mode == 'canary' && format('release-repair-canary-{0}', inputs.nonce) || 'release-repair-transaction' }}
+  cancel-in-progress: false
+
+jobs:
+  authorize:
+    name: authorize
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+      issues: read
+    outputs:
+      body_hash: ${{ steps.auth.outputs.body_hash }}
+      issue_number: ${{ steps.auth.outputs.issue_number }}
+      main_revision: ${{ steps.auth.outputs.main_revision }}
+      mode: ${{ steps.auth.outputs.mode }}
+      nonce: ${{ steps.auth.outputs.nonce }}
+      seal_hash: ${{ steps.auth.outputs.seal_hash }}
+      seal_id: ${{ steps.auth.outputs.seal_id }}
+      source_revision: ${{ steps.auth.outputs.source_revision }}
+      target_revision: ${{ steps.auth.outputs.target_revision }}
+    steps:
+      - name: Authorize exact default-main dispatch inputs
+        id: auth
+        env:
+          BODY_HASH: ${{ inputs.body_hash }}
+          EVENT_ACTOR: ${{ github.actor }}
+          EVENT_REF: ${{ github.ref }}
+          EVENT_SHA: ${{ github.sha }}
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          MAIN_REVISION: ${{ inputs.main_revision }}
+          MODE: ${{ inputs.mode }}
+          NONCE: ${{ inputs.nonce }}
+          SEAL_HASH: ${{ inputs.seal_hash }}
+          SEAL_ID: ${{ inputs.seal_id }}
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+          TARGET_REVISION: ${{ inputs.target_revision }}
+        run: |
+          set -euo pipefail
+          [ "$EVENT_REF" = refs/heads/main ]
+          live_main=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)
+          [ "$EVENT_SHA" = "$live_main" ]
+          [ "$MAIN_REVISION" = "$live_main" ]
+          case "$MAIN_REVISION$TARGET_REVISION$SOURCE_REVISION" in
+            *[!0-9a-f]*) echo 'revision input must be lowercase hexadecimal' >&2; exit 1 ;;
+          esac
+          [ "${#MAIN_REVISION}" -eq 40 ]
+          case "$NONCE" in
+            ''|*[!a-z0-9-]*) echo 'nonce must be lowercase alphanumeric with hyphens' >&2; exit 1 ;;
+          esac
+          [ "${#NONCE}" -ge 12 ]
+          if [ "$MODE" = canary ]; then
+            [ "${#NONCE}" -le 72 ]
+          else
+            [ "${#NONCE}" -le 64 ]
+          fi
+          read_stable_target_count() {
+            stable_tags=$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/v")
+            # shellcheck disable=SC2016
+            stable_target_count=$(printf '%s' "$stable_tags" | jq --arg target "$TARGET_REVISION" '[
+              .[] | select(
+                (.ref | test("^refs/tags/v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$")) and
+                .object.type == "commit" and .object.sha == $target
+              )
+            ] | length')
+          }
+          case "$MODE" in
+            canary)
+              [ -z "$TARGET_REVISION$SOURCE_REVISION" ]
+              if [ "$EVENT_ACTOR" = 'github-actions[bot]' ]; then
+                case "$ISSUE_NUMBER$SEAL_ID" in *[!0-9]*|'') exit 1 ;; esac
+                case "$BODY_HASH$SEAL_HASH" in *[!0-9a-f]*) exit 1 ;; esac
+                [ "${#BODY_HASH}" -eq 64 ] && [ "${#SEAL_HASH}" -eq 64 ]
+                [ "$(gh api "repos/$GITHUB_REPOSITORY/actions/variables/RELEASE_AUTOMATION_ENABLED" --jq .value)" = false ]
+                issue=$(gh api "repos/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER")
+                [ "$(printf '%s' "$issue" | jq -r .state)" = open ]
+                [ "$(printf '%s' "$issue" | jq -r .user.login)" = 'github-actions[bot]' ]
+                body=$(printf '%s' "$issue" | jq -r .body)
+                [ "$(printf '%s' "$body" | sha256sum | awk '{print $1}')" = "$BODY_HASH" ]
+                seal=$(gh api "repos/$GITHUB_REPOSITORY/issues/comments/$SEAL_ID")
+                [ "$(printf '%s' "$seal" | jq -r .user.login)" = 'github-actions[bot]' ]
+                [ "$(printf '%s' "$seal" | jq -r .created_at)" = "$(printf '%s' "$seal" | jq -r .updated_at)" ]
+                seal_body=$(printf '%s' "$seal" | jq -r .body)
+                [ "$(printf '%s' "$seal_body" | sha256sum | awk '{print $1}')" = "$SEAL_HASH" ]
+                root_nonce=$(printf '%s' "$body" | jq -r .nonce)
+                [ "$(printf '%s' "$seal_body" | jq -r .nonce)" = "$root_nonce" ]
+                [ "$(printf '%s' "$seal_body" | jq -r .issue_number)" = "$ISSUE_NUMBER" ]
+                [ "$(printf '%s' "$seal_body" | jq -r .body_hash)" = "sha256:$BODY_HASH" ]
+                [ "$NONCE" = "$root_nonce-primary" ] || [ "$NONCE" = "$root_nonce-guard" ]
+              else
+                [ "$EVENT_ACTOR" = jskorlol ]
+                [ -z "$ISSUE_NUMBER$BODY_HASH$SEAL_ID$SEAL_HASH" ]
+              fi
+              ;;
+            replacement)
+              [ "$EVENT_ACTOR" = jskorlol ]
+              [ "${#TARGET_REVISION}" -eq 40 ]
+              [ "${#SOURCE_REVISION}" -eq 40 ]
+              [ -z "$ISSUE_NUMBER$BODY_HASH$SEAL_ID$SEAL_HASH" ]
+              gh api "repos/$GITHUB_REPOSITORY/git/commits/$TARGET_REVISION" >/dev/null
+              gh api "repos/$GITHUB_REPOSITORY/git/commits/$SOURCE_REVISION" >/dev/null
+              [ "$TARGET_REVISION" = "$MAIN_REVISION" ]
+              read_stable_target_count
+              [ "$stable_target_count" -eq 0 ]
+              ;;
+            control)
+              [ "$EVENT_ACTOR" = jskorlol ]
+              [ "${#TARGET_REVISION}" -eq 40 ]
+              [ "${#SOURCE_REVISION}" -eq 40 ]
+              [ -z "$ISSUE_NUMBER$BODY_HASH$SEAL_ID$SEAL_HASH" ]
+              gh api "repos/$GITHUB_REPOSITORY/git/commits/$TARGET_REVISION" >/dev/null
+              gh api "repos/$GITHUB_REPOSITORY/git/commits/$SOURCE_REVISION" >/dev/null
+              read_stable_target_count
+              [ "$stable_target_count" -eq 1 ]
+              ;;
+            guard-repair)
+              [ "$EVENT_ACTOR" = jskorlol ]
+              [ "${#TARGET_REVISION}" -eq 40 ]
+              [ "${#SOURCE_REVISION}" -eq 40 ]
+              [ -z "$ISSUE_NUMBER$BODY_HASH$SEAL_ID$SEAL_HASH" ]
+              gh api "repos/$GITHUB_REPOSITORY/git/commits/$TARGET_REVISION" >/dev/null
+              gh api "repos/$GITHUB_REPOSITORY/git/commits/$SOURCE_REVISION" >/dev/null
+              ;;
+            resume)
+              [ "$EVENT_ACTOR" = jskorlol ]
+              case "$ISSUE_NUMBER" in *[!0-9]*|'') exit 1 ;; esac
+              case "$BODY_HASH$SEAL_HASH" in *[!0-9a-f]*) exit 1 ;; esac
+              [ "${#BODY_HASH}" -eq 64 ]
+              if [ -n "$SEAL_ID$SEAL_HASH" ]; then
+                case "$SEAL_ID" in *[!0-9]*|'') exit 1 ;; esac
+                [ "${#SEAL_HASH}" -eq 64 ]
+              fi
+              ;;
+            *) exit 1 ;;
+          esac
+          {
+            printf 'body_hash=%s\n' "$BODY_HASH"
+            printf 'issue_number=%s\n' "$ISSUE_NUMBER"
+            printf 'main_revision=%s\n' "$MAIN_REVISION"
+            printf 'mode=%s\n' "$MODE"
+            printf 'nonce=%s\n' "$NONCE"
+            printf 'seal_hash=%s\n' "$SEAL_HASH"
+            printf 'seal_id=%s\n' "$SEAL_ID"
+            printf 'source_revision=%s\n' "$SOURCE_REVISION"
+            printf 'target_revision=%s\n' "$TARGET_REVISION"
+          } >>"$GITHUB_OUTPUT"
+
+  canary:
+    name: canary
+    if: needs.authorize.outputs.mode == 'canary'
+    needs: authorize
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      checks: write
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Create, prove, and clean an exact-main canary PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MAIN_REVISION: ${{ needs.authorize.outputs.main_revision }}
+          NONCE: ${{ needs.authorize.outputs.nonce }}
+        run: |
+          set -euo pipefail
+          live_main=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)
+          [ "$live_main" = "$MAIN_REVISION" ]
+          branch="automation/release-repair-canary-$NONCE"
+          ref="refs/heads/$branch"
+          # Clean deterministic canary residue before retry.
+          residue=$(gh pr list --state open --head "$branch" --json number --limit 10)
+          [ "$(printf '%s' "$residue" | jq 'length')" -le 1 ]
+          for number in $(printf '%s' "$residue" | jq -r '.[].number'); do
+            existing=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$number")
+            printf '%s' "$existing" | jq -e --arg branch "$branch" '
+              .user.login == "github-actions[bot]" and .base.ref == "main" and
+              .head.ref == $branch' >/dev/null
+            gh api --method PATCH "repos/$GITHUB_REPOSITORY/pulls/$number" \
+              -f state=closed >/dev/null
+          done
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$branch" \
+            --silent >/dev/null 2>&1; then
+            gh api --method DELETE "repos/$GITHUB_REPOSITORY/git/$ref" >/dev/null
+          fi
+          gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+            -f ref="$ref" -f sha="$MAIN_REVISION" >/dev/null
+          cleanup() {
+            if [ -n "${number:-}" ]; then
+              gh api --method PATCH "repos/$GITHUB_REPOSITORY/pulls/$number" \
+                -f state=closed >/dev/null 2>&1 || true
+            fi
+            gh api --method DELETE "repos/$GITHUB_REPOSITORY/git/$ref" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          content=$(printf 'primary:%s:%s\n' "$NONCE" "$MAIN_REVISION" | base64 | tr -d '\n')
+          gh api --method PUT \
+            "repos/$GITHUB_REPOSITORY/contents/.release-canary/$NONCE-primary?ref=$branch" \
+            -f message="chore: primary repair canary $NONCE" \
+            -f content="$content" -f branch="$branch" >/dev/null
+          head=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$branch" --jq .object.sha)
+          url=$(gh pr create --base main --head "$branch" \
+            --title "chore: primary repair canary $NONCE" \
+            --body "Never merge. Exact-main primary launcher canary for $NONCE.")
+          number=${url##*/}
+          for name in verify runtime-image; do
+            jq -n --arg name "$name" --arg head "$head" \
+              --arg summary "Primary repair canary $NONCE" \
+              '{name:$name,head_sha:$head,status:"completed",conclusion:"success",
+                output:{title:("Repair canary " + $name),summary:$summary}}' \
+              | gh api --method POST "repos/$GITHUB_REPOSITORY/check-runs" --input - >/dev/null
+          done
+          approved=false
+          for _ in $(seq 1 180); do
+            reviews=$(gh api --paginate --slurp \
+              "repos/$GITHUB_REPOSITORY/pulls/$number/reviews?per_page=100")
+            if printf '%s' "$reviews" | jq -e --arg head "$head" '
+              any(.[][]; .user.login == "jskorlol" and
+                .state == "APPROVED" and .commit_id == $head)' >/dev/null; then
+              approved=true
+              break
+            fi
+            sleep 10
+          done
+          [ "$approved" = true ]
+          checks=$(gh api "repos/$GITHUB_REPOSITORY/commits/$head/check-runs")
+          printf '%s' "$checks" | jq -e '
+            [.check_runs[] | select(
+              (.name == "verify" or .name == "runtime-image") and
+              .status == "completed" and .conclusion == "success" and
+              .app.id == 15368)] | length == 2' >/dev/null
+          rulesets=$(gh api "repos/$GITHUB_REPOSITORY/rulesets")
+          main_id=
+          for id in $(printf '%s' "$rulesets" | jq -r \
+            '.[] | select(.target == "branch" and .enforcement == "active") | .id'); do
+            value=$(gh api "repos/$GITHUB_REPOSITORY/rulesets/$id")
+            if printf '%s' "$value" | jq -e \
+              '.conditions.ref_name.include == ["refs/heads/main"]' >/dev/null; then
+              [ -z "$main_id" ]
+              main_id=$id
+              main_ruleset=$value
+            fi
+          done
+          [ -n "$main_id" ]
+          ruleset_digest="sha256:$(printf '%s' "$main_ruleset" | jq -Sc . | sha256sum | awk '{print $1}')"
+          launcher_blob=$(gh api \
+            "repos/$GITHUB_REPOSITORY/contents/.github/workflows/release-repair.yml?ref=$MAIN_REVISION" \
+            --jq .sha)
+          mkdir -p "$RUNNER_TEMP/canary-proof"
+          jq -n --arg launcher primary --arg conclusion success \
+            --arg blob "$launcher_blob" --arg ruleset "$ruleset_digest" \
+            --arg main "$MAIN_REVISION" --arg nonce "$NONCE" \
+            '{launcher:$launcher,proof:{conclusion:$conclusion,
+              launcher_blob_sha:$blob,ruleset_digest:$ruleset,
+              main_revision:$main,nonce:$nonce}}' \
+            >"$RUNNER_TEMP/canary-proof/primary.json"
+          cleanup
+          trap - EXIT
+          [ "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$branch" \
+            --silent >/dev/null 2>&1; echo $?)" -ne 0 ]
+      - name: Upload current primary canary proof
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-repair-primary-canary-proof
+          path: ${{ runner.temp }}/canary-proof/primary.json
+          if-no-files-found: error
+          retention-days: 30
+
+  checkpoint:
+    name: checkpoint
+    if: needs.authorize.outputs.mode != 'canary'
+    needs: authorize
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+    outputs:
+      body_hash: ${{ steps.checkpoint.outputs.body_hash }}
+      issue_number: ${{ steps.checkpoint.outputs.issue_number }}
+      main_revision: ${{ steps.checkpoint.outputs.main_revision }}
+      source_revision: ${{ steps.checkpoint.outputs.source_revision }}
+      target_revision: ${{ steps.checkpoint.outputs.target_revision }}
+      transaction_mode: ${{ steps.checkpoint.outputs.transaction_mode }}
+    steps:
+      - name: Create or read back one canonical checkpoint issue
+        id: checkpoint
+        env:
+          BODY_HASH: ${{ needs.authorize.outputs.body_hash }}
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ needs.authorize.outputs.issue_number }}
+          MAIN_REVISION: ${{ needs.authorize.outputs.main_revision }}
+          MODE: ${{ needs.authorize.outputs.mode }}
+          NONCE: ${{ needs.authorize.outputs.nonce }}
+          SOURCE_REVISION: ${{ needs.authorize.outputs.source_revision }}
+          TARGET_REVISION: ${{ needs.authorize.outputs.target_revision }}
+        run: |
+          set -euo pipefail
+          gh api --method POST "repos/$GITHUB_REPOSITORY/labels" \
+            -f name=release-repair-checkpoint -f color=8b0000 \
+            -f description='Durable release repair transaction lock' >/dev/null 2>&1 || true
+          open=$(gh api --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/issues?state=open&labels=release-repair-checkpoint&per_page=100")
+          count=$(printf '%s' "$open" | jq '[.[][] | select(.pull_request == null)] | length')
+          if [ "$MODE" = resume ]; then
+            [ "$count" -le 1 ]
+            issue=$(gh api "repos/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER")
+            [ "$(printf '%s' "$issue" | jq -r '.pull_request == null')" = true ]
+            [ "$(printf '%s' "$issue" | jq -r .user.login)" = 'github-actions[bot]' ]
+            [ "$(printf '%s' "$issue" | jq -r .title)" = "Release repair checkpoint $NONCE" ]
+            printf '%s' "$issue" | jq -e \
+              '[.labels[].name] | sort == ["release-repair-checkpoint"]' >/dev/null
+            body=$(printf '%s' "$issue" | jq -r .body)
+            actual=$(printf '%s' "$body" | sha256sum | awk '{print $1}')
+            [ "$actual" = "$BODY_HASH" ]
+            [ "$(printf '%s' "$body" | jq -cS .)" = "$body" ]
+            [ "$(printf '%s' "$body" | jq -r .nonce)" = "$NONCE" ]
+            transaction_mode=$(printf '%s' "$body" | jq -r .mode)
+            case "$transaction_mode" in replacement|control|guard-repair) ;; *) exit 1 ;; esac
+            case "$(printf '%s' "$issue" | jq -r .state)" in
+              open)
+                [ "$count" -eq 1 ]
+                [ "$(printf '%s' "$open" | jq --argjson number "$ISSUE_NUMBER" \
+                  '[.[][] | select(.pull_request == null and .number == $number)] | length')" -eq 1 ]
+                ;;
+              closed)
+                [ "$count" -eq 0 ]
+                completion="release repair restored nonce=$NONCE"
+                comments=$(gh api --paginate --slurp \
+                  "repos/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER/comments?per_page=100")
+                [ "$(printf '%s' "$comments" | jq --arg body "$completion" \
+                  '[.[][] | select(.user.login == "github-actions[bot]" and .body == $body)] | length')" -eq 0 ]
+                gh api --method PATCH "repos/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER" \
+                  -f state=open >/dev/null
+                issue=$(gh api "repos/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER")
+                [ "$(printf '%s' "$issue" | jq -r .state)" = open ]
+                [ "$(printf '%s' "$issue" | jq -r .body)" = "$body" ]
+                ;;
+              *) exit 1 ;;
+            esac
+          else
+            [ "$count" -le 1 ]
+            workflows=$(gh api --paginate --slurp \
+              "repos/$GITHUB_REPOSITORY/actions/workflows?per_page=100" | jq -cS '
+                [.[].workflows[] | {workflow_id:.id,path:.path,original_state:.state}] |
+                sort_by(.workflow_id)')
+            case "$MODE" in
+              guard-repair)
+                quiesced=$(printf '%s' "$workflows" | jq -cS \
+                  '[.[] | select(.path != ".github/workflows/release-repair.yml")] | map(.workflow_id)')
+                ;;
+              *)
+                quiesced=$(printf '%s' "$workflows" | jq -cS '
+                  [.[] | select(
+                    .path != ".github/workflows/release-repair.yml" and
+                    .path != ".github/workflows/release-repair-guard.yml")] |
+                  map(.workflow_id)')
+                ;;
+            esac
+            rulesets=$(gh api --paginate --slurp \
+              "repos/$GITHUB_REPOSITORY/rulesets?per_page=100")
+            main_id=
+            for id in $(printf '%s' "$rulesets" | jq -r \
+              '.[][] | select(.target == "branch" and .enforcement == "active") | .id'); do
+              value=$(gh api "repos/$GITHUB_REPOSITORY/rulesets/$id")
+              if printf '%s' "$value" | jq -e \
+                '.conditions.ref_name.include == ["refs/heads/main"]' >/dev/null; then
+                [ -z "$main_id" ]
+                main_id=$id
+                main_ruleset=$value
+              fi
+            done
+            [ -n "$main_id" ]
+            ruleset_digest="sha256:$(printf '%s' "$main_ruleset" | jq -Sc . | sha256sum | awk '{print $1}')"
+            refs=$(gh api --paginate --slurp \
+              "repos/$GITHUB_REPOSITORY/git/matching-refs/?per_page=100" | jq -cS \
+              '[.[][] | {ref:.ref,sha:.object.sha}] | sort_by(.ref)')
+            prs=$(gh api --paginate --slurp \
+              "repos/$GITHUB_REPOSITORY/pulls?state=open&per_page=100" | jq -cS \
+              '[.[][] | {number:.number,base:.base.ref,head:.head.ref,sha:.head.sha}] | sort_by(.number)')
+            releases=$(gh api --paginate --slurp \
+              "repos/$GITHUB_REPOSITORY/releases?per_page=100" | jq -cS \
+              '[.[][] | {id:.id,tag_name:.tag_name,target:.target_commitish,draft:.draft,prerelease:.prerelease}] | sort_by(.id)')
+            registry_token=$(curl -fsSL \
+              'https://ghcr.io/token?service=ghcr.io&scope=repository%3Akorioinc%2Fmultica-runtime-controller%3Apull' \
+              | jq -er .token)
+            tags=$(curl -fsSL -H "Authorization: Bearer $registry_token" \
+              'https://ghcr.io/v2/korioinc/multica-runtime-controller/tags/list?n=10000' \
+              | jq -cS '(.tags // []) | unique | sort')
+            manifests='[]'
+            while IFS= read -r tag; do
+              headers=$(curl -fsSI -H "Authorization: Bearer $registry_token" \
+                -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json' \
+                "https://ghcr.io/v2/korioinc/multica-runtime-controller/manifests/$tag")
+              digest=$(printf '%s' "$headers" | tr -d '\r' \
+                | awk 'tolower($1) == "docker-content-digest:" {print $2; exit}')
+              case "$digest" in sha256:[0-9a-f][0-9a-f]*) ;; *) exit 1 ;; esac
+              [ "${#digest}" -eq 71 ]
+              manifests=$(printf '%s' "$manifests" | jq -cS \
+                --arg tag "$tag" --arg digest "$digest" \
+                '. + [{tag:$tag,digest:$digest}] | sort_by(.tag)')
+            done < <(printf '%s' "$tags" | jq -r '.[]')
+            package=$(jq -ncS --argjson manifests "$manifests" '{manifests:$manifests}')
+            initial_surface=$(jq -ncS --argjson refs "$refs" --argjson prs "$prs" \
+              --argjson releases "$releases" --argjson package "$package" \
+              '{refs:$refs,pull_requests:$prs,releases:$releases,package:$package}')
+            initial_surface_hash="sha256:$(printf '%s' "$initial_surface" | sha256sum | awk '{print $1}')"
+            body=$(jq -ncS --argjson schema_version 1 --arg nonce "$NONCE" \
+              --arg mode "$MODE" --arg target "$TARGET_REVISION" \
+              --arg source "$SOURCE_REVISION" --arg main "$MAIN_REVISION" \
+              --argjson workflows "$workflows" --argjson quiesced "$quiesced" \
+              --arg ruleset "$ruleset_digest" --arg initial "$initial_surface_hash" \
+              '{schema_version:$schema_version,nonce:$nonce,mode:$mode,
+                target_revision:$target,source_revision:$source,main_revision:$main,
+                workflows:$workflows,quiesced_workflow_ids:$quiesced,
+                ruleset_digest:$ruleset,initial_surface_hash:$initial}')
+            if [ "$count" -eq 0 ]; then
+              if created=$(jq -n --arg title "Release repair checkpoint $NONCE" \
+                --arg body "$body" \
+                '{title:$title,body:$body,labels:["release-repair-checkpoint"]}' \
+                | gh api --method POST "repos/$GITHUB_REPOSITORY/issues" --input -); then
+                ISSUE_NUMBER=$(printf '%s' "$created" | jq -r .number)
+              else
+                recovered=$(gh api --paginate --slurp \
+                  "repos/$GITHUB_REPOSITORY/issues?state=open&labels=release-repair-checkpoint&per_page=100")
+                matches=$(printf '%s' "$recovered" | jq -c \
+                  --arg title "Release repair checkpoint $NONCE" --arg body "$body" '
+                  [.[][] | select(.pull_request == null and
+                    .user.login == "github-actions[bot]" and
+                    .title == $title and .body == $body and
+                    ([.labels[].name] | sort) == ["release-repair-checkpoint"])]')
+                [ "$(printf '%s' "$matches" | jq 'length')" -eq 1 ]
+                ISSUE_NUMBER=$(printf '%s' "$matches" | jq -r '.[0].number')
+              fi
+            else
+              existing=$(printf '%s' "$open" | jq -c \
+                '[.[][] | select(.pull_request == null)][0]')
+              [ "$(printf '%s' "$existing" | jq -r .user.login)" = 'github-actions[bot]' ]
+              [ "$(printf '%s' "$existing" | jq -r .body)" = "$body" ]
+              ISSUE_NUMBER=$(printf '%s' "$existing" | jq -r .number)
+            fi
+            issue=$(gh api "repos/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER")
+            [ "$(printf '%s' "$issue" | jq -r .user.login)" = 'github-actions[bot]' ]
+            [ "$(printf '%s' "$issue" | jq -r .body)" = "$body" ]
+            actual=$(printf '%s' "$body" | sha256sum | awk '{print $1}')
+            transaction_mode=$MODE
+          fi
+          issue=$(gh api "repos/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER")
+          [ "$(printf '%s' "$issue" | jq -r .state)" = open ]
+          [ "$(printf '%s' "$issue" | jq -r .user.login)" = 'github-actions[bot]' ]
+          [ "$(printf '%s' "$issue" | jq -r .title)" = "Release repair checkpoint $NONCE" ]
+          [ "$(printf '%s' "$issue" | jq -r .body)" = "$body" ]
+          printf '%s' "$issue" | jq -e \
+            '[.labels[].name] | sort == ["release-repair-checkpoint"]' >/dev/null
+          {
+            printf 'body_hash=%s\n' "$actual"
+            printf 'issue_number=%s\n' "$ISSUE_NUMBER"
+            printf 'main_revision=%s\n' "$(printf '%s' "$body" | jq -r .main_revision)"
+            printf 'source_revision=%s\n' "$(printf '%s' "$body" | jq -r .source_revision)"
+            printf 'target_revision=%s\n' "$(printf '%s' "$body" | jq -r .target_revision)"
+            printf 'transaction_mode=%s\n' "$transaction_mode"
+          } >>"$GITHUB_OUTPUT"
+
+  quiesce:
+    name: quiesce
+    if: needs.authorize.outputs.mode != 'canary'
+    needs: [authorize, checkpoint]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      actions: write
+      contents: read
+      issues: read
+    outputs:
+      baseline_b64: ${{ steps.quiesce.outputs.baseline_b64 }}
+    steps:
+      - name: Disable, read back, drain, and capture the post-drain surface
+        id: quiesce
+        env:
+          BODY_HASH: ${{ needs.checkpoint.outputs.body_hash }}
+          GH_TOKEN: ${{ github.token }}
+          INPUT_SEAL_HASH: ${{ needs.authorize.outputs.seal_hash }}
+          INPUT_SEAL_ID: ${{ needs.authorize.outputs.seal_id }}
+          ISSUE_NUMBER: ${{ needs.checkpoint.outputs.issue_number }}
+          NONCE: ${{ needs.authorize.outputs.nonce }}
+        run: |
+          set -euo pipefail
+          issue=$(gh api "repos/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER")
+          [ "$(printf '%s' "$issue" | jq -r .state)" = open ]
+          body=$(printf '%s' "$issue" | jq -r .body)
+          [ "$(printf '%s' "$body" | sha256sum | awk '{print $1}')" = "$BODY_HASH" ]
+          [ "$(gh api "repos/$GITHUB_REPOSITORY/actions/variables/RELEASE_AUTOMATION_ENABLED" --jq .value)" = false ]
+          live_workflows=$(gh api --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/actions/workflows?per_page=100" | jq -cS '
+              [.[].workflows[] | {workflow_id:.id,path:.path,current_state:.state}] |
+              sort_by(.workflow_id)')
+          expected_inventory=$(printf '%s' "$body" | jq -cS \
+            '[.workflows[] | {workflow_id,path}] | sort_by(.workflow_id)')
+          current_inventory=$(printf '%s' "$live_workflows" | jq -cS \
+            '[.[] | {workflow_id,path}] | sort_by(.workflow_id)')
+          [ "$current_inventory" = "$expected_inventory" ]
+          # shellcheck disable=SC2016
+          printf '%s' "$live_workflows" | jq -e --argjson checkpoint "$body" '
+            all(.[]; . as $current |
+              ($checkpoint.workflows |
+                map(select(.workflow_id == $current.workflow_id))[0]) as $original |
+              if ($checkpoint.quiesced_workflow_ids | index($current.workflow_id)) != null
+              then ($current.current_state == $original.original_state or
+                    $current.current_state == "disabled_manually")
+              else $current.current_state == $original.original_state end)' >/dev/null
+          for id in $(printf '%s' "$body" | jq -r '.quiesced_workflow_ids[]'); do
+            gh api --method PUT "repos/$GITHUB_REPOSITORY/actions/workflows/$id/disable" >/dev/null
+            [ "$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$id" --jq .state)" = disabled_manually ]
+          done
+          for id in $(printf '%s' "$body" | jq -r '.quiesced_workflow_ids[]'); do
+            runs=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$id/runs?status=in_progress&per_page=100")
+            for run in $(printf '%s' "$runs" | jq -r '.workflow_runs[].id'); do
+              gh api --method POST "repos/$GITHUB_REPOSITORY/actions/runs/$run/cancel" >/dev/null || true
+            done
+            runs=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$id/runs?status=queued&per_page=100")
+            for run in $(printf '%s' "$runs" | jq -r '.workflow_runs[].id'); do
+              gh api --method POST "repos/$GITHUB_REPOSITORY/actions/runs/$run/cancel" >/dev/null || true
+            done
+          done
+          drained=false
+          for _ in $(seq 1 60); do
+            active=0
+            for id in $(printf '%s' "$body" | jq -r '.quiesced_workflow_ids[]'); do
+              count=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$id/runs?per_page=100" \
+                --jq '[.workflow_runs[] | select(.status == "queued" or .status == "in_progress")] | length')
+              active=$((active + count))
+            done
+            if [ "$active" -eq 0 ]; then drained=true; break; fi
+            sleep 5
+          done
+          [ "$drained" = true ]
+          refs=$(gh api --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/git/matching-refs/?per_page=100" | jq -cS \
+            '[.[][] | {ref:.ref,sha:.object.sha}] | sort_by(.ref)')
+          prs=$(gh api --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/pulls?state=open&per_page=100" | jq -cS \
+            '[.[][] | {number:.number,base:.base.ref,head:.head.ref,sha:.head.sha}] | sort_by(.number)')
+          releases=$(gh api --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/releases?per_page=100" | jq -cS \
+            '[.[][] | {id:.id,tag_name:.tag_name,target:.target_commitish,draft:.draft,prerelease:.prerelease}] | sort_by(.id)')
+          registry_token=$(curl -fsSL \
+            'https://ghcr.io/token?service=ghcr.io&scope=repository%3Akorioinc%2Fmultica-runtime-controller%3Apull' \
+            | jq -er .token)
+          tags=$(curl -fsSL -H "Authorization: Bearer $registry_token" \
+            'https://ghcr.io/v2/korioinc/multica-runtime-controller/tags/list?n=10000' \
+            | jq -cS '(.tags // []) | unique | sort')
+          manifests='[]'
+          while IFS= read -r tag; do
+            headers=$(curl -fsSI -H "Authorization: Bearer $registry_token" \
+              -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json' \
+              "https://ghcr.io/v2/korioinc/multica-runtime-controller/manifests/$tag")
+            digest=$(printf '%s' "$headers" | tr -d '\r' \
+              | awk 'tolower($1) == "docker-content-digest:" {print $2; exit}')
+            case "$digest" in sha256:[0-9a-f][0-9a-f]*) ;; *) exit 1 ;; esac
+            [ "${#digest}" -eq 71 ]
+            manifests=$(printf '%s' "$manifests" | jq -cS \
+              --arg tag "$tag" --arg digest "$digest" \
+              '. + [{tag:$tag,digest:$digest}] | sort_by(.tag)')
+          done < <(printf '%s' "$tags" | jq -r '.[]')
+          package=$(jq -ncS --argjson manifests "$manifests" '{manifests:$manifests}')
+          current_main=$(printf '%s' "$refs" | jq -r \
+            '[.[] | select(.ref == "refs/heads/main")][0].sha')
+          checks=$(gh api --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/commits/$current_main/check-runs?per_page=100" | jq -cS \
+            '[.[].check_runs[] | {id,name,head_sha,status,conclusion,app_id:.app.id}] | sort_by(.id)')
+          states=$(printf '%s' "$body" | jq -cS '[.workflows[] | {workflow_id,original_state}]')
+          rulesets=$(gh api --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/rulesets?per_page=100")
+          main_id=
+          for id in $(printf '%s' "$rulesets" | jq -r \
+            '.[][] | select(.target == "branch" and .enforcement == "active") | .id'); do
+            value=$(gh api "repos/$GITHUB_REPOSITORY/rulesets/$id")
+            if printf '%s' "$value" | jq -e \
+              '.conditions.ref_name.include == ["refs/heads/main"]' >/dev/null; then
+              [ -z "$main_id" ]
+              main_id=$id
+              main_ruleset=$value
+            fi
+          done
+          [ -n "$main_id" ]
+          current_ruleset="sha256:$(printf '%s' "$main_ruleset" | jq -Sc . | sha256sum | awk '{print $1}')"
+          [ "$(printf '%s' "$body" | jq -r .ruleset_digest)" = "$current_ruleset" ]
+          if [ -z "$INPUT_SEAL_ID$INPUT_SEAL_HASH" ]; then
+            initial_surface=$(jq -ncS --argjson refs "$refs" --argjson prs "$prs" \
+              --argjson releases "$releases" --argjson package "$package" \
+              '{refs:$refs,pull_requests:$prs,releases:$releases,package:$package}')
+            actual_initial="sha256:$(printf '%s' "$initial_surface" | sha256sum | awk '{print $1}')"
+            [ "$(printf '%s' "$body" | jq -r .initial_surface_hash)" = "$actual_initial" ]
+          fi
+          if [ -n "$INPUT_SEAL_ID$INPUT_SEAL_HASH" ]; then
+            case "$INPUT_SEAL_ID" in *[!0-9]*|'') exit 1 ;; esac
+            [ "${#INPUT_SEAL_HASH}" -eq 64 ]
+            prior=$(gh api "repos/$GITHUB_REPOSITORY/issues/comments/$INPUT_SEAL_ID")
+            prior_body=$(printf '%s' "$prior" | jq -r .body)
+            [ "$(printf '%s' "$prior_body" | sha256sum | awk '{print $1}')" = "$INPUT_SEAL_HASH" ]
+            [ "$(printf '%s' "$prior_body" | jq -r .nonce)" = "$NONCE" ]
+            [ "$(printf '%s' "$prior_body" | jq -r .body_hash)" = "sha256:$BODY_HASH" ]
+            [ "$(printf '%s' "$prior_body" | jq -r .ruleset_digest)" = "$current_ruleset" ]
+            baseline=$(printf '%s' "$prior_body" | jq -cS .baseline)
+            current=$(jq -ncS --argjson refs "$refs" --argjson prs "$prs" \
+              --argjson releases "$releases" --argjson package "$package" \
+              --argjson checks "$checks" \
+              '{refs:$refs,pull_requests:$prs,releases:$releases,
+                package:$package,check_runs:$checks}')
+            printf '%s' "$current" | jq -e --argjson base "$baseline" --arg nonce "$NONCE" '
+              .releases == $base.releases and .package == $base.package and
+              (($base.pull_requests - .pull_requests) | length) == 0 and
+              ((.pull_requests - $base.pull_requests) |
+                all(.[]; .head == ("automation/release-repair-" + $nonce) or
+                  .head == ("automation/release-repair-guard-" + $nonce) or
+                  .head == ("automation/release-repair-canary-" + $nonce + "-primary") or
+                  .head == ("automation/release-repair-canary-" + $nonce + "-guard"))) and
+              ([(.refs | map({key:.ref,value:.sha}) | from_entries) as $now |
+                 ($base.refs | map({key:.ref,value:.sha}) | from_entries) as $before |
+                 (($now | keys) + ($before | keys) | unique)[] as $ref |
+                 select($now[$ref] != $before[$ref]) | $ref] |
+                all(.[]; . == "refs/heads/main" or
+                  . == ("refs/heads/automation/release-repair-" + $nonce) or
+                  . == ("refs/heads/automation/release-repair-guard-" + $nonce) or
+                  . == ("refs/heads/automation/release-repair-canary-" + $nonce + "-primary") or
+                  . == ("refs/heads/automation/release-repair-canary-" + $nonce + "-guard"))) and
+              ((.refs | map(select(.ref == "refs/heads/main"))[0].sha) as $current_main |
+                ($base.refs | map(select(.ref == "refs/heads/main"))[0].sha) as $base_main |
+                (($current_main == $base_main and .check_runs == $base.check_runs) or
+                ($current_main != $base_main and
+                  (.check_runs | length) == 2 and
+                  ([.check_runs[].name] | sort) == ["runtime-image","verify"] and
+                  all(.check_runs[]; .head_sha == $current_main and
+                    .status == "completed" and .conclusion == "success" and
+                    .app_id == 15368))))
+            ' >/dev/null
+            printf 'baseline_b64=%s\n' "$(printf '%s' "$baseline" | base64 | tr -d '\n')" \
+              >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          baseline=$(jq -ncS --argjson refs "$refs" --argjson prs "$prs" \
+            --argjson releases "$releases" --argjson package "$package" \
+            --argjson checks "$checks" --argjson states "$states" \
+            '{refs:$refs,pull_requests:$prs,releases:$releases,package:$package,
+              check_runs:$checks,workflow_states:$states}')
+          printf 'baseline_b64=%s\n' "$(printf '%s' "$baseline" | base64 | tr -d '\n')" \
+            >>"$GITHUB_OUTPUT"
+
+  seal:
+    name: seal
+    if: needs.authorize.outputs.mode != 'canary'
+    needs: [authorize, checkpoint, quiesce]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+    outputs:
+      seal_hash: ${{ steps.seal.outputs.seal_hash }}
+      seal_id: ${{ steps.seal.outputs.seal_id }}
+    steps:
+      - name: Create or read back one authoritative hash-chained seal
+        id: seal
+        env:
+          BASELINE_B64: ${{ needs.quiesce.outputs.baseline_b64 }}
+          BODY_HASH: ${{ needs.checkpoint.outputs.body_hash }}
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ needs.checkpoint.outputs.issue_number }}
+          MAIN_REVISION: ${{ needs.checkpoint.outputs.main_revision }}
+          NONCE: ${{ needs.authorize.outputs.nonce }}
+        run: |
+          set -euo pipefail
+          issue=$(gh api "repos/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER")
+          body=$(printf '%s' "$issue" | jq -r .body)
+          [ "$(printf '%s' "$body" | sha256sum | awk '{print $1}')" = "$BODY_HASH" ]
+          baseline=$(printf '%s' "$BASELINE_B64" | base64 --decode)
+          baseline_hash="sha256:$(printf '%s' "$baseline" | sha256sum | awk '{print $1}')"
+          seal=$(jq -ncS --arg phase quiesced --argjson issue "$ISSUE_NUMBER" \
+            --arg nonce "$NONCE" --arg body_hash "sha256:$BODY_HASH" \
+            --argjson baseline "$baseline" --arg baseline_hash "$baseline_hash" \
+            --arg main "$MAIN_REVISION" --arg ruleset "$(printf '%s' "$body" | jq -r .ruleset_digest)" \
+            '{phase:$phase,issue_number:$issue,nonce:$nonce,body_hash:$body_hash,
+              baseline:$baseline,baseline_hash:$baseline_hash,
+              main_revision:$main,ruleset_digest:$ruleset}')
+          comments=$(gh api --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER/comments?per_page=100")
+          matches=$(printf '%s' "$comments" | jq -c --arg nonce "$NONCE" '
+            [.[][] | select(.body | startswith("{\"baseline\":") or contains("\"phase\":\"quiesced\"")) |
+              select((.body | fromjson).nonce == $nonce)]')
+          count=$(printf '%s' "$matches" | jq 'length')
+          if [ "$count" -eq 0 ]; then
+            created=$(jq -n --arg body "$seal" '{body:$body}' | gh api --method POST \
+              "repos/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER/comments" --input -)
+            seal_id=$(printf '%s' "$created" | jq -r .id)
+          elif [ "$count" -eq 1 ]; then
+            seal_id=$(printf '%s' "$matches" | jq -r '.[0].id')
+          else
+            echo 'duplicate authoritative seals' >&2
+            exit 1
+          fi
+          comment=$(gh api "repos/$GITHUB_REPOSITORY/issues/comments/$seal_id")
+          [ "$(printf '%s' "$comment" | jq -r .user.login)" = 'github-actions[bot]' ]
+          [ "$(printf '%s' "$comment" | jq -r .created_at)" = "$(printf '%s' "$comment" | jq -r .updated_at)" ]
+          [ "$(printf '%s' "$comment" | jq -r .body)" = "$seal" ]
+          seal_hash=$(printf '%s' "$seal" | sha256sum | awk '{print $1}')
+          {
+            printf 'seal_hash=%s\n' "$seal_hash"
+            printf 'seal_id=%s\n' "$seal_id"
+          } >>"$GITHUB_OUTPUT"
+
+  validate-source:
+    name: validate-source
+    if: needs.authorize.outputs.mode != 'canary'
+    needs: [authorize, checkpoint, seal]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: read
+    outputs:
+      files_json: ${{ steps.validate.outputs.files_json }}
+    steps:
+      - name: Validate state-bound source and exact edit allowlist inline
+        id: validate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MAIN_REVISION: ${{ needs.checkpoint.outputs.main_revision }}
+          MODE: ${{ needs.checkpoint.outputs.transaction_mode }}
+          SOURCE_REVISION: ${{ needs.checkpoint.outputs.source_revision }}
+          TARGET_REVISION: ${{ needs.checkpoint.outputs.target_revision }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/git/commits/$TARGET_REVISION" >/dev/null
+          gh api "repos/$GITHUB_REPOSITORY/git/commits/$SOURCE_REVISION" >/dev/null
+          read_stable_target_count() {
+            stable_tags=$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/v")
+            # shellcheck disable=SC2016
+            stable_target_count=$(printf '%s' "$stable_tags" | jq --arg target "$TARGET_REVISION" '[
+              .[] | select(
+                (.ref | test("^refs/tags/v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$")) and
+                .object.type == "commit" and .object.sha == $target
+              )
+            ] | length')
+          }
+          case "$MODE" in
+            replacement)
+              [ "$TARGET_REVISION" = "$MAIN_REVISION" ]
+              read_stable_target_count
+              [ "$stable_target_count" -eq 0 ]
+              files=$(gh api "repos/$GITHUB_REPOSITORY/compare/$MAIN_REVISION...$SOURCE_REVISION" | jq -cS \
+                '[.files[].filename] | unique | sort')
+              ;;
+            control)
+              read_stable_target_count
+              [ "$stable_target_count" -eq 1 ]
+              files=$(gh api "repos/$GITHUB_REPOSITORY/compare/$MAIN_REVISION...$SOURCE_REVISION" | jq -cS \
+                '[.files[].filename] | unique | sort')
+              printf '%s' "$files" | jq -e 'all(.[];
+                . == ".github/workflows/release.yml" or
+                . == ".github/workflows/create-develop-to-main-pr.yml" or
+                . == ".github/workflows/ci.yml" or
+                . == ".github/workflows/runtime-version-auto-merge.yml" or
+                . == "scripts/runtime_versions.py" or
+                . == "scripts/tests/test_runtime_versions.py" or
+                startswith("scripts/tests/fixtures/") or . == "Makefile")' >/dev/null
+              ;;
+            guard-repair)
+              files=$(gh api "repos/$GITHUB_REPOSITORY/compare/$MAIN_REVISION...$SOURCE_REVISION" | jq -cS \
+                '[.files[].filename] | unique | sort')
+              [ "$files" = '[".github/workflows/release-repair-guard.yml"]' ]
+              ;;
+            *) exit 1 ;;
+          esac
+          [ "$(printf '%s' "$files" | jq 'length')" -gt 0 ]
+          if [ "$MODE" != guard-repair ]; then
+            printf '%s' "$files" | jq -e '
+              index(".github/workflows/release-repair.yml") == null and
+              index(".github/workflows/release-repair-guard.yml") == null' >/dev/null
+          fi
+          printf 'files_json=%s\n' "$files" >>"$GITHUB_OUTPUT"
+
+  propose:
+    name: propose
+    if: needs.authorize.outputs.mode != 'canary'
+    needs: [authorize, checkpoint, seal, validate-source]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      head_sha: ${{ steps.propose.outputs.head_sha }}
+      pull_request_number: ${{ steps.propose.outputs.pull_request_number }}
+    steps:
+      - name: Materialize the validated source tree without executing it
+        id: propose
+        env:
+          FILES_JSON: ${{ needs.validate-source.outputs.files_json }}
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ needs.checkpoint.outputs.issue_number }}
+          MAIN_REVISION: ${{ needs.checkpoint.outputs.main_revision }}
+          MODE: ${{ needs.checkpoint.outputs.transaction_mode }}
+          NONCE: ${{ needs.authorize.outputs.nonce }}
+          SOURCE_REVISION: ${{ needs.checkpoint.outputs.source_revision }}
+          TARGET_REVISION: ${{ needs.checkpoint.outputs.target_revision }}
+        run: |
+          set -euo pipefail
+          [ "$(gh api "repos/$GITHUB_REPOSITORY/actions/variables/RELEASE_AUTOMATION_ENABLED" --jq .value)" = false ]
+          branch="automation/release-repair-$NONCE"
+          expected_title="repair: release $MODE $NONCE"
+          expected_body="release-repair issue=$ISSUE_NUMBER nonce=$NONCE mode=$MODE target=$TARGET_REVISION source=$SOURCE_REVISION"
+          expected_message="repair: $MODE $NONCE"
+          base=$(gh api "repos/$GITHUB_REPOSITORY/git/commits/$MAIN_REVISION")
+          base_tree=$(printf '%s' "$base" | jq -r .tree.sha)
+          source=$(gh api "repos/$GITHUB_REPOSITORY/git/commits/$SOURCE_REVISION")
+          source_tree=$(printf '%s' "$source" | jq -r .tree.sha)
+          if [ "$MODE" = replacement ]; then
+            new_tree=$source_tree
+          else
+            recursive=$(gh api "repos/$GITHUB_REPOSITORY/git/trees/$source_tree?recursive=1")
+            entries=$(printf '%s' "$FILES_JSON" | jq -c \
+              --argjson tree "$(printf '%s' "$recursive" | jq -c .tree)" '
+              map(. as $path | ($tree | map(select(.path == $path))[0]) as $entry |
+                if $entry == null then {path:$path,mode:"100644",type:"blob",sha:null}
+                else {path:$entry.path,mode:$entry.mode,type:$entry.type,sha:$entry.sha} end)')
+            tree_payload=$(jq -n --arg base_tree "$base_tree" --argjson tree "$entries" \
+              '{base_tree:$base_tree,tree:$tree}')
+            new_tree=$(printf '%s' "$tree_payload" | gh api --method POST \
+              "repos/$GITHUB_REPOSITORY/git/trees" --input - --jq .sha)
+          fi
+          validate_repair_commit() {
+            candidate=$(gh api "repos/$GITHUB_REPOSITORY/git/commits/$1")
+            printf '%s' "$candidate" | jq -e --arg base "$MAIN_REVISION" \
+              --arg message "$expected_message" --arg tree "$new_tree" '
+              .message == $message and .tree.sha == $tree and
+              (.parents | length) == 1 and .parents[0].sha == $base' >/dev/null
+          }
+          existing_ref=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$branch" \
+            --jq .object.sha 2>/dev/null || true)
+          # Recognize a merged repair PR even after branch deletion.
+          prs=$(gh pr list --state all --head "$branch" --json number --limit 10)
+          [ "$(printf '%s' "$prs" | jq 'length')" -le 1 ]
+          if [ "$(printf '%s' "$prs" | jq 'length')" -eq 1 ]; then
+            number=$(printf '%s' "$prs" | jq -r '.[0].number')
+            pr=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$number")
+            head=$(printf '%s' "$pr" | jq -r .head.sha)
+            validate_repair_commit "$head"
+            printf '%s' "$pr" | jq -e --arg branch "$branch" \
+              --arg body "$expected_body" --arg title "$expected_title" \
+              --arg repository "$GITHUB_REPOSITORY" '
+              .base.ref == "main" and .head.ref == $branch and
+              .base.repo.full_name == $repository and
+              .head.repo.full_name == $repository and
+              .user.login == "github-actions[bot]" and
+              .title == $title and .body == $body' >/dev/null
+            if [ "$(printf '%s' "$pr" | jq -r .merged)" = true ]; then
+              live_main=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)
+              [ "$(printf '%s' "$pr" | jq -r .merge_commit_sha)" = "$live_main" ]
+              merge=$(gh api "repos/$GITHUB_REPOSITORY/git/commits/$live_main")
+              printf '%s' "$merge" | jq -e --arg base "$MAIN_REVISION" \
+                --arg tree "$new_tree" '
+                .tree.sha == $tree and (.parents | length) == 1 and
+                .parents[0].sha == $base' >/dev/null
+              {
+                printf 'head_sha=%s\n' "$head"
+                printf 'pull_request_number=%s\n' "$number"
+              } >>"$GITHUB_OUTPUT"
+              exit 0
+            fi
+            [ "$(printf '%s' "$pr" | jq -r .state)" = open ]
+            [ "$(printf '%s' "$pr" | jq -r .base.sha)" = "$MAIN_REVISION" ]
+            [ -n "$existing_ref" ]
+            [ "$head" = "$existing_ref" ]
+            {
+              printf 'head_sha=%s\n' "$head"
+              printf 'pull_request_number=%s\n' "$number"
+            } >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          live_main=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)
+          [ "$live_main" = "$MAIN_REVISION" ]
+          if [ -n "$existing_ref" ]; then
+            head=$existing_ref
+            validate_repair_commit "$head"
+          else
+            commit=$(jq -n --arg message "$expected_message" --arg tree "$new_tree" \
+              --arg parent "$MAIN_REVISION" '{message:$message,tree:$tree,parents:[$parent]}' \
+              | gh api --method POST "repos/$GITHUB_REPOSITORY/git/commits" --input -)
+            head=$(printf '%s' "$commit" | jq -r .sha)
+            validate_repair_commit "$head"
+            gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+              -f ref="refs/heads/$branch" -f sha="$head" >/dev/null
+          fi
+          url=$(gh pr create --base main --head "$branch" \
+            --title "$expected_title" --body "$expected_body")
+          number=${url##*/}
+          pr=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$number")
+          printf '%s' "$pr" | jq -e --arg head "$head" --arg branch "$branch" \
+            --arg base "$MAIN_REVISION" --arg body "$expected_body" \
+            --arg title "$expected_title" --arg repository "$GITHUB_REPOSITORY" '
+            .state == "open" and .base.ref == "main" and .head.ref == $branch and
+            .base.sha == $base and .head.sha == $head and
+            .base.repo.full_name == $repository and
+            .head.repo.full_name == $repository and
+            .user.login == "github-actions[bot]" and
+            .title == $title and .body == $body' >/dev/null
+          {
+            printf 'head_sha=%s\n' "$head"
+            printf 'pull_request_number=%s\n' "$number"
+          } >>"$GITHUB_OUTPUT"
+
+  verify-source:
+    name: verify-source
+    if: needs.authorize.outputs.mode != 'canary'
+    needs: [authorize, checkpoint, propose]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the immutable repair head with a read-only token
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.propose.outputs.head_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up Go without a shared cache
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: src/go.mod
+          cache: false
+      - name: Set up Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v4.2.2
+      - name: Validate workflows with the unchanged trusted policy owner
+        env:
+          MAIN_REVISION: ${{ needs.checkpoint.outputs.main_revision }}
+        run: |
+          set -euo pipefail
+          git show "$MAIN_REVISION:scripts/runtime_versions.py" \
+            >"$RUNNER_TEMP/trusted-runtime-versions.py"
+          python3 "$RUNNER_TEMP/trusted-runtime-versions.py" \
+            --root "$GITHUB_WORKSPACE" validate-actions \
+            "$GITHUB_WORKSPACE/.github/workflows"
+      - name: Verify the proposed source without write authority
+        run: make verify
+
+  runtime-image-source:
+    name: runtime-image-source-${{ matrix.architecture }}
+    if: needs.authorize.outputs.mode != 'canary'
+    needs: [authorize, propose]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: amd64
+            runner: ubuntu-24.04
+            platform: linux/amd64
+          - architecture: arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the immutable repair head with a read-only token
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.propose.outputs.head_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Reclaim runner disk for the cold native build
+        run: |
+          set -euo pipefail
+          sudo rm -rf -- /usr/local/lib/android /usr/share/dotnet /opt/ghc
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - name: Resolve source-owned non-secret build arguments read-only
+        id: build-args
+        env:
+          HEAD_SHA: ${{ needs.propose.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          python3 scripts/runtime_versions.py build-args \
+            --version ci --format json --revision "$HEAD_SHA" \
+            | jq -r 'to_entries[] | "\(.key)=\(.value)"' >"$RUNNER_TEMP/build-args"
+          {
+            echo 'value<<EOF'
+            cat "$RUNNER_TEMP/build-args"
+            echo EOF
+          } >>"$GITHUB_OUTPUT"
+      - name: Build the native runtime platform without pushing
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          push: false
+          build-args: ${{ steps.build-args.outputs.value }}
+          provenance: false
+          sbom: false
+
+  publish-checks:
+    name: publish-checks
+    if: needs.authorize.outputs.mode != 'canary'
+    needs: [authorize, checkpoint, validate-source, propose, verify-source, runtime-image-source]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      checks: write
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Publish exact-head required checks from trusted inline validation
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ needs.propose.outputs.head_sha }}
+          ISSUE_NUMBER: ${{ needs.checkpoint.outputs.issue_number }}
+          MAIN_REVISION: ${{ needs.checkpoint.outputs.main_revision }}
+          MODE: ${{ needs.checkpoint.outputs.transaction_mode }}
+          NONCE: ${{ needs.authorize.outputs.nonce }}
+          PULL_REQUEST_NUMBER: ${{ needs.propose.outputs.pull_request_number }}
+          SOURCE_REVISION: ${{ needs.checkpoint.outputs.source_revision }}
+          TARGET_REVISION: ${{ needs.checkpoint.outputs.target_revision }}
+        run: |
+          set -euo pipefail
+          branch="automation/release-repair-$NONCE"
+          expected_title="repair: release $MODE $NONCE"
+          expected_body="release-repair issue=$ISSUE_NUMBER nonce=$NONCE mode=$MODE target=$TARGET_REVISION source=$SOURCE_REVISION"
+          pr=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PULL_REQUEST_NUMBER")
+          printf '%s' "$pr" | jq -e --arg head "$HEAD_SHA" --arg branch "$branch" \
+            --arg body "$expected_body" \
+            --arg title "$expected_title" --arg repository "$GITHUB_REPOSITORY" '
+            .base.ref == "main" and .head.ref == $branch and .head.sha == $head and
+            .base.repo.full_name == $repository and
+            .head.repo.full_name == $repository and
+            .user.login == "github-actions[bot]" and
+            .title == $title and .body == $body' >/dev/null
+          if [ "$(printf '%s' "$pr" | jq -r .merged)" = true ]; then
+            merged_sha=$(printf '%s' "$pr" | jq -r .merge_commit_sha)
+            merge=$(gh api "repos/$GITHUB_REPOSITORY/git/commits/$merged_sha")
+            printf '%s' "$merge" | jq -e --arg base "$MAIN_REVISION" \
+              '(.parents | length) == 1 and .parents[0].sha == $base' >/dev/null
+            exit 0
+          fi
+          printf '%s' "$pr" | jq -e --arg base "$MAIN_REVISION" \
+            '.state == "open" and .base.sha == $base' >/dev/null
+          for name in verify runtime-image; do
+            jq -n --arg name "$name" --arg head "$HEAD_SHA" \
+              '{name:$name,head_sha:$head,status:"completed",conclusion:"success",
+                output:{title:("Trusted repair " + $name),
+                  summary:"Validated by the unchanged release repair launcher."}}' \
+              | gh api --method POST "repos/$GITHUB_REPOSITORY/check-runs" --input - >/dev/null
+          done
+
+  await-merge:
+    name: await-merge
+    if: needs.authorize.outputs.mode != 'canary'
+    needs: [authorize, checkpoint, propose, publish-checks]
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      merged_sha: ${{ steps.await.outputs.merged_sha }}
+    steps:
+      - name: Wait for jskorlol exact-head approval and protected merge
+        id: await
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ needs.propose.outputs.head_sha }}
+          ISSUE_NUMBER: ${{ needs.checkpoint.outputs.issue_number }}
+          MAIN_REVISION: ${{ needs.checkpoint.outputs.main_revision }}
+          MODE: ${{ needs.checkpoint.outputs.transaction_mode }}
+          NONCE: ${{ needs.authorize.outputs.nonce }}
+          PULL_REQUEST_NUMBER: ${{ needs.propose.outputs.pull_request_number }}
+          SOURCE_REVISION: ${{ needs.checkpoint.outputs.source_revision }}
+          TARGET_REVISION: ${{ needs.checkpoint.outputs.target_revision }}
+        run: |
+          set -euo pipefail
+          branch="automation/release-repair-$NONCE"
+          expected_title="repair: release $MODE $NONCE"
+          expected_body="release-repair issue=$ISSUE_NUMBER nonce=$NONCE mode=$MODE target=$TARGET_REVISION source=$SOURCE_REVISION"
+          for _ in $(seq 1 2100); do
+            pr=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PULL_REQUEST_NUMBER")
+            printf '%s' "$pr" | jq -e --arg head "$HEAD_SHA" --arg branch "$branch" \
+              --arg body "$expected_body" --arg title "$expected_title" \
+              --arg repository "$GITHUB_REPOSITORY" '
+              .base.ref == "main" and .head.ref == $branch and .head.sha == $head and
+              .base.repo.full_name == $repository and
+              .head.repo.full_name == $repository and
+              .user.login == "github-actions[bot]" and
+              .title == $title and .body == $body' >/dev/null
+            if [ "$(printf '%s' "$pr" | jq -r .merged)" = true ]; then
+              printf '%s' "$pr" | jq -e --arg head "$HEAD_SHA" '
+                .head.sha == $head and .merged_by.login == "jskorlol" and
+                (.merge_commit_sha | test("^[0-9a-f]{40}$"))' >/dev/null
+              merged_sha=$(printf '%s' "$pr" | jq -r .merge_commit_sha)
+              merge=$(gh api "repos/$GITHUB_REPOSITORY/git/commits/$merged_sha")
+              printf '%s' "$merge" | jq -e --arg base "$MAIN_REVISION" \
+                '(.parents | length) == 1 and .parents[0].sha == $base' >/dev/null
+              reviews=$(gh api --paginate --slurp \
+                "repos/$GITHUB_REPOSITORY/pulls/$PULL_REQUEST_NUMBER/reviews?per_page=100")
+              printf '%s' "$reviews" | jq -e --arg head "$HEAD_SHA" '
+                any(.[][]; .user.login == "jskorlol" and
+                  .state == "APPROVED" and .commit_id == $head)' >/dev/null
+              printf 'merged_sha=%s\n' "$merged_sha" >>"$GITHUB_OUTPUT"
+              exit 0
+            fi
+            printf '%s' "$pr" | jq -e --arg base "$MAIN_REVISION" \
+              '.state == "open" and .base.sha == $base' >/dev/null
+            sleep 10
+          done
+          echo 'repair PR approval/merge deadline expired' >&2
+          exit 1
+
+  restore:
+    name: restore
+    if: needs.authorize.outputs.mode != 'canary'
+    needs: [authorize, checkpoint, seal, await-merge]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      actions: write
+      contents: read
+      issues: read
+    steps:
+      - name: Prove both launchers and restore the exact checkpoint mapping
+        env:
+          BODY_HASH: ${{ needs.checkpoint.outputs.body_hash }}
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ needs.checkpoint.outputs.issue_number }}
+          MERGED_SHA: ${{ needs.await-merge.outputs.merged_sha }}
+          NONCE: ${{ needs.authorize.outputs.nonce }}
+          SEAL_HASH: ${{ needs.seal.outputs.seal_hash }}
+          SEAL_ID: ${{ needs.seal.outputs.seal_id }}
+          TRANSACTION_MODE: ${{ needs.checkpoint.outputs.transaction_mode }}
+        run: |
+          set -euo pipefail
+          [ "$(gh api "repos/$GITHUB_REPOSITORY/actions/variables/RELEASE_AUTOMATION_ENABLED" --jq .value)" = false ]
+          issue=$(gh api "repos/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER")
+          [ "$(printf '%s' "$issue" | jq -r .state)" = open ]
+          [ "$(printf '%s' "$issue" | jq -r .user.login)" = 'github-actions[bot]' ]
+          [ "$(printf '%s' "$issue" | jq -r .title)" = "Release repair checkpoint $NONCE" ]
+          printf '%s' "$issue" | jq -e \
+            '[.labels[].name] | sort == ["release-repair-checkpoint"]' >/dev/null
+          body=$(printf '%s' "$issue" | jq -r .body)
+          [ "$(printf '%s' "$body" | sha256sum | awk '{print $1}')" = "$BODY_HASH" ]
+          seal=$(gh api "repos/$GITHUB_REPOSITORY/issues/comments/$SEAL_ID")
+          [ "$(printf '%s' "$seal" | jq -r .user.login)" = 'github-actions[bot]' ]
+          [ "$(printf '%s' "$seal" | jq -r .created_at)" = "$(printf '%s' "$seal" | jq -r .updated_at)" ]
+          seal_body=$(printf '%s' "$seal" | jq -r .body)
+          [ "$(printf '%s' "$seal_body" | sha256sum | awk '{print $1}')" = "$SEAL_HASH" ]
+          [ "$(printf '%s' "$seal_body" | jq -r .issue_number)" = "$ISSUE_NUMBER" ]
+          [ "$(printf '%s' "$seal_body" | jq -r .nonce)" = "$NONCE" ]
+          [ "$(printf '%s' "$seal_body" | jq -r .body_hash)" = "sha256:$BODY_HASH" ]
+          [ "$(printf '%s' "$seal_body" | jq -r .ruleset_digest)" = \
+            "$(printf '%s' "$body" | jq -r .ruleset_digest)" ]
+          baseline=$(printf '%s' "$seal_body" | jq -cS .baseline)
+          [ "$(printf '%s' "$seal_body" | jq -r .baseline_hash)" = \
+            "sha256:$(printf '%s' "$baseline" | sha256sum | awk '{print $1}')" ]
+          live_main=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)
+          [ "$live_main" = "$MERGED_SHA" ]
+          validate_sealed_surface() {
+            phase=$1
+            [ "$(gh api "repos/$GITHUB_REPOSITORY/actions/variables/RELEASE_AUTOMATION_ENABLED" --jq .value)" = false ]
+            refs=$(gh api --paginate --slurp \
+              "repos/$GITHUB_REPOSITORY/git/matching-refs/?per_page=100" | jq -cS \
+              '[.[][] | {ref:.ref,sha:.object.sha}] | sort_by(.ref)')
+            prs=$(gh api --paginate --slurp \
+              "repos/$GITHUB_REPOSITORY/pulls?state=open&per_page=100" | jq -cS \
+              '[.[][] | {number:.number,base:.base.ref,head:.head.ref,sha:.head.sha}] | sort_by(.number)')
+            releases=$(gh api --paginate --slurp \
+              "repos/$GITHUB_REPOSITORY/releases?per_page=100" | jq -cS \
+              '[.[][] | {id:.id,tag_name:.tag_name,target:.target_commitish,draft:.draft,prerelease:.prerelease}] | sort_by(.id)')
+            registry_token=$(curl -fsSL \
+              'https://ghcr.io/token?service=ghcr.io&scope=repository%3Akorioinc%2Fmultica-runtime-controller%3Apull' \
+              | jq -er .token)
+            tags=$(curl -fsSL -H "Authorization: Bearer $registry_token" \
+              'https://ghcr.io/v2/korioinc/multica-runtime-controller/tags/list?n=10000' \
+              | jq -cS '(.tags // []) | unique | sort')
+            manifests='[]'
+            while IFS= read -r tag; do
+              headers=$(curl -fsSI -H "Authorization: Bearer $registry_token" \
+                -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json' \
+                "https://ghcr.io/v2/korioinc/multica-runtime-controller/manifests/$tag")
+              digest=$(printf '%s' "$headers" | tr -d '\r' \
+                | awk 'tolower($1) == "docker-content-digest:" {print $2; exit}')
+              case "$digest" in sha256:[0-9a-f][0-9a-f]*) ;; *) exit 1 ;; esac
+              [ "${#digest}" -eq 71 ]
+              manifests=$(printf '%s' "$manifests" | jq -cS \
+                --arg tag "$tag" --arg digest "$digest" \
+                '. + [{tag:$tag,digest:$digest}] | sort_by(.tag)')
+            done < <(printf '%s' "$tags" | jq -r '.[]')
+            package=$(jq -ncS --argjson manifests "$manifests" '{manifests:$manifests}')
+            current_main=$(printf '%s' "$refs" | jq -r \
+              '[.[] | select(.ref == "refs/heads/main")][0].sha')
+            [ "$current_main" = "$MERGED_SHA" ]
+            checks=$(gh api --paginate --slurp \
+              "repos/$GITHUB_REPOSITORY/commits/$current_main/check-runs?per_page=100" | jq -cS \
+              '[.[].check_runs[] | {id,name,head_sha,status,conclusion,app_id:.app.id}] | sort_by(.id)')
+            rulesets=$(gh api --paginate --slurp \
+              "repos/$GITHUB_REPOSITORY/rulesets?per_page=100")
+            main_id=
+            for id in $(printf '%s' "$rulesets" | jq -r \
+              '.[][] | select(.target == "branch" and .enforcement == "active") | .id'); do
+              value=$(gh api "repos/$GITHUB_REPOSITORY/rulesets/$id")
+              if printf '%s' "$value" | jq -e \
+                '.conditions.ref_name.include == ["refs/heads/main"]' >/dev/null; then
+                [ -z "$main_id" ]
+                main_id=$id
+                main_ruleset=$value
+              fi
+            done
+            [ -n "$main_id" ]
+            current_ruleset="sha256:$(printf '%s' "$main_ruleset" | jq -Sc . | sha256sum | awk '{print $1}')"
+            [ "$(printf '%s' "$body" | jq -r .ruleset_digest)" = "$current_ruleset" ]
+            current=$(jq -ncS --argjson refs "$refs" --argjson prs "$prs" \
+              --argjson releases "$releases" --argjson package "$package" \
+              --argjson checks "$checks" \
+              '{refs:$refs,pull_requests:$prs,releases:$releases,
+                package:$package,check_runs:$checks}')
+            printf '%s' "$current" | jq -e --argjson base "$baseline" --arg nonce "$NONCE" '
+              .releases == $base.releases and .package == $base.package and
+              (($base.pull_requests - .pull_requests) | length) == 0 and
+              ((.pull_requests - $base.pull_requests) |
+                all(.[]; .head == ("automation/release-repair-" + $nonce) or
+                  .head == ("automation/release-repair-guard-" + $nonce) or
+                  .head == ("automation/release-repair-canary-" + $nonce + "-primary") or
+                  .head == ("automation/release-repair-canary-" + $nonce + "-guard"))) and
+              ([(.refs | map({key:.ref,value:.sha}) | from_entries) as $now |
+                 ($base.refs | map({key:.ref,value:.sha}) | from_entries) as $before |
+                 (($now | keys) + ($before | keys) | unique)[] as $ref |
+                 select($now[$ref] != $before[$ref]) | $ref] |
+                all(.[]; . == "refs/heads/main" or
+                  . == ("refs/heads/automation/release-repair-" + $nonce) or
+                  . == ("refs/heads/automation/release-repair-guard-" + $nonce) or
+                  . == ("refs/heads/automation/release-repair-canary-" + $nonce + "-primary") or
+                  . == ("refs/heads/automation/release-repair-canary-" + $nonce + "-guard"))) and
+              ((.refs | map(select(.ref == "refs/heads/main"))[0].sha) as $current_main |
+                ($base.refs | map(select(.ref == "refs/heads/main"))[0].sha) as $base_main |
+                (($current_main == $base_main and .check_runs == $base.check_runs) or
+                ($current_main != $base_main and
+                  (.check_runs | length) == 2 and
+                  ([.check_runs[].name] | sort) == ["runtime-image","verify"] and
+                  all(.check_runs[]; .head_sha == $current_main and
+                    .status == "completed" and .conclusion == "success" and
+                    .app_id == 15368))))
+            ' >/dev/null
+            live_workflows=$(gh api --paginate --slurp \
+              "repos/$GITHUB_REPOSITORY/actions/workflows?per_page=100" | jq -cS '
+                [.[].workflows[] | {workflow_id:.id,path:.path,current_state:.state}] |
+                sort_by(.workflow_id)')
+            expected_inventory=$(printf '%s' "$body" | jq -cS \
+              '[.workflows[] | {workflow_id,path}] | sort_by(.workflow_id)')
+            current_inventory=$(printf '%s' "$live_workflows" | jq -cS \
+              '[.[] | {workflow_id,path}] | sort_by(.workflow_id)')
+            [ "$current_inventory" = "$expected_inventory" ]
+            case "$TRANSACTION_MODE" in
+              guard-repair) staged_path=.github/workflows/release-repair-guard.yml ;;
+              *) staged_path= ;;
+            esac
+            printf '%s' "$live_workflows" | jq -e --argjson checkpoint "$body" \
+              --arg staged_path "$staged_path" '
+              all(.[]; . as $current |
+                ($checkpoint.workflows |
+                  map(select(.workflow_id == $current.workflow_id))[0]) as $original |
+                if ($checkpoint.quiesced_workflow_ids | index($current.workflow_id)) != null
+                then ($current.current_state == $original.original_state or
+                      $current.current_state == "disabled_manually" or
+                      ($current.path == $staged_path and $current.current_state == "active"))
+                else $current.current_state == $original.original_state end)' >/dev/null
+            printf 'validated sealed surface at %s\n' "$phase"
+          }
+          validate_sealed_surface pre-restore
+          if [ "$TRANSACTION_MODE" = guard-repair ]; then
+            guard_id=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/release-repair-guard.yml" --jq .id)
+            gh api --method PUT "repos/$GITHUB_REPOSITORY/actions/workflows/$guard_id/enable" >/dev/null
+            [ "$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$guard_id" --jq .state)" = active ]
+          fi
+          dispatch_canary() {
+            workflow=$1
+            suffix=$2
+            canary_nonce="$NONCE-$suffix"
+            jq -n --arg main "$live_main" --arg nonce "$canary_nonce" \
+              --arg issue "$ISSUE_NUMBER" --arg body_hash "$BODY_HASH" \
+              --arg seal_id "$SEAL_ID" --arg seal_hash "$SEAL_HASH" \
+              '{ref:"main",inputs:{mode:"canary",main_revision:$main,nonce:$nonce,
+                target_revision:"",source_revision:"",issue_number:$issue,
+                body_hash:$body_hash,seal_id:$seal_id,seal_hash:$seal_hash}}' \
+              | gh api --method POST \
+                  "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow/dispatches" --input -
+            run_id=
+            for _ in $(seq 1 60); do
+              runs=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow/runs?event=workflow_dispatch&per_page=20")
+              run_id=$(printf '%s' "$runs" | jq -r --arg nonce "$canary_nonce" \
+                '[.workflow_runs[] | select(.display_title | contains($nonce))][0].id // empty')
+              [ -z "$run_id" ] || break
+              sleep 5
+            done
+            [ -n "$run_id" ]
+            for _ in $(seq 1 720); do
+              run=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id")
+              status=$(printf '%s' "$run" | jq -r .status)
+              if [ "$status" = completed ]; then
+                [ "$(printf '%s' "$run" | jq -r .conclusion)" = success ]
+                branch="automation/release-repair-canary-$canary_nonce"
+                if gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$branch" \
+                  --silent >/dev/null 2>&1; then
+                  echo 'canary cleanup left a branch' >&2
+                  return 1
+                fi
+                if [ "$(gh pr list --state open --head "$branch" --json number --limit 10 \
+                  | jq 'length')" -ne 0 ]; then
+                  echo 'canary cleanup left an open pull request' >&2
+                  return 1
+                fi
+                return 0
+              fi
+              sleep 5
+            done
+            return 1
+          }
+          dispatch_canary release-repair.yml primary
+          if ! dispatch_canary release-repair-guard.yml guard; then
+            if [ "$TRANSACTION_MODE" = guard-repair ]; then
+              gh api --method PUT "repos/$GITHUB_REPOSITORY/actions/workflows/$guard_id/disable" >/dev/null
+            fi
+            exit 1
+          fi
+          validate_sealed_surface post-canary
+          printf '%s' "$body" | jq -c '.workflows[]' | while IFS= read -r item; do
+            id=$(printf '%s' "$item" | jq -r .workflow_id)
+            state=$(printf '%s' "$item" | jq -r .original_state)
+            case "$state" in
+              active) gh api --method PUT "repos/$GITHUB_REPOSITORY/actions/workflows/$id/enable" >/dev/null ;;
+              disabled_manually) gh api --method PUT "repos/$GITHUB_REPOSITORY/actions/workflows/$id/disable" >/dev/null ;;
+              *) echo "unsupported original workflow state $state" >&2; exit 1 ;;
+            esac
+            [ "$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$id" --jq .state)" = "$state" ]
+          done
+          validate_sealed_surface post-restore
+
+  close-checkpoint:
+    name: close-checkpoint
+    if: needs.authorize.outputs.mode != 'canary'
+    needs: [authorize, checkpoint, seal, restore]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+    steps:
+      - name: Record completion and close the restored checkpoint last
+        env:
+          BODY_HASH: ${{ needs.checkpoint.outputs.body_hash }}
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ needs.checkpoint.outputs.issue_number }}
+          NONCE: ${{ needs.authorize.outputs.nonce }}
+          SEAL_HASH: ${{ needs.seal.outputs.seal_hash }}
+          SEAL_ID: ${{ needs.seal.outputs.seal_id }}
+        run: |
+          set -euo pipefail
+          issue=$(gh api "repos/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER")
+          [ "$(printf '%s' "$issue" | jq -r .user.login)" = 'github-actions[bot]' ]
+          [ "$(printf '%s' "$issue" | jq -r .title)" = "Release repair checkpoint $NONCE" ]
+          body=$(printf '%s' "$issue" | jq -r .body)
+          [ "$(printf '%s' "$body" | sha256sum | awk '{print $1}')" = "$BODY_HASH" ]
+          [ "$(printf '%s' "$body" | jq -r .nonce)" = "$NONCE" ]
+          printf '%s' "$issue" | jq -e \
+            '[.labels[].name] | sort == ["release-repair-checkpoint"]' >/dev/null
+          seal=$(gh api "repos/$GITHUB_REPOSITORY/issues/comments/$SEAL_ID")
+          [ "$(printf '%s' "$seal" | jq -r .user.login)" = 'github-actions[bot]' ]
+          [ "$(printf '%s' "$seal" | jq -r .created_at)" = "$(printf '%s' "$seal" | jq -r .updated_at)" ]
+          seal_body=$(printf '%s' "$seal" | jq -r .body)
+          [ "$(printf '%s' "$seal_body" | sha256sum | awk '{print $1}')" = "$SEAL_HASH" ]
+          [ "$(printf '%s' "$seal_body" | jq -r .issue_number)" = "$ISSUE_NUMBER" ]
+          [ "$(printf '%s' "$seal_body" | jq -r .body_hash)" = "sha256:$BODY_HASH" ]
+          completion="release repair restored nonce=$NONCE"
+          comments=$(gh api --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER/comments?per_page=100")
+          matches=$(printf '%s' "$comments" | jq -c --arg body "$completion" \
+            '[.[][] | select(.body == $body)]')
+          count=$(printf '%s' "$matches" | jq 'length')
+          [ "$count" -le 1 ]
+          if [ "$count" -eq 0 ]; then
+            if ! jq -n --arg body "$completion" '{body:$body}' \
+              | gh api --method POST \
+                  "repos/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER/comments" --input - >/dev/null; then
+              : # Reconcile an unknown API result by exact readback below.
+            fi
+            comments=$(gh api --paginate --slurp \
+              "repos/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER/comments?per_page=100")
+            matches=$(printf '%s' "$comments" | jq -c --arg body "$completion" \
+              '[.[][] | select(.body == $body)]')
+          fi
+          [ "$(printf '%s' "$matches" | jq 'length')" -eq 1 ]
+          printf '%s' "$matches" | jq -e '
+            .[0].user.login == "github-actions[bot]" and
+            .[0].created_at == .[0].updated_at' >/dev/null
+          state=$(printf '%s' "$issue" | jq -r .state)
+          if [ "$state" = open ]; then
+            gh api --method PATCH "repos/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER" \
+              -f state=closed >/dev/null
+          else
+            [ "$state" = closed ]
+          fi
+          [ "$(gh api "repos/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER" --jq .state)" = closed ]
