@@ -771,7 +771,7 @@ def validate_actions(directory: Path) -> dict[str, Any]:
     workflow_jobs: dict[str, dict[str, str]] = {}
 
     def permissions_for(block: str) -> dict[str, str]:
-        marker = re.search(r"(?m)^    permissions:\s*$", block)
+        marker = re.search(r"(?m)^    permissions:(?:\s*\{\})?\s*$", block)
         if marker is None:
             return {}
         permissions: dict[str, str] = {}
@@ -842,7 +842,7 @@ def validate_actions(directory: Path) -> dict[str, Any]:
             block = job_text[job_match.start() : end]
             job_name = job_match.group(1)
             blocks[job_name] = block
-            if not re.search(r"(?m)^    permissions:\s*$", block):
+            if not re.search(r"(?m)^    permissions:(?:\s*\{\})?\s*$", block):
                 raise ResolverError(f"job_permissions_missing file={path} job={job_name}")
         workflow_jobs[path.name] = blocks
         if re.search(r"(?m)^  workflow_dispatch:\s*$", text):
@@ -864,6 +864,8 @@ def validate_actions(directory: Path) -> dict[str, Any]:
         raise ResolverError(f"required_workflow_missing files={','.join(missing)}")
 
     ci = workflow_texts["ci.yml"]
+    if "docker/setup-qemu-action" in ci or "platforms: linux/amd64,linux/arm64" in ci:
+        raise ResolverError("ci_native_platform_build_required")
     ci_on = ci[ci.index("on:") : ci.index("permissions:")]
     if re.search(r"(?m)^\s+paths(?:-ignore)?:", ci_on):
         raise ResolverError("ci_pull_request_paths_filter_forbidden")
@@ -888,6 +890,17 @@ def validate_actions(directory: Path) -> dict[str, Any]:
             "CI automation {0} PR-{1} SHA-{2}",
             "automation-verify",
             "automation-runtime-image",
+            "runtime-image-build:",
+            "architecture: amd64",
+            "runner: ubuntu-24.04",
+            "platform: linux/amd64",
+            "architecture: arm64",
+            "runner: ubuntu-24.04-arm",
+            "platform: linux/arm64",
+            "runs-on: ${{ matrix.runner }}",
+            "platforms: ${{ matrix.platform }}",
+            "scope=runtime-main-${{ matrix.architecture }}",
+            "scope=${{ steps.scope.outputs.cache_scope }}-${{ matrix.architecture }}",
             '"repos/$GITHUB_REPOSITORY/check-runs"',
             "head_sha: $head",
             "ref: ${{ needs.context.outputs.checkout_sha }}",
@@ -900,7 +913,8 @@ def validate_actions(directory: Path) -> dict[str, Any]:
     expected_ci_permissions = {
         "context": {"contents": "read", "pull-requests": "read"},
         "verify": {"contents": "read"},
-        "runtime-image": {"contents": "read"},
+        "runtime-image-build": {"contents": "read"},
+        "runtime-image": {},
         "publish-checks": {
             "checks": "write",
             "contents": "read",
@@ -999,7 +1013,7 @@ def validate_actions(directory: Path) -> dict[str, Any]:
             ".github/workflows/ci.yml",
             "triggering_actor",
             "attempts/$RUN_ATTEMPT/jobs",
-            '["automation-runtime-image","automation-verify","context","publish-checks"]',
+            '["automation-runtime-image","automation-runtime-image-amd64","automation-runtime-image-arm64","automation-verify","context","publish-checks"]',
             "--match-head-commit",
             "compare/develop...$automation_head",
             "--merge --delete-branch",
@@ -1095,6 +1109,11 @@ def validate_actions(directory: Path) -> dict[str, Any]:
                 f"promotion_job_permissions_mismatch job={job_name} "
                 f"expected={expected} actual={actual}"
             )
+        if job_name in {"propose-sync", "propose-patch", "promote"} and \
+                "GH_REPO: ${{ github.repository }}" not in block:
+            raise ResolverError(
+                f"promotion_job_repository_context_missing job={job_name}"
+            )
 
     development = workflow_texts.get("develop-image.yml")
     if development is None:
@@ -1102,6 +1121,8 @@ def validate_actions(directory: Path) -> dict[str, Any]:
     development_verify = workflow_jobs["develop-image.yml"].get("verify")
     if development_verify is None or "if: vars.RELEASE_AUTOMATION_ENABLED == 'true'" not in development_verify:
         raise ResolverError("development_image_activation_gate_missing job=verify")
+    if "docker/setup-qemu-action" in development or "platforms: linux/amd64,linux/arm64" in development:
+        raise ResolverError("development_native_platform_build_required")
     require_fragments(
         "develop-image.yml",
         development,
@@ -1113,34 +1134,52 @@ def validate_actions(directory: Path) -> dict[str, Any]:
             '[ "$EVENT_SHA" = "$live_main" ]',
             '"repos/$GITHUB_REPOSITORY/git/ref/heads/develop"',
             "revision: ${{ steps.context.outputs.revision }}",
-            "develop-${{ needs.verify.outputs.revision }}",
+            '--tag "$IMAGE:develop-$REVISION"',
             "build_args: ${{ steps.build-args.outputs.value }}",
             "build-args: ${{ needs.verify.outputs.build_args }}",
+            "publish-platform:",
+            "architecture: amd64",
+            "runner: ubuntu-24.04",
+            "platform: linux/amd64",
+            "architecture: arm64",
+            "runner: ubuntu-24.04-arm",
+            "platform: linux/arm64",
+            "runs-on: ${{ matrix.runner }}",
+            "platforms: ${{ matrix.platform }}",
+            "BUILDKIT_MULTI_PLATFORM: 1",
+            "oci-artifact=true",
+            "push-by-digest=true",
+            "name-canonical=true",
+            "development-digest-${{ matrix.architecture }}",
+            "actions/upload-artifact@",
+            "actions/download-artifact@",
+            "docker buildx imagetools create",
+            "--metadata-file",
         ),
     )
-    codeowners = directory.parent / "CODEOWNERS"
-    if not codeowners.is_file():
-        raise ResolverError("trusted_automation_codeowners_missing")
-    codeowners_text = codeowners.read_text(encoding="utf-8")
-    for fragment in (
-        "/.github/** @jskorlol",
-        "/.dockerignore @jskorlol",
-        "/Dockerfile @jskorlol",
-        "/Makefile @jskorlol",
-        "/SECURITY.md @jskorlol",
-        "/scripts/** @jskorlol",
-    ):
-        if fragment not in codeowners_text:
+    expected_development_permissions = {
+        "verify": {"contents": "read"},
+        "publish-platform": {"contents": "read", "packages": "write"},
+        "publish": {"packages": "write"},
+    }
+    for job_name, expected in expected_development_permissions.items():
+        block = workflow_jobs["develop-image.yml"].get(job_name)
+        if block is None:
+            raise ResolverError(f"development_job_missing job={job_name}")
+        actual = permissions_for(block)
+        if actual != expected:
             raise ResolverError(
-                f"trusted_automation_codeowner_missing fragment={fragment}"
+                f"development_job_permissions_mismatch job={job_name} "
+                f"expected={expected} actual={actual}"
             )
-
     release = workflow_texts.get("release.yml")
     if release is None:
         raise ResolverError("required_workflow_missing files=release.yml")
     release_plan = workflow_jobs["release.yml"].get("plan")
     if release_plan is None or "if: vars.RELEASE_AUTOMATION_ENABLED == 'true'" not in release_plan:
         raise ResolverError("release_activation_gate_missing job=plan")
+    if "docker/setup-qemu-action" in release or "platforms: linux/amd64,linux/arm64" in release:
+        raise ResolverError("release_native_platform_build_required")
     require_fragments(
         "release.yml",
         release,
@@ -1154,8 +1193,41 @@ def validate_actions(directory: Path) -> dict[str, Any]:
             '.user.login == "jskorlol"',
             '.state == "APPROVED"',
             ".commit_id == $head",
+            "candidate-platform:",
+            "architecture: amd64",
+            "runner: ubuntu-24.04",
+            "platform: linux/amd64",
+            "architecture: arm64",
+            "runner: ubuntu-24.04-arm",
+            "platform: linux/arm64",
+            "runs-on: ${{ matrix.runner }}",
+            "platforms: ${{ matrix.platform }}",
+            "BUILDKIT_MULTI_PLATFORM: 1",
+            "oci-artifact=true",
+            "push-by-digest=true",
+            "name-canonical=true",
+            "release-digest-${{ matrix.architecture }}",
+            "actions/upload-artifact@",
+            "actions/download-artifact@",
+            "docker buildx imagetools create",
+            "--metadata-file",
         ),
     )
+    expected_release_permissions = {
+        "plan": {"contents": "read", "packages": "read", "pull-requests": "read"},
+        "candidate-platform": {"contents": "read", "packages": "write"},
+        "candidate": {"contents": "read", "packages": "write"},
+    }
+    for job_name, expected in expected_release_permissions.items():
+        block = workflow_jobs["release.yml"].get(job_name)
+        if block is None:
+            raise ResolverError(f"release_job_missing job={job_name}")
+        actual = permissions_for(block)
+        if actual != expected:
+            raise ResolverError(
+                f"release_job_permissions_mismatch job={job_name} "
+                f"expected={expected} actual={actual}"
+            )
     if checkout_count == 0:
         raise ResolverError("no_checkout_steps_found")
     return {"workflows": len(workflows), "external_actions": action_count, "checkouts": checkout_count}
