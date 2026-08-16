@@ -2251,6 +2251,10 @@ def validate_actions(directory: Path) -> dict[str, Any]:
         repair = workflow_texts.get(file_name)
         if repair is None:
             raise ResolverError(f"required_workflow_missing files={file_name}")
+        if not re.search(
+            r"(?m)^env:\n  GH_REPO: \$\{\{ github\.repository \}\}\s*$", repair
+        ):
+            raise ResolverError(f"repair_workflow_repository_context_missing file={file_name}")
         for forbidden in (
             "download-artifact@",
             "actions/cache@",
