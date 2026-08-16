@@ -41,37 +41,23 @@ Controller and task Pods use the same immutable image digest. The image contains
 The image never compiles Multica from a local source checkout.
 
 Pinned runtime, extension, cloud CLI, Multica, and provider versions live in
-`build/runtime-versions.env`. The four-hour automation changes only
-`MULTICA_CLI_VERSION`, `CODEX_VERSION`, and `PI_VERSION`. Production release
-identity is allocated from the terminal Git tag, GitHub Release, and GHCR
-inventory after a reviewed `develop`-to-`main` merge; runtime pin maintenance
-does not allocate or increment a stable version. Every current workflow passes
-an explicit `ci`, `develop`, or stable version to the image build. During the
-two-phase workflow cutover only, the root `VERSION` file remains a bounded
-old-`main` compatibility sentinel and an omitted `build-args --version` emits a
-deprecation marker. Phase B removes both together.
+`build/runtime-versions.env`. The four-hour automation checks the official
+Multica release, updates `MULTICA_CLI_VERSION`, and increments the root
+`VERSION` patch in the same pull request. A release version therefore reaches
+`main` only with the CLI update it identifies.
 
 ```bash
 # Build and load the host architecture for local verification.
 make image \
   IMAGE=ghcr.io/korioinc/multica-runtime-controller:dev \
   VERSION=dev
-
-# Break-glass image build. This does not create an official GitHub Release and
-# cannot replace the digest-bound release workflow.
-make image-push \
-  IMAGE=ghcr.io/korioinc/multica-runtime-controller:recovery-<revision> \
-  VERSION=<version> \
-  COMMIT=<full-40-character-revision>
 ```
 
-Official stable publication is owned by the `Release` GitHub Actions workflow.
-It builds amd64 on the native `ubuntu-24.04` runner and arm64 on the native
-`ubuntu-24.04-arm` runner, pushes each result by digest, and assembles the
-immutable multi-platform version manifest only after both builds pass. It then
-creates the same-revision GitHub Release and promotes that digest to `latest`.
-After publication, configure both `controller.image.reference` and
-`runtime.image.reference` with the recorded multi-platform digest.
+After a `develop`-to-`main` merge, the `Release` workflow publishes the
+multi-platform image as both the numeric version and `latest`, then creates the
+matching `v<VERSION>` GitHub Release. Configure both
+`controller.image.reference` and `runtime.image.reference` with the published
+digest.
 
 ## Public Repository and Release Automation
 
@@ -80,120 +66,31 @@ a `LICENSE` file is added by the repository owner. Report vulnerabilities only
 through the private process in [SECURITY.md](SECURITY.md), never in public
 issues, pull requests, logs, or artifacts.
 
-Eight workflows own delivery:
+Three workflows own delivery:
 
-- `CI` is secret-free. Its build and verification jobs are read-only, and its
-  literal `verify` and `runtime-image` jobs are the required checks for every
-  pull request. The runtime image check
-  fans out to native amd64 and arm64 runners and succeeds only after both
-  architecture builds pass. Automation uses a
-  `repository_dispatch` event so GitHub always loads the reviewed default-branch
-  copy against an exact bot PR head; the workflow rejects a moved trusted ref
-  or mismatched pull request. After a successful bot-PR attempt, one isolated
-  dispatch job emits an `automation-merge` repository dispatch carrying
-  that exact run ID, attempt, workflow SHA, PR, and head SHA.
-- `Runtime Version Update` runs at minute 0 every four hours UTC and can also
-  be started with the `runtime-version-update` repository-dispatch event. It
-  reads only the fixed official Multica, Codex, and
-  Pi sources, maintains one `automation/runtime-versions` pull request into
-  `develop` with the run-scoped `GITHUB_TOKEN`, and dispatches exact-head CI.
-  Its write-capable job loads and hash-verifies the resolver from the exact
-  live `main` workflow revision, starts Python in isolated mode, and binds all
-  file and Git operations to the absolute Actions workspace instead of
-  executing control code from `develop`. It never writes to `main`.
-- `Runtime Version Auto Merge` is a separate trusted `repository_dispatch`
-  consumer. It waits for and checks the source CI workflow, run attempt,
-  actors, repository, branch, head,
-  current pull request, files, commit identity, and the exact successful CI
-  jobs without checking out or executing pull request code. A least-privilege
-  merge job performs matched-head squash merges for env-only runtime updates
-  into protected `develop`. A main-ancestry sync PR is the sole merge-commit
-  case. A separate Actions-write job dispatches the trusted default-branch
-  reconciler for the exact merge SHA.
-- `Create develop into main PR` runs only from the reviewed `main` copy: after
-  successful `develop` push CI, after `main` pushes, once per hour, and on an
-  exact-revision workflow dispatch. It derives one of `sync`, `wait-release`,
-  `none`, or `promotion` from live ancestry and release inventory. A sync PR
-  restores `main` ancestry to `develop`; otherwise, only a terminal release may
-  lead to one direct bot-owned `develop`-to-`main` promotion PR and trusted
-  exact-head CI. The promotion requires repository-owner approval; this
-  workflow never merges it.
-- `Development Image` is repository-dispatch-only and always loads the reviewed
-  default-branch workflow with the exact live `develop` SHA as input. A read-only verify job
-  resolves all build arguments before separate native amd64 and arm64
-  package-write jobs check out the source and push per-architecture digests. A
-  final job publishes their verified manifest as `develop` and
-  `develop-<full-commit-SHA>`. Each architecture uses its own
-  `runtime-develop-<architecture>` write cache and may restore the matching
-  trusted `runtime-main-<architecture>` cache. The workflow never changes
-  stable version tags, `latest`, or a GitHub Release.
-- `Release` evaluates every new `main` revision, accepts only an exact
-  bot-authored promotion with an exact-head `jskorlol` approval and merge, and
-  allocates the next patch from the complete stable inventory. Recovery uses
-  the `stable-release-recovery` repository-dispatch event with the exact full
-  revision. Native amd64 and arm64 proofs plus current launcher canaries precede
-  immutable tag reservation; only then may the numeric manifest, GitHub
-  Release, and `latest` be published in that order.
-- `Release Repair` is the primary protected repair launcher. With the rollout
-  gate read back as false, it creates and verifies one canonical checkpoint
-  Issue, disables and drains the recorded workflow set, seals the post-drain
-  surface in one immutable hash-chained Issue comment, and proposes only its
-  mode-specific protected PR. It never edits itself.
-- `Release Repair Guard` is the independent peer launcher. It owns recovery of
-  the primary launcher and shares the same checkpoint lock, seal, nonce, and
-  exact restore mapping. Either peer stages and canaries a repaired launcher;
-  a failed canary re-disables it, and the Issue closes only after both canaries
-  and exact original workflow-state restoration succeed.
+1. `CLI Version Update` runs every four hours or manually. It updates the
+   Multica CLI pin and patch `VERSION`, opens one PR into `develop`, waits for
+   `verify` and `runtime-image`, squash-merges the exact checked head, and asks
+   the next workflow to create the promotion PR.
+2. `Create develop to main PR` provides the two required PR checks and keeps one
+   direct `develop`-to-`main` PR. The promotion remains visible for the
+   maintainer to merge.
+3. `Release` runs for every `main` push. It reads `VERSION`, builds and pushes
+   `linux/amd64` plus `linux/arm64` to GHCR as `<VERSION>` and `latest`, and
+   creates the matching GitHub Release.
 
-The release, development publisher, updater, CI dispatcher, merge, and develop
-promotion dispatcher use only GitHub's ephemeral repository-scoped `GITHUB_TOKEN` with
-job-specific permissions. There is no updater GitHub App, PAT, registry
-credential, repository or Environment secret, or automation Environment. The
-privileged merge workflow has no checkout, artifact download, pull request
-execution, or cache restore. Tokens must never be placed in source, shell
-history, workflow inputs, build arguments, artifacts, or cache keys.
+Bot-created pull requests use an exact-head `repository_dispatch` check run
+because events created by the repository `GITHUB_TOKEN` do not recursively
+start another workflow. All three workflows use only the ephemeral
+repository-scoped token and job-specific permissions; no PAT, repository
+secret, release gate, repair workflow, or secondary auto-merge workflow is
+required.
 
-The non-secret repository variable `RELEASE_AUTOMATION_ENABLED` is the rollout
-gate. Bootstrap and repair read back literal `false` before mutation. Operators
-set and read back `true` only after both launcher blobs and the current ruleset
-have successful canary proof and the checkpoint's original workflow mapping is
-restored. A retry supplies the same Issue number, canonical body hash, seal ID,
-seal hash, and nonce; an edited or duplicate Issue/seal, unexpected ref, PR,
-check, package, or release delta, nonzero drained run, widened gate, or 403
-fails closed.
-
-GitHub creates an approval-required ordinary workflow run for pull requests
-opened or updated by `GITHUB_TOKEN`. Automation therefore sends a second,
-validated repository-dispatch CI run for the exact PR head. Repository dispatch
-always selects the reviewed default-branch workflow definition. The `develop` ruleset
-requires those source-pinned checks with strict base freshness and permits
-squash plus the ancestry-sync merge commit. The `main` ruleset is also strict
-and requires the same checks plus repository-owner review; neither branch
-ruleset has a bypass actor. The release workflow independently revalidates
-that `jskorlol` approved the exact `develop` head and merged the promotion.
-
-The first GHCR candidate is private by default. Before a GitHub Release can be
-created, an organization owner must make the linked
-`multica-runtime-controller` package public once in Package settings; this
-visibility change is irreversible. Rerun the same version and exact revision
-afterward. The OCI source label links the package to this repository, and the
-workflow verifies public visibility before finalizing the release.
-
-Stable image tags match `^[0-9]+\.[0-9]+\.[0-9]+$`; automation never overwrites
-them, while `latest` remains mutable. Because GHCR does not provide a stable-tag
-immutability control, the recorded manifest digest is authoritative. The
-GitHub `v*` tag ruleset denies update and deletion without bypass actors. A
-release rerun reconciles
-`absent → candidate_private → candidate_verified → release_verified → latest_digest_matched`
-and continues only the earliest incomplete step. A different revision, source,
-or digest is a terminal conflict and requires a higher patch release.
-
-GitHub's scheduled workflows are a polling cadence, not a four-hour SLA: runs
-can be delayed, and a public repository schedule can be disabled after 60 days
-without repository activity. Treat a last successful updater run older than
-eight hours as an operational alert, re-enable the workflow if needed, and use
-the corresponding repository-dispatch event to reconcile it. Kubernetes/Helm deployment remains a separate
-operation and is not performed by either automation workflow.
+Stable versions match `MAJOR.MINOR.PATCH`. The CLI updater increments one patch
+per actual Multica release change. A release retry accepts only the same main
+revision and rejects a tag or GitHub Release owned by another revision.
+Scheduled runs are polling;
+use the workflow's manual dispatch when a public-repository schedule is paused.
 
 ## Mount Runtime Configuration
 
