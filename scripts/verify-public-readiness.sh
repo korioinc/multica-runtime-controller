@@ -429,6 +429,7 @@ jq '[.[] | select(.permission == "push" or .permission == "maintain" or .permiss
 jq '[.[] | select(.read_only == false) | {kind:"deploy_key",name:.title,detail:(.id|tostring)}]' \
   "$workdir/deploy-keys.json" >"$workdir/active-key-writers.json"
 jq '[.installations[] |
+  select(.suspended_at == null) |
   select([.permissions | to_entries[] |
     select(.value == "write" and (.key == "actions" or .key == "administration" or
       .key == "checks" or .key == "contents" or .key == "deployments" or
