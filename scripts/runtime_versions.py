@@ -1036,6 +1036,7 @@ def validate_actions(directory: Path) -> dict[str, Any]:
             "INPUT_PULL_REQUEST_NUMBER",
             "INPUT_HEAD_SHA",
             "display_title",
+            '.name == $title',
             "CI automation",
             "automation/runtime-versions",
             "automation/release-patch",
