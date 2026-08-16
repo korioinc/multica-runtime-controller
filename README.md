@@ -78,21 +78,28 @@ issues, pull requests, logs, or artifacts.
 
 Six workflows own delivery:
 
-- `CI` is read-only and secret-free. Its literal `verify` and `runtime-image`
-  jobs are the required checks for every pull request. The runtime image check
+- `CI` is secret-free. Its build and verification jobs are read-only, and its
+  literal `verify` and `runtime-image` jobs are the required checks for every
+  pull request. The runtime image check
   fans out to native amd64 and arm64 runners and succeeds only after both
   architecture builds pass. Automation uses a
   `repository_dispatch` event so GitHub always loads the reviewed default-branch
   copy against an exact bot PR head; the workflow rejects a moved trusted ref
-  or mismatched pull request.
+  or mismatched pull request. After a successful bot-PR attempt, one isolated
+  contents-write job emits an `automation-merge` repository dispatch carrying
+  that exact run ID, attempt, workflow SHA, PR, and head SHA.
 - `Runtime Version Update` runs at minute 0 every four hours UTC and can also
   be started with the `runtime-version-update` repository-dispatch event. It
   reads only the fixed official Multica, Codex, and
   Pi sources, maintains one `automation/runtime-versions` pull request into
   `develop` with the run-scoped `GITHUB_TOKEN`, and dispatches exact-head CI.
-  It never writes to `main`.
-- `Runtime Version Auto Merge` is a separate trusted `workflow_run`. It checks
-  the triggering workflow, run attempt, actors, repository, branch, head,
+  Its write-capable job loads and hash-verifies the resolver from the exact
+  live `main` workflow revision, starts Python in isolated mode, and binds all
+  file and Git operations to the absolute Actions workspace instead of
+  executing control code from `develop`. It never writes to `main`.
+- `Runtime Version Auto Merge` is a separate trusted `repository_dispatch`
+  consumer. It waits for and checks the source CI workflow, run attempt,
+  actors, repository, branch, head,
   current pull request, files, commit identity, and the exact successful CI
   jobs without checking out or executing pull request code. A least-privilege
   merge job performs matched-head squash merges for runtime updates and

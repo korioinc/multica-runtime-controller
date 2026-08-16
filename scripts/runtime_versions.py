@@ -93,6 +93,17 @@ def _run(*command: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     )
 
 
+def activate_target_root(path: Path) -> Path:
+    """Make every relative file and git operation use one explicit repository root."""
+    if not path.is_absolute():
+        raise ResolverError("target_root_not_absolute")
+    root = path.resolve(strict=True)
+    if not root.is_dir():
+        raise ResolverError(f"target_root_not_directory path={root}")
+    os.chdir(root)
+    return root
+
+
 def parse_env_bytes(content: bytes) -> dict[str, str]:
     try:
         text = content.decode("utf-8")
@@ -910,6 +921,13 @@ def validate_actions(directory: Path) -> dict[str, Any]:
             'git fetch --no-tags origin "$BASE_SHA"',
             "scripts/install-runtime-tools.sh scripts/runtime-entrypoint.sh",
             "scripts/verify-runtime-tools.sh src",
+            "dispatch-merge:",
+            "needs: [context, verify, runtime-image, publish-checks]",
+            "needs.context.outputs.automation_kind != 'promotion'",
+            "SOURCE_RUN_ID: ${{ github.run_id }}",
+            "SOURCE_RUN_ATTEMPT: ${{ github.run_attempt }}",
+            '{event_type:"automation-merge",client_payload:',
+            '"repos/$GITHUB_REPOSITORY/dispatches"',
         ),
     )
     expected_ci_permissions = {
@@ -922,6 +940,7 @@ def validate_actions(directory: Path) -> dict[str, Any]:
             "contents": "read",
             "pull-requests": "read",
         },
+        "dispatch-merge": {"contents": "write"},
     }
     for job_name, expected in expected_ci_permissions.items():
         block = workflow_jobs["ci.yml"].get(job_name)
@@ -940,6 +959,7 @@ def validate_actions(directory: Path) -> dict[str, Any]:
         "secrets.",
         "environment:",
         "gh pr merge",
+        "python3 scripts/runtime_versions.py",
     ):
         if forbidden in updater:
             raise ResolverError(
@@ -960,8 +980,16 @@ def validate_actions(directory: Path) -> dict[str, Any]:
             '"repos/$GITHUB_REPOSITORY/dispatches"',
             "pull_request_number",
             "head_sha",
+            "TRUSTED_RESOLVER: ${{ runner.temp }}/trusted-runtime-versions.py",
+            "EVENT_WORKFLOW_SHA: ${{ github.sha }}",
+            'git show "$live_main:scripts/runtime_versions.py"',
+            'git hash-object "$TRUSTED_RESOLVER"',
+            "TARGET_ROOT: ${{ github.workspace }}",
+            'python3 -I "$TRUSTED_RESOLVER" --root "$TARGET_ROOT"',
         ),
     )
+    if updater.count('python3 -I "$TRUSTED_RESOLVER" --root "$TARGET_ROOT"') != 7:
+        raise ResolverError("updater_trusted_resolver_call_count_mismatch")
     propose = workflow_jobs["runtime-version-update.yml"].get("propose")
     if propose is None:
         raise ResolverError("updater_job_missing job=propose")
@@ -987,6 +1015,7 @@ def validate_actions(directory: Path) -> dict[str, Any]:
         "make ",
         "./scripts/",
         "actions/workflows/release.yml/dispatches",
+        "workflow_run:",
     ):
         if forbidden in merge_workflow:
             raise ResolverError(
@@ -996,15 +1025,16 @@ def validate_actions(directory: Path) -> dict[str, Any]:
         "runtime-version-auto-merge.yml",
         merge_workflow,
         (
-            "  workflow_run:",
-            "workflows: [CI]",
-            "types: [completed]",
-            "branches: [main]",
+            "  repository_dispatch:",
+            "types: [automation-merge]",
             "vars.RELEASE_AUTOMATION_ENABLED == 'true'",
-            "startsWith(github.event.workflow_run.display_title, 'CI automation runtime-update ')",
-            "startsWith(github.event.workflow_run.display_title, 'CI automation release-patch ')",
-            "startsWith(github.event.workflow_run.display_title, 'CI automation sync-main ')",
+            "github.event.client_payload.kind == 'runtime-update'",
+            "github.event.client_payload.kind == 'release-patch'",
+            "github.event.client_payload.kind == 'sync-main'",
             "EVENT_WORKFLOW_SHA",
+            "INPUT_WORKFLOW_SHA",
+            "INPUT_PULL_REQUEST_NUMBER",
+            "INPUT_HEAD_SHA",
             "display_title",
             "CI automation",
             "automation/runtime-versions",
@@ -1012,12 +1042,17 @@ def validate_actions(directory: Path) -> dict[str, Any]:
             "automation/sync-main",
             '$kind == "sync-main" and .commits >= 2',
             '$kind != "sync-main" and .commits == 1',
-            "github.event.workflow_run.id",
-            "github.event.workflow_run.run_attempt",
+            "github.event.client_payload.run_id",
+            "github.event.client_payload.run_attempt",
+            '[ "$EVENT_NAME" = repository_dispatch ]',
+            '[ "$EVENT_REF" = refs/heads/main ]',
+            '[ "$EVENT_WORKFLOW_SHA" = "$INPUT_WORKFLOW_SHA" ]',
+            'expected_title="CI automation $INPUT_KIND PR-$INPUT_PULL_REQUEST_NUMBER SHA-$INPUT_HEAD_SHA"',
             ".github/workflows/ci.yml",
             "triggering_actor",
             "attempts/$RUN_ATTEMPT/jobs",
-            '["automation-runtime-image","automation-runtime-image-amd64","automation-runtime-image-arm64","automation-verify","context","publish-checks"]',
+            '["automation-runtime-image","automation-runtime-image-amd64","automation-runtime-image-arm64","automation-verify","context","dispatch-merge","publish-checks"]',
+            "source CI run %s did not complete before the merge deadline",
             "--match-head-commit",
             "compare/develop...$automation_head",
             "--merge --delete-branch",
@@ -1159,7 +1194,8 @@ def validate_actions(directory: Path) -> dict[str, Any]:
             "actions/upload-artifact@",
             "actions/download-artifact@",
             "docker buildx imagetools create",
-            "--metadata-file",
+            "for attempt in 1 2 3 4 5 6",
+            "development manifest did not converge",
         ),
     )
     expected_development_permissions = {
@@ -1215,7 +1251,8 @@ def validate_actions(directory: Path) -> dict[str, Any]:
             "actions/upload-artifact@",
             "actions/download-artifact@",
             "docker buildx imagetools create",
-            "--metadata-file",
+            "for attempt in 1 2 3 4 5 6",
+            "release manifest did not converge",
         ),
     )
     expected_release_permissions = {
@@ -1260,6 +1297,7 @@ def _emit_github_output(values: Mapping[str, Any]) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--root", type=Path, default=Path.cwd())
     commands = parser.add_subparsers(dest="command", required=True)
 
     check = commands.add_parser("check")
@@ -1304,6 +1342,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     arguments = build_parser().parse_args(argv)
     try:
+        activate_target_root(arguments.root)
         if arguments.command == "check":
             current = parse_env_bytes(ENV_PATH.read_bytes())
             result = resolve_versions(current, _fetcher_from_argument(arguments.offline_fixture))

@@ -18,6 +18,8 @@ jobs:
     if: vars.RELEASE_AUTOMATION_ENABLED == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      TARGET_ROOT: ${{ github.workspace }}
     permissions:
       contents: read
     outputs:
@@ -30,9 +32,31 @@ jobs:
           ref: develop
           fetch-depth: 0
           persist-credentials: false
+      - name: Load the resolver from the exact trusted main revision
+        env:
+          EVENT_WORKFLOW_SHA: ${{ github.sha }}
+          GH_TOKEN: ${{ github.token }}
+          TRUSTED_RESOLVER: ${{ runner.temp }}/trusted-runtime-versions.py
+        run: |
+          set -euo pipefail
+          live_main=$(gh api \
+            "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)
+          [ "$EVENT_WORKFLOW_SHA" = "$live_main" ] || {
+            printf 'trusted workflow moved: event=%s live-main=%s\n' \
+              "$EVENT_WORKFLOW_SHA" "$live_main" >&2
+            exit 1
+          }
+          git fetch --force origin "$live_main"
+          expected_blob=$(git rev-parse \
+            "$live_main:scripts/runtime_versions.py")
+          git show "$live_main:scripts/runtime_versions.py" \
+            >"$TRUSTED_RESOLVER"
+          [ "$(git hash-object "$TRUSTED_RESOLVER")" = "$expected_blob" ]
+          chmod 0555 "$TRUSTED_RESOLVER"
       - name: Require the current release to be complete
         env:
           GH_TOKEN: ${{ github.token }}
+          TRUSTED_RESOLVER: ${{ runner.temp }}/trusted-runtime-versions.py
         run: |
           # jq programs and Markdown format strings are intentionally literal.
           # shellcheck disable=SC2016
@@ -40,10 +64,10 @@ jobs:
           git fetch --force origin refs/heads/main:refs/remotes/origin/main
           revision=$(git rev-parse origin/main)
           version=$(git show "$revision:VERSION")
-          python3 scripts/runtime_versions.py release-preflight \
+          python3 -I "$TRUSTED_RESOLVER" --root "$TARGET_ROOT" release-preflight \
             --version "$version" --revision "$revision" --live \
             --allow-same-identity
-          state=$(python3 scripts/runtime_versions.py release-state \
+          state=$(python3 -I "$TRUSTED_RESOLVER" --root "$TARGET_ROOT" release-state \
             --version "$version" --revision "$revision" --live \
             --format json | jq -r .state)
           [ "$state" = latest_digest_matched ] || {
@@ -54,11 +78,13 @@ jobs:
         id: check
         env:
           GH_TOKEN: ${{ github.token }}
+          TRUSTED_RESOLVER: ${{ runner.temp }}/trusted-runtime-versions.py
         run: |
           # jq programs and Markdown format strings are intentionally literal.
           # shellcheck disable=SC2016
           set -eu
-          python3 scripts/runtime_versions.py check --format json >"$RUNNER_TEMP/versions.json"
+          python3 -I "$TRUSTED_RESOLVER" --root "$TARGET_ROOT" check --format json \
+            >"$RUNNER_TEMP/versions.json"
           updates=$(jq -c .updates "$RUNNER_TEMP/versions.json")
           count=$(jq '.updates | length' "$RUNNER_TEMP/versions.json")
           {
@@ -78,6 +104,8 @@ jobs:
     if: needs.resolve.outputs.has_updates == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      TARGET_ROOT: ${{ github.workspace }}
     permissions:
       contents: write
       pull-requests: write
@@ -88,18 +116,40 @@ jobs:
           ref: develop
           fetch-depth: 0
           persist-credentials: false
+      - name: Load the resolver from the exact trusted main revision
+        env:
+          EVENT_WORKFLOW_SHA: ${{ github.sha }}
+          GH_TOKEN: ${{ github.token }}
+          TRUSTED_RESOLVER: ${{ runner.temp }}/trusted-runtime-versions.py
+        run: |
+          set -euo pipefail
+          live_main=$(gh api \
+            "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)
+          [ "$EVENT_WORKFLOW_SHA" = "$live_main" ] || {
+            printf 'trusted workflow moved: event=%s live-main=%s\n' \
+              "$EVENT_WORKFLOW_SHA" "$live_main" >&2
+            exit 1
+          }
+          git fetch --force origin "$live_main"
+          expected_blob=$(git rev-parse \
+            "$live_main:scripts/runtime_versions.py")
+          git show "$live_main:scripts/runtime_versions.py" \
+            >"$TRUSTED_RESOLVER"
+          [ "$(git hash-object "$TRUSTED_RESOLVER")" = "$expected_blob" ]
+          chmod 0555 "$TRUSTED_RESOLVER"
       - name: Revalidate the checked-out release boundary
         env:
           GH_TOKEN: ${{ github.token }}
+          TRUSTED_RESOLVER: ${{ runner.temp }}/trusted-runtime-versions.py
         run: |
           set -eu
           git fetch --force origin refs/heads/main:refs/remotes/origin/main
           revision=$(git rev-parse origin/main)
           version=$(git show "$revision:VERSION")
-          python3 scripts/runtime_versions.py release-preflight \
+          python3 -I "$TRUSTED_RESOLVER" --root "$TARGET_ROOT" release-preflight \
             --version "$version" --revision "$revision" --live \
             --allow-same-identity
-          state=$(python3 scripts/runtime_versions.py release-state \
+          state=$(python3 -I "$TRUSTED_RESOLVER" --root "$TARGET_ROOT" release-state \
             --version "$version" --revision "$revision" --live \
             --format json | jq -r .state)
           [ "$state" = latest_digest_matched ] || {
@@ -109,10 +159,11 @@ jobs:
       - name: Update the exact two version files
         env:
           GH_TOKEN: ${{ github.token }}
+          TRUSTED_RESOLVER: ${{ runner.temp }}/trusted-runtime-versions.py
         run: |
           set -eu
-          python3 scripts/runtime_versions.py update --write
-          python3 scripts/runtime_versions.py validate \
+          python3 -I "$TRUSTED_RESOLVER" --root "$TARGET_ROOT" update --write
+          python3 -I "$TRUSTED_RESOLVER" --root "$TARGET_ROOT" validate \
             --base-ref origin/develop --automation-diff
       - name: Commit and push the bot-owned branch
         env:
