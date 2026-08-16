@@ -1230,6 +1230,7 @@ def validate_actions(directory: Path) -> dict[str, Any]:
             "INPUT_VERSION: ${{ github.event.client_payload.version }}",
             "INPUT_REVISION: ${{ github.event.client_payload.revision }}",
             "pull-requests: read",
+            'promotion=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$number")',
             '.merged_by.login == "jskorlol"',
             '.user.login == "jskorlol"',
             '.state == "APPROVED"',

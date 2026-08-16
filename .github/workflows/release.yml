@@ -88,12 +88,10 @@ jobs:
             --arg revision "$REVISION" '[
               .[] | select(
                 .state == "closed" and
-                .merged == true and
                 .base.ref == "main" and
                 .head.ref == "develop" and
                 .user.login == "github-actions[bot]" and
-                .merge_commit_sha == $revision and
-                .merged_by.login == "jskorlol"
+                .merge_commit_sha == $revision
               )
             ]')
           [ "$(printf '%s' "$matches" | jq 'length')" -eq 1 ] || {
@@ -101,7 +99,21 @@ jobs:
             exit 1
           }
           number=$(printf '%s' "$matches" | jq -r '.[0].number')
-          head=$(printf '%s' "$matches" | jq -r '.[0].head.sha')
+          promotion=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$number")
+          printf '%s' "$promotion" | jq -e \
+            --arg revision "$REVISION" '
+              .state == "closed" and
+              .merged == true and
+              .base.ref == "main" and
+              .head.ref == "develop" and
+              .user.login == "github-actions[bot]" and
+              .merge_commit_sha == $revision and
+              .merged_by.login == "jskorlol"
+            ' >/dev/null || {
+            echo 'promotion details do not match the release boundary' >&2
+            exit 1
+          }
+          head=$(printf '%s' "$promotion" | jq -r '.head.sha')
           reviews=$(gh api --paginate --slurp \
             "repos/$GITHUB_REPOSITORY/pulls/$number/reviews?per_page=100")
           printf '%s' "$reviews" | jq -e --arg head "$head" '
