@@ -44,6 +44,9 @@ on:
 
 permissions: {}
 
+env:
+  GH_REPO: ${{ github.repository }}
+
 concurrency:
   group: ${{ inputs.mode == 'canary' && format('release-repair-canary-{0}', inputs.nonce) || 'release-repair-transaction' }}
   cancel-in-progress: false
