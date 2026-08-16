@@ -1195,7 +1195,7 @@ def validate_actions(directory: Path) -> dict[str, Any]:
             "actions/upload-artifact@",
             "actions/download-artifact@",
             "docker buildx imagetools create",
-            "for attempt in 1 2 3 4 5 6",
+            'while [ "$attempt" -le 18 ]',
             "development manifest did not converge",
         ),
     )
@@ -1255,7 +1255,7 @@ def validate_actions(directory: Path) -> dict[str, Any]:
             "actions/upload-artifact@",
             "actions/download-artifact@",
             "docker buildx imagetools create",
-            "for attempt in 1 2 3 4 5 6",
+            'while [ "$attempt" -le 18 ]',
             "release manifest did not converge",
         ),
     )

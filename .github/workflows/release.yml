@@ -352,7 +352,8 @@ jobs:
           digest=
           platforms=
           verified=false
-          for attempt in 1 2 3 4 5 6; do
+          attempt=1
+          while [ "$attempt" -le 18 ]; do
             digest=$(docker buildx imagetools inspect \
               "$IMAGE:$VERSION" 2>/dev/null \
               | awk '$1 == "Digest:" {print $2; exit}') || digest=
@@ -369,8 +370,9 @@ jobs:
               verified=true
               break
             fi
-            [ "$attempt" -lt 6 ] || break
-            sleep $((attempt * 2))
+            [ "$attempt" -lt 18 ] || break
+            sleep 5
+            attempt=$((attempt + 1))
           done
           [ "$verified" = true ] || {
             echo 'release manifest did not converge' >&2
