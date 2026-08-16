@@ -1194,7 +1194,8 @@ def validate_actions(directory: Path) -> dict[str, Any]:
             "actions/upload-artifact@",
             "actions/download-artifact@",
             "docker buildx imagetools create",
-            "--metadata-file",
+            "for attempt in 1 2 3 4 5 6",
+            "development manifest did not converge",
         ),
     )
     expected_development_permissions = {
@@ -1250,7 +1251,8 @@ def validate_actions(directory: Path) -> dict[str, Any]:
             "actions/upload-artifact@",
             "actions/download-artifact@",
             "docker buildx imagetools create",
-            "--metadata-file",
+            "for attempt in 1 2 3 4 5 6",
+            "release manifest did not converge",
         ),
     )
     expected_release_permissions = {
