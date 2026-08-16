@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -21,6 +22,32 @@ def fixture(name: str) -> dict:
 
 
 class RuntimeVersionTests(unittest.TestCase):
+    def test_cli_uses_only_an_explicit_absolute_target_root(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target_root = Path(directory)
+            (target_root / "build").mkdir()
+            (target_root / "build" / "runtime-versions.env").write_bytes(ENV_BYTES)
+            command = [
+                "python3",
+                "-I",
+                str(ROOT / "scripts" / "runtime_versions.py"),
+                "--root",
+                str(target_root),
+                "check",
+                "--offline-fixture",
+                str(FIXTURES / "upstreams-current.json"),
+            ]
+
+            completed = subprocess.run(command, check=False, text=True, capture_output=True)
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(json.loads(completed.stdout)["updates"], [])
+
+            command[4] = "."
+            rejected = subprocess.run(command, check=False, text=True, capture_output=True)
+            self.assertEqual(rejected.returncode, 1)
+            self.assertIn("target_root_not_absolute", rejected.stderr)
+
     def test_current_sources_are_a_successful_noop(self) -> None:
         current = runtime_versions.parse_env_bytes(ENV_BYTES)
         result = runtime_versions.resolve_versions(

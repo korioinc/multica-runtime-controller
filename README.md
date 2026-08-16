@@ -94,8 +94,9 @@ Six workflows own delivery:
   Pi sources, maintains one `automation/runtime-versions` pull request into
   `develop` with the run-scoped `GITHUB_TOKEN`, and dispatches exact-head CI.
   Its write-capable job loads and hash-verifies the resolver from the exact
-  live `main` workflow revision instead of executing control code from
-  `develop`. It never writes to `main`.
+  live `main` workflow revision, starts Python in isolated mode, and binds all
+  file and Git operations to the absolute Actions workspace instead of
+  executing control code from `develop`. It never writes to `main`.
 - `Runtime Version Auto Merge` is a separate trusted `repository_dispatch`
   consumer. It waits for and checks the source CI workflow, run attempt,
   actors, repository, branch, head,

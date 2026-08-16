@@ -93,6 +93,17 @@ def _run(*command: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     )
 
 
+def activate_target_root(path: Path) -> Path:
+    """Make every relative file and git operation use one explicit repository root."""
+    if not path.is_absolute():
+        raise ResolverError("target_root_not_absolute")
+    root = path.resolve(strict=True)
+    if not root.is_dir():
+        raise ResolverError(f"target_root_not_directory path={root}")
+    os.chdir(root)
+    return root
+
+
 def parse_env_bytes(content: bytes) -> dict[str, str]:
     try:
         text = content.decode("utf-8")
@@ -973,10 +984,11 @@ def validate_actions(directory: Path) -> dict[str, Any]:
             "EVENT_WORKFLOW_SHA: ${{ github.sha }}",
             'git show "$live_main:scripts/runtime_versions.py"',
             'git hash-object "$TRUSTED_RESOLVER"',
-            'python3 "$TRUSTED_RESOLVER"',
+            "TARGET_ROOT: ${{ github.workspace }}",
+            'python3 -I "$TRUSTED_RESOLVER" --root "$TARGET_ROOT"',
         ),
     )
-    if updater.count('python3 "$TRUSTED_RESOLVER"') != 7:
+    if updater.count('python3 -I "$TRUSTED_RESOLVER" --root "$TARGET_ROOT"') != 7:
         raise ResolverError("updater_trusted_resolver_call_count_mismatch")
     propose = workflow_jobs["runtime-version-update.yml"].get("propose")
     if propose is None:
@@ -1283,6 +1295,7 @@ def _emit_github_output(values: Mapping[str, Any]) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--root", type=Path, default=Path.cwd())
     commands = parser.add_subparsers(dest="command", required=True)
 
     check = commands.add_parser("check")
@@ -1327,6 +1340,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     arguments = build_parser().parse_args(argv)
     try:
+        activate_target_root(arguments.root)
         if arguments.command == "check":
             current = parse_env_bytes(ENV_PATH.read_bytes())
             result = resolve_versions(current, _fetcher_from_argument(arguments.offline_fixture))

@@ -18,6 +18,8 @@ jobs:
     if: vars.RELEASE_AUTOMATION_ENABLED == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      TARGET_ROOT: ${{ github.workspace }}
     permissions:
       contents: read
     outputs:
@@ -62,10 +64,10 @@ jobs:
           git fetch --force origin refs/heads/main:refs/remotes/origin/main
           revision=$(git rev-parse origin/main)
           version=$(git show "$revision:VERSION")
-          python3 "$TRUSTED_RESOLVER" release-preflight \
+          python3 -I "$TRUSTED_RESOLVER" --root "$TARGET_ROOT" release-preflight \
             --version "$version" --revision "$revision" --live \
             --allow-same-identity
-          state=$(python3 "$TRUSTED_RESOLVER" release-state \
+          state=$(python3 -I "$TRUSTED_RESOLVER" --root "$TARGET_ROOT" release-state \
             --version "$version" --revision "$revision" --live \
             --format json | jq -r .state)
           [ "$state" = latest_digest_matched ] || {
@@ -81,7 +83,7 @@ jobs:
           # jq programs and Markdown format strings are intentionally literal.
           # shellcheck disable=SC2016
           set -eu
-          python3 "$TRUSTED_RESOLVER" check --format json \
+          python3 -I "$TRUSTED_RESOLVER" --root "$TARGET_ROOT" check --format json \
             >"$RUNNER_TEMP/versions.json"
           updates=$(jq -c .updates "$RUNNER_TEMP/versions.json")
           count=$(jq '.updates | length' "$RUNNER_TEMP/versions.json")
@@ -102,6 +104,8 @@ jobs:
     if: needs.resolve.outputs.has_updates == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      TARGET_ROOT: ${{ github.workspace }}
     permissions:
       contents: write
       pull-requests: write
@@ -142,10 +146,10 @@ jobs:
           git fetch --force origin refs/heads/main:refs/remotes/origin/main
           revision=$(git rev-parse origin/main)
           version=$(git show "$revision:VERSION")
-          python3 "$TRUSTED_RESOLVER" release-preflight \
+          python3 -I "$TRUSTED_RESOLVER" --root "$TARGET_ROOT" release-preflight \
             --version "$version" --revision "$revision" --live \
             --allow-same-identity
-          state=$(python3 "$TRUSTED_RESOLVER" release-state \
+          state=$(python3 -I "$TRUSTED_RESOLVER" --root "$TARGET_ROOT" release-state \
             --version "$version" --revision "$revision" --live \
             --format json | jq -r .state)
           [ "$state" = latest_digest_matched ] || {
@@ -158,8 +162,8 @@ jobs:
           TRUSTED_RESOLVER: ${{ runner.temp }}/trusted-runtime-versions.py
         run: |
           set -eu
-          python3 "$TRUSTED_RESOLVER" update --write
-          python3 "$TRUSTED_RESOLVER" validate \
+          python3 -I "$TRUSTED_RESOLVER" --root "$TARGET_ROOT" update --write
+          python3 -I "$TRUSTED_RESOLVER" --root "$TARGET_ROOT" validate \
             --base-ref origin/develop --automation-diff
       - name: Commit and push the bot-owned branch
         env:
