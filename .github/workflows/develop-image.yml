@@ -210,29 +210,42 @@ jobs:
           docker buildx imagetools create \
             --tag "$IMAGE:develop" \
             --tag "$IMAGE:develop-$REVISION" \
-            --metadata-file "$RUNNER_TEMP/manifest-metadata.json" \
             "${refs[@]}"
-          digest=$(jq -er '."containerimage.descriptor".digest' \
-            "$RUNNER_TEMP/manifest-metadata.json")
+          digest=
+          platforms=
+          verified=false
+          for attempt in 1 2 3 4 5 6; do
+            digest=$(docker buildx imagetools inspect \
+              "$IMAGE:develop-$REVISION" 2>/dev/null \
+              | awk '$1 == "Digest:" {print $2; exit}') || digest=
+            moving_digest=$(docker buildx imagetools inspect \
+              "$IMAGE:develop" 2>/dev/null \
+              | awk '$1 == "Digest:" {print $2; exit}') || moving_digest=
+            platforms=$(docker buildx imagetools inspect --raw \
+              "$IMAGE:develop-$REVISION" 2>/dev/null | jq -c '
+                [.manifests[] |
+                 select(.platform.os == "linux" and
+                        (.platform.architecture == "amd64" or
+                         .platform.architecture == "arm64")) |
+                 (.platform.os + "/" + .platform.architecture)] |
+                unique | sort') || platforms=
+            if [ -n "$digest" ] && [ "$moving_digest" = "$digest" ] && \
+               [ "$platforms" = '["linux/amd64","linux/arm64"]' ]; then
+              verified=true
+              break
+            fi
+            [ "$attempt" -lt 6 ] || break
+            sleep $((attempt * 2))
+          done
+          [ "$verified" = true ] || {
+            echo 'development manifest did not converge' >&2
+            exit 1
+          }
           case "$digest" in
             sha256:[0-9a-f][0-9a-f]*) ;;
             *) echo 'manifest creation did not return a sha256 digest' >&2; exit 1 ;;
           esac
           [ "${#digest}" -eq 71 ]
-          for tag in develop "develop-$REVISION"; do
-            resolved=$(docker buildx imagetools inspect "$IMAGE:$tag" \
-              | awk '$1 == "Digest:" {print $2; exit}')
-            [ "$resolved" = "$digest" ]
-          done
-          platforms=$(docker buildx imagetools inspect --raw \
-            "$IMAGE:develop-$REVISION" | jq -c '
-              [.manifests[] |
-               select(.platform.os == "linux" and
-                      (.platform.architecture == "amd64" or
-                       .platform.architecture == "arm64")) |
-               (.platform.os + "/" + .platform.architecture)] |
-              unique | sort')
-          [ "$platforms" = '["linux/amd64","linux/arm64"]' ]
           printf 'digest=%s\n' "$digest" >>"$GITHUB_OUTPUT"
       - name: Record development image identity
         env:

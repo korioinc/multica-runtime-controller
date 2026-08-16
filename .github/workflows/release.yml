@@ -338,27 +338,39 @@ jobs:
           done
           docker buildx imagetools create \
             --tag "$IMAGE:$VERSION" \
-            --metadata-file "$RUNNER_TEMP/manifest-metadata.json" \
             "${refs[@]}"
-          digest=$(jq -er '."containerimage.descriptor".digest' \
-            "$RUNNER_TEMP/manifest-metadata.json")
+          digest=
+          platforms=
+          verified=false
+          for attempt in 1 2 3 4 5 6; do
+            digest=$(docker buildx imagetools inspect \
+              "$IMAGE:$VERSION" 2>/dev/null \
+              | awk '$1 == "Digest:" {print $2; exit}') || digest=
+            platforms=$(docker buildx imagetools inspect --raw \
+              "$IMAGE:$VERSION" 2>/dev/null | jq -c '
+                [.manifests[] |
+                 select(.platform.os == "linux" and
+                        (.platform.architecture == "amd64" or
+                         .platform.architecture == "arm64")) |
+                 (.platform.os + "/" + .platform.architecture)] |
+                unique | sort') || platforms=
+            if [ -n "$digest" ] && \
+               [ "$platforms" = '["linux/amd64","linux/arm64"]' ]; then
+              verified=true
+              break
+            fi
+            [ "$attempt" -lt 6 ] || break
+            sleep $((attempt * 2))
+          done
+          [ "$verified" = true ] || {
+            echo 'release manifest did not converge' >&2
+            exit 1
+          }
           case "$digest" in
             sha256:[0-9a-f][0-9a-f]*) ;;
             *) echo 'manifest creation did not return a sha256 digest' >&2; exit 1 ;;
           esac
           [ "${#digest}" -eq 71 ]
-          resolved=$(docker buildx imagetools inspect "$IMAGE:$VERSION" \
-            | awk '$1 == "Digest:" {print $2; exit}')
-          [ "$resolved" = "$digest" ]
-          platforms=$(docker buildx imagetools inspect --raw \
-            "$IMAGE:$VERSION" | jq -c '
-              [.manifests[] |
-               select(.platform.os == "linux" and
-                      (.platform.architecture == "amd64" or
-                       .platform.architecture == "arm64")) |
-               (.platform.os + "/" + .platform.architecture)] |
-              unique | sort')
-          [ "$platforms" = '["linux/amd64","linux/arm64"]' ]
       - name: Verify candidate identity
         id: state
         env:
