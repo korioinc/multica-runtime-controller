@@ -99,7 +99,7 @@ jobs:
               .id == $run_id and
               .run_attempt == $run_attempt and
               .workflow_id == $workflow_id and
-              .name == "CI" and
+              .name == $title and
               .path == ".github/workflows/ci.yml" and
               .event == "repository_dispatch" and
               .status == "completed" and
