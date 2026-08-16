@@ -75,33 +75,11 @@ jobs:
     if: needs.resolve.outputs.has_updates == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    environment: automation
     permissions:
-      contents: read
+      actions: write
+      contents: write
+      pull-requests: write
     steps:
-      - name: Create repository-scoped App token
-        id: app-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          app-id: ${{ vars.AUTOMATION_APP_ID }}
-          private-key: ${{ secrets.AUTOMATION_APP_PRIVATE_KEY }}
-          owner: korioinc
-          repositories: multica-runtime-controller
-          permission-contents: write
-          permission-pull-requests: write
-      - name: Resolve the authenticated App bot identity
-        id: bot
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
-        run: |
-          set -eu
-          bot_login="${APP_SLUG}[bot]"
-          bot_id=$(gh api "/users/${APP_SLUG}%5Bbot%5D" --jq .id)
-          {
-            echo "login=$bot_login"
-            echo "email=${bot_id}+${bot_login}@users.noreply.github.com"
-          } >>"$GITHUB_OUTPUT"
       - name: Check out latest main without persisted credentials
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -131,47 +109,48 @@ jobs:
         run: |
           set -eu
           python3 scripts/runtime_versions.py update --write
-          python3 scripts/runtime_versions.py validate --base-ref origin/main
-          names=$(git diff --name-only origin/main -- | LC_ALL=C sort)
-          expected=$(printf '%s\n' VERSION build/runtime-versions.env | LC_ALL=C sort)
-          [ "$names" = "$expected" ] || {
-            printf 'unexpected updater diff:\n%s\n' "$names" >&2
-            exit 1
-          }
+          python3 scripts/runtime_versions.py validate \
+            --base-ref origin/main --automation-diff
       - name: Commit and push the bot-owned branch
         env:
-          AUTOMATION_TOKEN: ${{ steps.app-token.outputs.token }}
-          BOT_LOGIN: ${{ steps.bot.outputs.login }}
-          BOT_EMAIL: ${{ steps.bot.outputs.email }}
+          AUTOMATION_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          set -eu
+          set -euo pipefail
           branch=automation/runtime-versions
-          git config user.name "$BOT_LOGIN"
-          git config user.email "$BOT_EMAIL"
+          bot_login='github-actions[bot]'
+          bot_email='41898282+github-actions[bot]@users.noreply.github.com'
+          git config user.name "$bot_login"
+          git config user.email "$bot_email"
           git checkout -B "$branch"
           git add VERSION build/runtime-versions.env
-          git commit -m 'chore: update runtime versions'
+          git commit --no-gpg-sign -m 'chore: update runtime versions'
+
           remote_sha=$(git ls-remote --heads origin "$branch" | awk '{print $1}')
           if [ -n "$remote_sha" ]; then
-            existing=$(GH_TOKEN="$AUTOMATION_TOKEN" gh pr list --state open \
-              --head "$branch" --json number,author --limit 10)
-            [ "$(printf '%s' "$existing" | jq 'length')" -eq 1 ] || {
+            prs=$(gh pr list --state open --head "$branch" --json number --limit 10)
+            [ "$(printf '%s' "$prs" | jq 'length')" -eq 1 ] || {
               echo 'bot branch exists without exactly one open PR' >&2
               exit 1
             }
-            [ "$(printf '%s' "$existing" | jq -r '.[0].author.is_bot')" = true ] || {
-              echo 'existing updater branch is not App-owned' >&2
-              exit 1
-            }
-            remote_actor=$(GH_TOKEN="$AUTOMATION_TOKEN" \
-              gh api "repos/$GITHUB_REPOSITORY/commits/$remote_sha" \
-              --jq '[.author.login,.committer.login] | @tsv')
-            expected_actor=$(printf '%s\t%s' "$BOT_LOGIN" "$BOT_LOGIN")
-            [ "$remote_actor" = "$expected_actor" ] || {
-              echo 'existing updater branch head is not App-authored and App-committed' >&2
-              exit 1
-            }
+            number=$(printf '%s' "$prs" | jq -r '.[0].number')
+            existing=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$number")
+            printf '%s' "$existing" | jq -e \
+              --arg branch "$branch" \
+              --arg repository "$GITHUB_REPOSITORY" '
+                .state == "open" and
+                .user.login == "github-actions[bot]" and
+                .head.ref == $branch and
+                .head.repo.full_name == $repository and
+                .base.ref == "main"
+              ' >/dev/null
+            remote_commit=$(gh api "repos/$GITHUB_REPOSITORY/commits/$remote_sha")
+            printf '%s' "$remote_commit" | jq -e '
+              .author.login == "github-actions[bot]" and
+              .committer.login == "github-actions[bot]"
+            ' >/dev/null
           fi
+
           askpass=$RUNNER_TEMP/git-askpass
           cat >"$askpass" <<'EOF'
           #!/bin/sh
@@ -188,19 +167,18 @@ jobs:
             lease="--force-with-lease=refs/heads/$branch:"
           fi
           GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0 \
-            git push "$lease" https://github.com/korioinc/multica-runtime-controller.git \
+            git push "$lease" "https://github.com/$GITHUB_REPOSITORY.git" \
               "HEAD:refs/heads/$branch"
-      - name: Create or update one PR and enable native auto-merge
+      - name: Create or update one PR and dispatch exact-head CI
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_TOKEN: ${{ github.token }}
           UPDATES: ${{ needs.resolve.outputs.updates }}
         run: |
           # jq programs and Markdown format strings are intentionally literal.
           # shellcheck disable=SC2016
-          set -eu
+          set -euo pipefail
           branch=automation/runtime-versions
-          prs=$(gh pr list --state open --head "$branch" \
-            --json number,author --limit 10)
+          prs=$(gh pr list --state open --head "$branch" --json number --limit 10)
           count=$(printf '%s' "$prs" | jq 'length')
           [ "$count" -le 1 ] || { echo 'duplicate updater PRs detected' >&2; exit 1; }
           version=$(cat VERSION)
@@ -212,7 +190,7 @@ jobs:
           Target controller release: \`$version\`
 
           Changed files are restricted to \`VERSION\` and \`build/runtime-versions.env\`.
-          The PR must pass \`CI / verify\` and \`CI / runtime-image\`; the App has no ruleset bypass.
+          The exact PR head must pass the \`verify\` and \`runtime-image\` jobs; no workflow has a ruleset bypass.
           EOF
           if [ "$count" -eq 0 ]; then
             url=$(gh pr create --base main --head "$branch" \
@@ -221,11 +199,32 @@ jobs:
             number=${url##*/}
           else
             number=$(printf '%s' "$prs" | jq -r '.[0].number')
-            is_bot=$(printf '%s' "$prs" | jq -r '.[0].author.is_bot')
-            [ "$is_bot" = true ] || { echo 'existing updater PR is not App-owned' >&2; exit 1; }
             gh pr edit "$number" --title "chore: release runtime $version" \
               --body-file "$RUNNER_TEMP/pr-body.md"
           fi
-          gh pr merge "$number" --auto --squash --delete-branch
-          printf "Updater PR: #%s; target release: \`%s\`.\n" \
-            "$number" "$version" >>"$GITHUB_STEP_SUMMARY"
+
+          head_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$branch" \
+            --jq .object.sha)
+          pr=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$number")
+          printf '%s' "$pr" | jq -e \
+            --arg branch "$branch" \
+            --arg head "$head_sha" \
+            --arg repository "$GITHUB_REPOSITORY" '
+              .state == "open" and
+              .user.login == "github-actions[bot]" and
+              .base.ref == "main" and
+              .head.ref == $branch and
+              .head.sha == $head and
+              .head.repo.full_name == $repository
+            ' >/dev/null
+
+          jq -n \
+            --arg ref "$branch" \
+            --arg number "$number" \
+            --arg head "$head_sha" \
+            '{ref:$ref,inputs:{pull_request_number:$number,head_sha:$head}}' \
+            | gh api --method POST \
+                "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/dispatches" \
+                --input -
+          printf "Updater PR: #%s; head: \`%s\`; target release: \`%s\`; CI dispatched.\n" \
+            "$number" "$head_sha" "$version" >>"$GITHUB_STEP_SUMMARY"

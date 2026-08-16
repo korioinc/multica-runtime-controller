@@ -74,35 +74,46 @@ a `LICENSE` file is added by the repository owner. Report vulnerabilities only
 through the private process in [SECURITY.md](SECURITY.md), never in public
 issues, pull requests, logs, or artifacts.
 
-Four workflows own delivery:
+Five workflows own delivery:
 
-- `CI` is read-only and secret-free. `CI / verify` and `CI / runtime-image` are
-  required for every pull request.
+- `CI` is read-only and secret-free. Its literal `verify` and `runtime-image`
+  jobs are the required checks for every pull request. The updater dispatches
+  the same workflow against an exact bot PR head and the workflow rejects a
+  moved ref or mismatched pull request.
 - `Runtime Version Update` runs at minute 0 every four hours UTC and can also
   be dispatched manually. It reads only the fixed official Multica, Codex, and
-  Pi sources, maintains one `automation/runtime-versions` pull request, and
-  requests native squash auto-merge after both required checks pass.
+  Pi sources, maintains one `automation/runtime-versions` pull request with
+  the run-scoped `GITHUB_TOKEN`, and dispatches exact-head CI. It never merges
+  the pull request itself.
+- `Runtime Version Auto Merge` is a separate trusted `workflow_run`. It checks
+  the triggering workflow, run attempt, actors, repository, branch, head,
+  current pull request, files, commit identity, and the exact successful CI
+  jobs without checking out or executing pull request code. A least-privilege
+  merge job performs the matched-head squash merge; a separate Actions-write
+  job dispatches `Release` with the resulting merge SHA and `VERSION`.
 - `Development Image` runs only for pushes to `develop`. A read-only verify job
   must pass before a separate package-write job publishes the same multi-arch
   digest as `develop` and `develop-<full-commit-SHA>`. It uses its own
   `runtime-develop` write cache, may restore the trusted `runtime-main` cache,
   and never changes stable version tags, `latest`, or a GitHub Release.
-- `Release` runs when `VERSION` changes on `main`. Manual recovery requires the
-  exact stable version and the original full 40-character revision.
+- `Release` runs when `VERSION` changes on `main` or when the merge workflow
+  explicitly supplies the exact stable version and full 40-character merge
+  revision. Manual recovery uses the same exact identity.
 
-The only long-lived privileged credential is owned by the `automation`
-Environment: variable `AUTOMATION_APP_ID` and secret
-`AUTOMATION_APP_PRIVATE_KEY`. That Environment allows exactly the `main`
-branch. The App is installed only on this repository with Contents and Pull
-Requests read/write permissions and has no ruleset, workflow, package, or
-administration access. Release jobs publish to
-`ghcr.io/korioinc/multica-runtime-controller` with the ephemeral,
-repository-scoped `GITHUB_TOKEN`; no registry PAT or repository secret is
-required. The development publisher uses the same ephemeral credential in its
-package-write job and receives no Environment secret. Secret values must be
-entered through GitHub's secret UI or an
-interactive non-logging command and must never be placed in source, shell
+The release, development publisher, updater, CI dispatcher, merge, and release
+dispatcher use only GitHub's ephemeral repository-scoped `GITHUB_TOKEN` with
+job-specific permissions. There is no updater GitHub App, PAT, registry
+credential, repository or Environment secret, or automation Environment. The
+privileged merge workflow has no checkout, artifact download, pull request
+execution, or cache restore. Tokens must never be placed in source, shell
 history, workflow inputs, build arguments, artifacts, or cache keys.
+
+GitHub creates an approval-required ordinary workflow run for pull requests
+opened or updated by `GITHUB_TOKEN`. The updater therefore dispatches a second,
+validated CI run for the exact head. Before automatic merging is enabled, the
+first real bot update is a frozen rollout canary: the ordinary run stays
+unapproved while the dispatched `verify` and `runtime-image` jobs must satisfy
+the source-pinned ruleset and report the pull request mergeable.
 
 The first GHCR candidate is private by default. Before a GitHub Release can be
 created, an organization owner must make the linked

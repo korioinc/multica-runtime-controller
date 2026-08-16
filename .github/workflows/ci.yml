@@ -4,24 +4,154 @@ on:
   pull_request:
   push:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      pull_request_number:
+        description: Same-repository automation pull request number
+        required: true
+        type: string
+      head_sha:
+        description: Exact 40-character automation pull request head SHA
+        required: true
+        type: string
 
 permissions: {}
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || inputs.pull_request_number || github.ref }}
   cancel-in-progress: true
 
 jobs:
+  context:
+    name: context
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      automation: ${{ steps.resolve.outputs.automation }}
+      base_sha: ${{ steps.resolve.outputs.base_sha }}
+      cache_scope: ${{ steps.resolve.outputs.cache_scope }}
+      checkout_sha: ${{ steps.resolve.outputs.checkout_sha }}
+      pull_request_number: ${{ steps.resolve.outputs.pull_request_number }}
+    steps:
+      - name: Resolve and validate the immutable CI context
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_SHA: ${{ github.sha }}
+          EVENT_ACTOR: ${{ github.actor }}
+          EVENT_TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+          INPUT_HEAD_SHA: ${{ inputs.head_sha }}
+          INPUT_PULL_REQUEST_NUMBER: ${{ inputs.pull_request_number }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          case "$EVENT_NAME" in
+            workflow_dispatch)
+              case "$INPUT_HEAD_SHA" in
+                *[!0-9a-f]*|'') echo 'head_sha must be lowercase hexadecimal' >&2; exit 1 ;;
+              esac
+              [ "${#INPUT_HEAD_SHA}" -eq 40 ] || {
+                echo 'head_sha must contain exactly 40 characters' >&2
+                exit 1
+              }
+              case "$INPUT_PULL_REQUEST_NUMBER" in
+                *[!0-9]*|'') echo 'pull_request_number must be numeric' >&2; exit 1 ;;
+              esac
+              [ "$EVENT_SHA" = "$INPUT_HEAD_SHA" ] || {
+                printf 'dispatch ref moved: event=%s input=%s\n' \
+                  "$EVENT_SHA" "$INPUT_HEAD_SHA" >&2
+                exit 1
+              }
+              [ "$EVENT_ACTOR" = 'github-actions[bot]' ] && \
+                [ "$EVENT_TRIGGERING_ACTOR" = 'github-actions[bot]' ] || {
+                  printf 'unexpected dispatch actor: actor=%s triggering=%s\n' \
+                    "$EVENT_ACTOR" "$EVENT_TRIGGERING_ACTOR" >&2
+                  exit 1
+                }
+
+              pr=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$INPUT_PULL_REQUEST_NUMBER")
+              printf '%s' "$pr" | jq -e \
+                --arg repository "$GITHUB_REPOSITORY" \
+                --arg head "$INPUT_HEAD_SHA" '
+                  .state == "open" and
+                  .base.ref == "main" and
+                  .head.ref == "automation/runtime-versions" and
+                  .head.repo.full_name == $repository and
+                  .head.sha == $head and
+                  .user.login == "github-actions[bot]" and
+                  .commits == 1
+                ' >/dev/null
+              base_sha=$(printf '%s' "$pr" | jq -r .base.sha)
+
+              files=$(gh api --paginate \
+                "repos/$GITHUB_REPOSITORY/pulls/$INPUT_PULL_REQUEST_NUMBER/files?per_page=100" \
+                --jq '.[].filename' | LC_ALL=C sort)
+              expected=$(printf '%s\n' VERSION build/runtime-versions.env | LC_ALL=C sort)
+              [ "$files" = "$expected" ] || {
+                printf 'unexpected automation PR files:\n%s\n' "$files" >&2
+                exit 1
+              }
+
+              commit=$(gh api "repos/$GITHUB_REPOSITORY/commits/$INPUT_HEAD_SHA")
+              printf '%s' "$commit" | jq -e '
+                .author.login == "github-actions[bot]" and
+                .committer.login == "github-actions[bot]"
+              ' >/dev/null
+              compare=$(gh api \
+                "repos/$GITHUB_REPOSITORY/compare/main...$INPUT_HEAD_SHA")
+              printf '%s' "$compare" | jq -e '.behind_by == 0' >/dev/null
+
+              automation=true
+              checkout_sha=$INPUT_HEAD_SHA
+              pull_request_number=$INPUT_PULL_REQUEST_NUMBER
+              cache_scope="runtime-pr-$INPUT_PULL_REQUEST_NUMBER"
+              ;;
+            pull_request)
+              automation=false
+              base_sha=$PR_BASE_SHA
+              checkout_sha=$EVENT_SHA
+              pull_request_number=$PR_NUMBER
+              cache_scope="runtime-pr-$PR_NUMBER"
+              ;;
+            push)
+              automation=false
+              base_sha=$PUSH_BEFORE_SHA
+              checkout_sha=$EVENT_SHA
+              pull_request_number=
+              cache_scope=runtime-main
+              ;;
+            *)
+              printf 'unsupported event: %s\n' "$EVENT_NAME" >&2
+              exit 1
+              ;;
+          esac
+
+          {
+            printf 'automation=%s\n' "$automation"
+            printf 'base_sha=%s\n' "$base_sha"
+            printf 'cache_scope=%s\n' "$cache_scope"
+            printf 'checkout_sha=%s\n' "$checkout_sha"
+            printf 'pull_request_number=%s\n' "$pull_request_number"
+          } >>"$GITHUB_OUTPUT"
+
   verify:
     name: verify
+    needs: context
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
       contents: read
     steps:
-      - name: Check out source
+      - name: Check out the validated source revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ needs.context.outputs.checkout_sha }}
           fetch-depth: 0
           persist-credentials: false
       - name: Set up Go
@@ -34,40 +164,39 @@ jobs:
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:
           version: v4.2.2
+      - name: Validate the automation-only diff
+        if: needs.context.outputs.automation == 'true'
+        env:
+          BASE_SHA: ${{ needs.context.outputs.base_sha }}
+        run: python3 scripts/runtime_versions.py validate --base-ref "$BASE_SHA" --automation-diff
       - name: Verify repository
         run: make verify
 
   runtime-image:
     name: runtime-image
+    needs: context
     runs-on: ubuntu-latest
     timeout-minutes: 90
     permissions:
       contents: read
     steps:
-      - name: Check out source
+      - name: Check out the validated source revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ needs.context.outputs.checkout_sha }}
           fetch-depth: 0
           persist-credentials: false
       - name: Select image verification scope
         id: scope
         env:
-          EVENT_NAME: ${{ github.event_name }}
-          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          PUSH_BEFORE_SHA: ${{ github.event.before }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_SHA: ${{ needs.context.outputs.base_sha }}
+          CACHE_SCOPE: ${{ needs.context.outputs.cache_scope }}
         run: |
           set -eu
-          if [ "$EVENT_NAME" = pull_request ]; then
-            base=$PR_BASE_SHA
-            cache_scope="runtime-pr-$PR_NUMBER"
-          else
-            base=$PUSH_BEFORE_SHA
-            cache_scope=runtime-main
-          fi
-          if [ -z "$base" ] || [ "$base" = 0000000000000000000000000000000000000000 ]; then
+          if [ -z "$BASE_SHA" ] || \
+            [ "$BASE_SHA" = 0000000000000000000000000000000000000000 ]; then
             build=true
-          elif git diff --quiet "$base" HEAD -- \
+          elif git diff --quiet "$BASE_SHA" HEAD -- \
             Dockerfile .dockerignore VERSION build/runtime-versions.env scripts src; then
             build=false
           else
@@ -75,7 +204,7 @@ jobs:
           fi
           {
             echo "build=$build"
-            echo "cache_scope=$cache_scope"
+            echo "cache_scope=$CACHE_SCOPE"
           } >>"$GITHUB_OUTPUT"
           printf 'runtime image build required: %s\n' "$build" >>"$GITHUB_STEP_SUMMARY"
       - name: Reclaim runner disk for the cold multi-platform build
@@ -97,7 +226,7 @@ jobs:
         if: steps.scope.outputs.build == 'true'
         id: build-args
         env:
-          REVISION: ${{ github.sha }}
+          REVISION: ${{ needs.context.outputs.checkout_sha }}
         run: |
           set -eu
           python3 scripts/runtime_versions.py build-args \
