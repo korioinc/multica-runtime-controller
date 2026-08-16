@@ -892,6 +892,7 @@ def validate_actions(directory: Path) -> dict[str, Any]:
             "head_sha: $head",
             "ref: ${{ needs.context.outputs.checkout_sha }}",
             "runtime-pr-",
+            'git fetch --no-tags origin "$BASE_SHA"',
             "scripts/install-runtime-tools.sh scripts/runtime-entrypoint.sh",
             "scripts/verify-runtime-tools.sh src",
         ),
