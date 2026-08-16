@@ -1,15 +1,13 @@
 name: Runtime Version Auto Merge
 
 on:
-  workflow_run:
-    workflows: [CI]
-    types: [completed]
-    branches: [main]
+  repository_dispatch:
+    types: [automation-merge]
 
 permissions: {}
 
 concurrency:
-  group: runtime-version-auto-merge-${{ github.event.workflow_run.id }}
+  group: runtime-version-auto-merge-${{ github.event.client_payload.run_id }}
   cancel-in-progress: false
 
 jobs:
@@ -17,11 +15,9 @@ jobs:
     name: merge
     if: >-
       vars.RELEASE_AUTOMATION_ENABLED == 'true' &&
-      github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.event == 'repository_dispatch' &&
-      (startsWith(github.event.workflow_run.display_title, 'CI automation runtime-update ') ||
-       startsWith(github.event.workflow_run.display_title, 'CI automation release-patch ') ||
-       startsWith(github.event.workflow_run.display_title, 'CI automation sync-main '))
+      (github.event.client_payload.kind == 'runtime-update' ||
+       github.event.client_payload.kind == 'release-patch' ||
+       github.event.client_payload.kind == 'sync-main')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -36,12 +32,17 @@ jobs:
         id: merge
         env:
           GH_TOKEN: ${{ github.token }}
-          RUN_ID: ${{ github.event.workflow_run.id }}
-          RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
-          EVENT_WORKFLOW_SHA: ${{ github.event.workflow_run.head_sha }}
-          EVENT_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
-          EVENT_ACTOR: ${{ github.event.workflow_run.actor.login }}
-          EVENT_TRIGGERING_ACTOR: ${{ github.event.workflow_run.triggering_actor.login }}
+          RUN_ID: ${{ github.event.client_payload.run_id }}
+          RUN_ATTEMPT: ${{ github.event.client_payload.run_attempt }}
+          INPUT_KIND: ${{ github.event.client_payload.kind }}
+          INPUT_PULL_REQUEST_NUMBER: ${{ github.event.client_payload.pull_request_number }}
+          INPUT_HEAD_SHA: ${{ github.event.client_payload.head_sha }}
+          INPUT_WORKFLOW_SHA: ${{ github.event.client_payload.workflow_sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_REF: ${{ github.ref }}
+          EVENT_WORKFLOW_SHA: ${{ github.sha }}
+          EVENT_ACTOR: ${{ github.actor }}
+          EVENT_TRIGGERING_ACTOR: ${{ github.triggering_actor }}
         run: |
           # jq programs and expected JSON are intentionally literal.
           # shellcheck disable=SC2016
@@ -52,23 +53,49 @@ jobs:
           case "$RUN_ATTEMPT" in
             *[!0-9]*|'') echo 'run attempt must be numeric' >&2; exit 1 ;;
           esac
+          [ "$EVENT_NAME" = repository_dispatch ]
+          [ "$EVENT_REF" = refs/heads/main ]
           case "$EVENT_WORKFLOW_SHA" in
             *[!0-9a-f]*|'') echo 'workflow SHA must be lowercase hexadecimal' >&2; exit 1 ;;
           esac
           [ "${#EVENT_WORKFLOW_SHA}" -eq 40 ]
-          [ "$EVENT_HEAD_BRANCH" = main ]
+          [ "$EVENT_WORKFLOW_SHA" = "$INPUT_WORKFLOW_SHA" ]
           [ "$EVENT_ACTOR" = 'github-actions[bot]' ]
           [ "$EVENT_TRIGGERING_ACTOR" = 'github-actions[bot]' ]
+          case "$INPUT_KIND" in
+            runtime-update|release-patch|sync-main) ;;
+            *) printf 'unsupported automation kind: %s\n' "$INPUT_KIND" >&2; exit 1 ;;
+          esac
+          case "$INPUT_PULL_REQUEST_NUMBER" in
+            *[!0-9]*|'') echo 'pull request number must be numeric' >&2; exit 1 ;;
+          esac
+          case "$INPUT_HEAD_SHA" in
+            *[!0-9a-f]*|'') echo 'automation head must be lowercase hexadecimal' >&2; exit 1 ;;
+          esac
+          [ "${#INPUT_HEAD_SHA}" -eq 40 ]
 
           expected_workflow_id=$(gh api \
             "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml" --jq .id)
-          run=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID")
+          run=
+          for _ in $(seq 1 30); do
+            run=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID")
+            status=$(printf '%s' "$run" | jq -r .status)
+            [ "$status" != completed ] || break
+            sleep 2
+          done
+          [ "$(printf '%s' "$run" | jq -r .status)" = completed ] || {
+            printf 'source CI run %s did not complete before the merge deadline\n' \
+              "$RUN_ID" >&2
+            exit 1
+          }
+          expected_title="CI automation $INPUT_KIND PR-$INPUT_PULL_REQUEST_NUMBER SHA-$INPUT_HEAD_SHA"
           printf '%s' "$run" | jq -e \
             --argjson run_id "$RUN_ID" \
             --argjson run_attempt "$RUN_ATTEMPT" \
             --argjson workflow_id "$expected_workflow_id" \
             --arg repository "$GITHUB_REPOSITORY" \
-            --arg workflow_sha "$EVENT_WORKFLOW_SHA" '
+            --arg workflow_sha "$EVENT_WORKFLOW_SHA" \
+            --arg title "$expected_title" '
               .id == $run_id and
               .run_attempt == $run_attempt and
               .workflow_id == $workflow_id and
@@ -80,6 +107,7 @@ jobs:
               .repository.full_name == $repository and
               .head_branch == "main" and
               .head_sha == $workflow_sha and
+              .display_title == $title and
               .actor.login == "github-actions[bot]" and
               .triggering_actor.login == "github-actions[bot]"
             ' >/dev/null
@@ -99,6 +127,9 @@ jobs:
           IFS=$'\t' read -r automation_kind pull_request_number automation_head <<EOF
           $identity
           EOF
+          [ "$automation_kind" = "$INPUT_KIND" ]
+          [ "$pull_request_number" = "$INPUT_PULL_REQUEST_NUMBER" ]
+          [ "$automation_head" = "$INPUT_HEAD_SHA" ]
           case "$automation_head" in
             *[!0-9a-f]*|'') echo 'automation head must be lowercase hexadecimal' >&2; exit 1 ;;
           esac
@@ -127,7 +158,7 @@ jobs:
 
           jobs_pages=$(gh api --paginate --slurp \
             "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT/jobs?per_page=100")
-          expected_names='["automation-runtime-image","automation-runtime-image-amd64","automation-runtime-image-arm64","automation-verify","context","publish-checks"]'
+          expected_names='["automation-runtime-image","automation-runtime-image-amd64","automation-runtime-image-arm64","automation-verify","context","dispatch-merge","publish-checks"]'
           actual_names=$(printf '%s' "$jobs_pages" | jq -c \
             '[.[].jobs[].name] | sort')
           [ "$actual_names" = "$expected_names" ] || {
@@ -136,7 +167,7 @@ jobs:
           }
           printf '%s' "$jobs_pages" | jq -e '
             [.[].jobs[]] as $jobs |
-            ($jobs | length) == 6 and
+            ($jobs | length) == 7 and
             all($jobs[]; .status == "completed" and .conclusion == "success")
           ' >/dev/null
 

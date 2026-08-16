@@ -486,3 +486,69 @@ jobs:
                 -H 'Accept: application/vnd.github+json' \
                 "repos/$GITHUB_REPOSITORY/check-runs" --input - >/dev/null
           done
+
+  dispatch-merge:
+    name: dispatch-merge
+    if: >-
+      always() &&
+      github.event_name == 'repository_dispatch' &&
+      needs.context.result == 'success' &&
+      needs.verify.result == 'success' &&
+      needs.runtime-image.result == 'success' &&
+      needs.publish-checks.result == 'success' &&
+      needs.context.outputs.automation_kind != 'promotion'
+    needs: [context, verify, runtime-image, publish-checks]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Dispatch the trusted merge gate for this exact completed CI attempt
+        env:
+          GH_TOKEN: ${{ github.token }}
+          AUTOMATION_KIND: ${{ needs.context.outputs.automation_kind }}
+          HEAD_SHA: ${{ needs.context.outputs.checkout_sha }}
+          PULL_REQUEST_NUMBER: ${{ needs.context.outputs.pull_request_number }}
+          SOURCE_RUN_ID: ${{ github.run_id }}
+          SOURCE_RUN_ATTEMPT: ${{ github.run_attempt }}
+          WORKFLOW_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          case "$AUTOMATION_KIND" in
+            runtime-update|release-patch|sync-main) ;;
+            *) printf 'unsupported merge kind: %s\n' "$AUTOMATION_KIND" >&2; exit 1 ;;
+          esac
+          case "$HEAD_SHA" in
+            *[!0-9a-f]*|'') echo 'head SHA must be lowercase hexadecimal' >&2; exit 1 ;;
+          esac
+          [ "${#HEAD_SHA}" -eq 40 ]
+          case "$PULL_REQUEST_NUMBER" in
+            *[!0-9]*|'') echo 'pull request number must be numeric' >&2; exit 1 ;;
+          esac
+          case "$SOURCE_RUN_ID" in
+            *[!0-9]*|'') echo 'source run ID must be numeric' >&2; exit 1 ;;
+          esac
+          case "$SOURCE_RUN_ATTEMPT" in
+            *[!0-9]*|'') echo 'source run attempt must be numeric' >&2; exit 1 ;;
+          esac
+          live_main=$(gh api \
+            "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)
+          [ "$WORKFLOW_SHA" = "$live_main" ] || {
+            printf 'trusted workflow moved: workflow=%s live-main=%s\n' \
+              "$WORKFLOW_SHA" "$live_main" >&2
+            exit 1
+          }
+
+          jq -n \
+            --arg kind "$AUTOMATION_KIND" \
+            --arg number "$PULL_REQUEST_NUMBER" \
+            --arg head "$HEAD_SHA" \
+            --arg workflow_sha "$WORKFLOW_SHA" \
+            --argjson run_id "$SOURCE_RUN_ID" \
+            --argjson run_attempt "$SOURCE_RUN_ATTEMPT" \
+            '{event_type:"automation-merge",client_payload:{kind:$kind,pull_request_number:$number,head_sha:$head,workflow_sha:$workflow_sha,run_id:$run_id,run_attempt:$run_attempt}}' \
+            | gh api --method POST \
+                "repos/$GITHUB_REPOSITORY/dispatches" \
+                --input -
+          printf 'Dispatched the merge gate for run %s attempt %s.\n' \
+            "$SOURCE_RUN_ID" "$SOURCE_RUN_ATTEMPT" >>"$GITHUB_STEP_SUMMARY"
