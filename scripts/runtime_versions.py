@@ -1698,6 +1698,17 @@ def validate_actions(directory: Path) -> dict[str, Any]:
     if unexpected:
         raise ResolverError(f"unexpected_workflow files={','.join(unexpected)}")
 
+    repository_context_pattern = re.compile(
+        r"(?m)^env:\n  GH_REPO: \$\{\{ github\.repository \}\}\s*$"
+    )
+    for file_name in (
+        "create-develop-to-main-pr.yml",
+        "release-repair.yml",
+        "release-repair-guard.yml",
+    ):
+        if repository_context_pattern.search(workflow_texts[file_name]) is None:
+            raise ResolverError(f"workflow_repository_context_missing file={file_name}")
+
     ci = workflow_texts["ci.yml"]
     if "docker/setup-qemu-action" in ci or "platforms: linux/amd64,linux/arm64" in ci:
         raise ResolverError("ci_native_platform_build_required")
@@ -2251,10 +2262,6 @@ def validate_actions(directory: Path) -> dict[str, Any]:
         repair = workflow_texts.get(file_name)
         if repair is None:
             raise ResolverError(f"required_workflow_missing files={file_name}")
-        if not re.search(
-            r"(?m)^env:\n  GH_REPO: \$\{\{ github\.repository \}\}\s*$", repair
-        ):
-            raise ResolverError(f"repair_workflow_repository_context_missing file={file_name}")
         for forbidden in (
             "download-artifact@",
             "actions/cache@",

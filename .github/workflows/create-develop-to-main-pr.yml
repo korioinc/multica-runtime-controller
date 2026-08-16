@@ -18,6 +18,9 @@ on:
 
 permissions: {}
 
+env:
+  GH_REPO: ${{ github.repository }}
+
 concurrency:
   group: create-develop-to-main-pr
   cancel-in-progress: false
