@@ -68,12 +68,12 @@ jobs:
                   "$EVENT_SHA" "$INPUT_HEAD_SHA" >&2
                 exit 1
               }
-              [ "$EVENT_ACTOR" = 'github-actions[bot]' ] && \
-                [ "$EVENT_TRIGGERING_ACTOR" = 'github-actions[bot]' ] || {
+              if ! { [ "$EVENT_ACTOR" = 'github-actions[bot]' ] && \
+                [ "$EVENT_TRIGGERING_ACTOR" = 'github-actions[bot]' ]; }; then
                   printf 'unexpected dispatch actor: actor=%s triggering=%s\n' \
                     "$EVENT_ACTOR" "$EVENT_TRIGGERING_ACTOR" >&2
                   exit 1
-                }
+              fi
 
               pr=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$INPUT_PULL_REQUEST_NUMBER")
               printf '%s' "$pr" | jq -e \
