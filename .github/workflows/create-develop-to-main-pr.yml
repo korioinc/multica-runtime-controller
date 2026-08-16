@@ -297,7 +297,7 @@ jobs:
               .head.ref == "automation/sync-main" and
               .head.sha == $head and
               .user.login == "github-actions[bot]" and
-              .commits == 1
+              .commits == 2
             ' >/dev/null
           files=$(gh api --paginate \
             "repos/$GITHUB_REPOSITORY/pulls/$number/files?per_page=100" \
