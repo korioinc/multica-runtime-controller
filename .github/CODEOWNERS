@@ -1,9 +1,7 @@
-* @jskorlol
-
-/.github/ @jskorlol
-/scripts/ @jskorlol
+# Changes to the trusted automation boundary require the repository owner.
+/.github/** @jskorlol
+/.dockerignore @jskorlol
 /Dockerfile @jskorlol
 /Makefile @jskorlol
-/VERSION @jskorlol
-/build/runtime-versions.env @jskorlol
 /SECURITY.md @jskorlol
+/scripts/** @jskorlol

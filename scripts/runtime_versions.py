@@ -767,8 +767,32 @@ def validate_actions(directory: Path) -> dict[str, Any]:
         raise ResolverError("no_workflows_found")
     action_count = 0
     checkout_count = 0
+    workflow_texts: dict[str, str] = {}
+    workflow_jobs: dict[str, dict[str, str]] = {}
+
+    def permissions_for(block: str) -> dict[str, str]:
+        marker = re.search(r"(?m)^    permissions:\s*$", block)
+        if marker is None:
+            return {}
+        permissions: dict[str, str] = {}
+        for line in block[marker.end() :].splitlines():
+            if line and len(line) - len(line.lstrip()) <= 4:
+                break
+            match = re.fullmatch(r"\s{6}([a-z-]+):\s*(read|write|none)\s*", line)
+            if match:
+                permissions[match.group(1)] = match.group(2)
+        return permissions
+
+    def require_fragments(file_name: str, text: str, fragments: tuple[str, ...]) -> None:
+        for fragment in fragments:
+            if fragment not in text:
+                raise ResolverError(
+                    f"workflow_contract_missing file={file_name} fragment={fragment}"
+                )
+
     for path in workflows:
         text = path.read_text(encoding="utf-8")
+        workflow_texts[path.name] = text
         if re.search(r"DOCKERHUB_|docker\.io/jskorlol/multica-runtime-controller", text):
             raise ResolverError(f"legacy_registry_reference file={path}")
         if not re.search(r"(?m)^permissions:\s*\{\}\s*$", text):
@@ -812,17 +836,326 @@ def validate_actions(directory: Path) -> dict[str, Any]:
         job_matches = list(re.finditer(r"(?m)^  ([A-Za-z0-9_-]+):\s*$", job_text))
         if not job_matches:
             raise ResolverError(f"workflow_job_definitions_missing file={path}")
+        blocks: dict[str, str] = {}
         for job_index, job_match in enumerate(job_matches):
             end = job_matches[job_index + 1].start() if job_index + 1 < len(job_matches) else len(job_text)
             block = job_text[job_match.start() : end]
             job_name = job_match.group(1)
+            blocks[job_name] = block
             if not re.search(r"(?m)^    permissions:\s*$", block):
                 raise ResolverError(f"job_permissions_missing file={path} job={job_name}")
-            if "AUTOMATION_APP_PRIVATE_KEY" in block and "packages: write" in block:
-                raise ResolverError(f"job_combines_write_credentials file={path} job={job_name}")
+        workflow_jobs[path.name] = blocks
+        if re.search(r"(?m)^  workflow_dispatch:\s*$", text):
+            raise ResolverError(
+                f"privileged_ref_selectable_dispatch_forbidden file={path}"
+            )
         if re.search(r"(?m)^  pull_request:\s*$", text):
             if "secrets." in text or re.search(r"(?m)^\s+environment:\s*", text):
                 raise ResolverError(f"pull_request_workflow_is_privileged file={path}")
+
+    required_workflows = {
+        "ci.yml",
+        "create-develop-to-main-pr.yml",
+        "runtime-version-update.yml",
+        "runtime-version-auto-merge.yml",
+    }
+    missing = sorted(required_workflows - set(workflow_texts))
+    if missing:
+        raise ResolverError(f"required_workflow_missing files={','.join(missing)}")
+
+    ci = workflow_texts["ci.yml"]
+    ci_on = ci[ci.index("on:") : ci.index("permissions:")]
+    if re.search(r"(?m)^\s+paths(?:-ignore)?:", ci_on):
+        raise ResolverError("ci_pull_request_paths_filter_forbidden")
+    require_fragments(
+        "ci.yml",
+        ci,
+        (
+            "  pull_request:",
+            "  repository_dispatch:",
+            "types: [automation-ci]",
+            "runtime-update",
+            "release-patch",
+            "sync-main",
+            "promotion",
+            '.base.ref == "develop"',
+            '.head.ref == "develop"',
+            "EVENT_SHA: ${{ github.sha }}",
+            "EVENT_REF: ${{ github.ref }}",
+            "INPUT_HEAD_SHA: ${{ github.event.client_payload.head_sha }}",
+            '[ "$EVENT_REF" = refs/heads/main ]',
+            '[ "$EVENT_SHA" = "$live_main" ]',
+            "CI automation {0} PR-{1} SHA-{2}",
+            "automation-verify",
+            "automation-runtime-image",
+            '"repos/$GITHUB_REPOSITORY/check-runs"',
+            "head_sha: $head",
+            "ref: ${{ needs.context.outputs.checkout_sha }}",
+            "runtime-pr-",
+            'git fetch --no-tags origin "$BASE_SHA"',
+            "scripts/install-runtime-tools.sh scripts/runtime-entrypoint.sh",
+            "scripts/verify-runtime-tools.sh src",
+        ),
+    )
+    expected_ci_permissions = {
+        "context": {"contents": "read", "pull-requests": "read"},
+        "verify": {"contents": "read"},
+        "runtime-image": {"contents": "read"},
+        "publish-checks": {
+            "checks": "write",
+            "contents": "read",
+            "pull-requests": "read",
+        },
+    }
+    for job_name, expected in expected_ci_permissions.items():
+        block = workflow_jobs["ci.yml"].get(job_name)
+        if block is None:
+            raise ResolverError(f"ci_job_missing job={job_name}")
+        actual = permissions_for(block)
+        if actual != expected:
+            raise ResolverError(
+                f"ci_job_permissions_mismatch job={job_name} expected={expected} actual={actual}"
+            )
+
+    updater = workflow_texts["runtime-version-update.yml"]
+    for forbidden in (
+        "AUTOMATION_APP_",
+        "actions/create-github-app-token",
+        "secrets.",
+        "environment:",
+        "gh pr merge",
+    ):
+        if forbidden in updater:
+            raise ResolverError(
+                f"updater_forbidden_fragment fragment={forbidden}"
+            )
+    require_fragments(
+        "runtime-version-update.yml",
+        updater,
+        (
+            "cron: '0 */4 * * *'",
+            "types: [runtime-version-update]",
+            "vars.RELEASE_AUTOMATION_ENABLED == 'true'",
+            "github.token",
+            "automation/runtime-versions",
+            "--base develop",
+            'kind:"runtime-update"',
+            '{event_type:"automation-ci",client_payload:{kind:"runtime-update"',
+            '"repos/$GITHUB_REPOSITORY/dispatches"',
+            "pull_request_number",
+            "head_sha",
+        ),
+    )
+    propose = workflow_jobs["runtime-version-update.yml"].get("propose")
+    if propose is None:
+        raise ResolverError("updater_job_missing job=propose")
+    expected_propose = {
+        "contents": "write",
+        "pull-requests": "write",
+    }
+    actual_propose = permissions_for(propose)
+    if actual_propose != expected_propose:
+        raise ResolverError(
+            f"updater_job_permissions_mismatch expected={expected_propose} actual={actual_propose}"
+        )
+
+    merge_workflow = workflow_texts["runtime-version-auto-merge.yml"]
+    for forbidden in (
+        "uses:",
+        "secrets.",
+        "environment:",
+        "actions/checkout",
+        "download-artifact",
+        "actions/cache",
+        "git checkout",
+        "make ",
+        "./scripts/",
+        "actions/workflows/release.yml/dispatches",
+    ):
+        if forbidden in merge_workflow:
+            raise ResolverError(
+                f"merge_workflow_forbidden_fragment fragment={forbidden}"
+            )
+    require_fragments(
+        "runtime-version-auto-merge.yml",
+        merge_workflow,
+        (
+            "  workflow_run:",
+            "workflows: [CI]",
+            "types: [completed]",
+            "branches: [main]",
+            "vars.RELEASE_AUTOMATION_ENABLED == 'true'",
+            "startsWith(github.event.workflow_run.display_title, 'CI automation runtime-update ')",
+            "startsWith(github.event.workflow_run.display_title, 'CI automation release-patch ')",
+            "startsWith(github.event.workflow_run.display_title, 'CI automation sync-main ')",
+            "EVENT_WORKFLOW_SHA",
+            "display_title",
+            "CI automation",
+            "automation/runtime-versions",
+            "automation/release-patch",
+            "automation/sync-main",
+            "github.event.workflow_run.id",
+            "github.event.workflow_run.run_attempt",
+            ".github/workflows/ci.yml",
+            "triggering_actor",
+            "attempts/$RUN_ATTEMPT/jobs",
+            '["automation-runtime-image","automation-verify","context","publish-checks"]',
+            "--match-head-commit",
+            "compare/develop...$automation_head",
+            "--merge --delete-branch",
+            "--squash --delete-branch",
+            'event == "repository_dispatch"',
+            '{event_type:"reconcile-develop",client_payload:{revision:$revision}}',
+            '"repos/$GITHUB_REPOSITORY/dispatches"',
+        ),
+    )
+    expected_merge_permissions = {
+        "actions": "read",
+        "contents": "write",
+        "pull-requests": "write",
+    }
+    expected_dispatch_permissions = {"contents": "write"}
+    for job_name, expected in (
+        ("merge", expected_merge_permissions),
+        ("dispatch-develop", expected_dispatch_permissions),
+    ):
+        block = workflow_jobs["runtime-version-auto-merge.yml"].get(job_name)
+        if block is None:
+            raise ResolverError(f"merge_workflow_job_missing job={job_name}")
+        actual = permissions_for(block)
+        if actual != expected:
+            raise ResolverError(
+                f"merge_workflow_permissions_mismatch job={job_name} "
+                f"expected={expected} actual={actual}"
+            )
+
+    promotion = workflow_texts["create-develop-to-main-pr.yml"]
+    for forbidden in (
+        "HEAD:refs/heads/develop",
+        "git merge origin/main",
+        "--head \"$GITHUB_REPOSITORY_OWNER:develop\"",
+        "cancel-in-progress: true",
+    ):
+        if forbidden in promotion:
+            raise ResolverError(
+                f"promotion_workflow_forbidden_fragment fragment={forbidden}"
+            )
+    require_fragments(
+        "create-develop-to-main-pr.yml",
+        promotion,
+        (
+            "branches: [develop]",
+            "branches: [main]",
+            "vars.RELEASE_AUTOMATION_ENABLED == 'true'",
+            "cron: '0 * * * *'",
+            "  repository_dispatch:",
+            "types: [reconcile-develop]",
+            "FORCE_RELEASE: ${{ github.event.client_payload.force_release }}",
+            "forced release requires identical main and develop trees",
+            "cancel-in-progress: false",
+            "mode='bootstrap'",
+            "mode='sync'",
+            "automation/release-patch",
+            "automation/sync-main",
+            "git merge --no-ff --no-edit \"$MAIN_SHA\"",
+            "gh pr create --base develop --head \"$branch\"",
+            'kind:"release-patch"',
+            'kind:"sync-main"',
+            "gh pr create --base main --head develop",
+            'kind:"promotion"',
+            '{event_type:"automation-ci",client_payload:',
+            '{event_type:"development-image",client_payload:',
+            '"repos/$GITHUB_REPOSITORY/dispatches"',
+        ),
+    )
+    expected_promotion_permissions = {
+        "resolve": {"contents": "read"},
+        "write-sync": {"contents": "write"},
+        "propose-sync": {
+            "contents": "write",
+            "pull-requests": "write",
+        },
+        "write-patch": {"contents": "write"},
+        "propose-patch": {
+            "contents": "write",
+            "pull-requests": "write",
+        },
+        "promote": {
+            "contents": "write",
+            "pull-requests": "write",
+        },
+    }
+    for job_name, expected in expected_promotion_permissions.items():
+        block = workflow_jobs["create-develop-to-main-pr.yml"].get(job_name)
+        if block is None:
+            raise ResolverError(f"promotion_job_missing job={job_name}")
+        actual = permissions_for(block)
+        if actual != expected:
+            raise ResolverError(
+                f"promotion_job_permissions_mismatch job={job_name} "
+                f"expected={expected} actual={actual}"
+            )
+
+    development = workflow_texts.get("develop-image.yml")
+    if development is None:
+        raise ResolverError("required_workflow_missing files=develop-image.yml")
+    development_verify = workflow_jobs["develop-image.yml"].get("verify")
+    if development_verify is None or "if: vars.RELEASE_AUTOMATION_ENABLED == 'true'" not in development_verify:
+        raise ResolverError("development_image_activation_gate_missing job=verify")
+    require_fragments(
+        "develop-image.yml",
+        development,
+        (
+            "  repository_dispatch:",
+            "types: [development-image]",
+            "run-name: Development image ${{ github.event.client_payload.revision }}",
+            '[ "$EVENT_REF" = refs/heads/main ]',
+            '[ "$EVENT_SHA" = "$live_main" ]',
+            '"repos/$GITHUB_REPOSITORY/git/ref/heads/develop"',
+            "revision: ${{ steps.context.outputs.revision }}",
+            "develop-${{ needs.verify.outputs.revision }}",
+            "build_args: ${{ steps.build-args.outputs.value }}",
+            "build-args: ${{ needs.verify.outputs.build_args }}",
+        ),
+    )
+    codeowners = directory.parent / "CODEOWNERS"
+    if not codeowners.is_file():
+        raise ResolverError("trusted_automation_codeowners_missing")
+    codeowners_text = codeowners.read_text(encoding="utf-8")
+    for fragment in (
+        "/.github/** @jskorlol",
+        "/.dockerignore @jskorlol",
+        "/Dockerfile @jskorlol",
+        "/Makefile @jskorlol",
+        "/SECURITY.md @jskorlol",
+        "/scripts/** @jskorlol",
+    ):
+        if fragment not in codeowners_text:
+            raise ResolverError(
+                f"trusted_automation_codeowner_missing fragment={fragment}"
+            )
+
+    release = workflow_texts.get("release.yml")
+    if release is None:
+        raise ResolverError("required_workflow_missing files=release.yml")
+    release_plan = workflow_jobs["release.yml"].get("plan")
+    if release_plan is None or "if: vars.RELEASE_AUTOMATION_ENABLED == 'true'" not in release_plan:
+        raise ResolverError("release_activation_gate_missing job=plan")
+    require_fragments(
+        "release.yml",
+        release,
+        (
+            "  repository_dispatch:",
+            "types: [stable-release-recovery]",
+            "INPUT_VERSION: ${{ github.event.client_payload.version }}",
+            "INPUT_REVISION: ${{ github.event.client_payload.revision }}",
+            "pull-requests: read",
+            '.merged_by.login == "jskorlol"',
+            '.user.login == "jskorlol"',
+            '.state == "APPROVED"',
+            ".commit_id == $head",
+        ),
+    )
     if checkout_count == 0:
         raise ResolverError("no_checkout_steps_found")
     return {"workflows": len(workflows), "external_actions": action_count, "checkouts": checkout_count}

@@ -74,35 +74,71 @@ a `LICENSE` file is added by the repository owner. Report vulnerabilities only
 through the private process in [SECURITY.md](SECURITY.md), never in public
 issues, pull requests, logs, or artifacts.
 
-Four workflows own delivery:
+Six workflows own delivery:
 
-- `CI` is read-only and secret-free. `CI / verify` and `CI / runtime-image` are
-  required for every pull request.
+- `CI` is read-only and secret-free. Its literal `verify` and `runtime-image`
+  jobs are the required checks for every pull request. Automation uses a
+  `repository_dispatch` event so GitHub always loads the reviewed default-branch
+  copy against an exact bot PR head; the workflow rejects a moved trusted ref
+  or mismatched pull request.
 - `Runtime Version Update` runs at minute 0 every four hours UTC and can also
-  be dispatched manually. It reads only the fixed official Multica, Codex, and
-  Pi sources, maintains one `automation/runtime-versions` pull request, and
-  requests native squash auto-merge after both required checks pass.
-- `Development Image` runs only for pushes to `develop`. A read-only verify job
-  must pass before a separate package-write job publishes the same multi-arch
-  digest as `develop` and `develop-<full-commit-SHA>`. It uses its own
+  be started with the `runtime-version-update` repository-dispatch event. It
+  reads only the fixed official Multica, Codex, and
+  Pi sources, maintains one `automation/runtime-versions` pull request into
+  `develop` with the run-scoped `GITHUB_TOKEN`, and dispatches exact-head CI.
+  It never writes to `main`.
+- `Runtime Version Auto Merge` is a separate trusted `workflow_run`. It checks
+  the triggering workflow, run attempt, actors, repository, branch, head,
+  current pull request, files, commit identity, and the exact successful CI
+  jobs without checking out or executing pull request code. A least-privilege
+  merge job performs matched-head squash merges for runtime updates and
+  release-patch PRs into protected `develop`. A main-ancestry sync PR is the
+  sole merge-commit case. A separate contents-write job sends a trusted
+  repository-dispatch reconciliation for the exact merge SHA.
+- `Create develop into main PR` runs only from the reviewed `main` copy: after
+  successful `develop` push CI, after `main` pushes, once per hour, and on an
+  exact-revision repository dispatch. A force-release payload can create the
+  first patch after bootstrap only when the two branch trees are identical.
+  After each squash promotion it first preserves the
+  new `main` commit in `develop` through one empty-tree, two-parent sync PR.
+  When source changed without a release version, it creates one bot-owned
+  `automation/release-patch` PR that changes only `VERSION`. It then maintains
+  one `develop` into `main` promotion PR and dispatches trusted exact-head CI.
+  The promotion requires repository-owner approval; this workflow never
+  merges it.
+- `Development Image` is repository-dispatch-only and always loads the reviewed
+  default-branch workflow with the exact live `develop` SHA as input. A read-only verify job
+  resolves all build arguments before the separate package-write job checks
+  out the source and publishes the same multi-arch digest as `develop` and
+  `develop-<full-commit-SHA>`. It uses its own
   `runtime-develop` write cache, may restore the trusted `runtime-main` cache,
   and never changes stable version tags, `latest`, or a GitHub Release.
-- `Release` runs when `VERSION` changes on `main`. Manual recovery requires the
-  exact stable version and the original full 40-character revision.
+- `Release` runs when the reviewed develop promotion changes `VERSION` on
+  `main`. Recovery uses the `stable-release-recovery` repository-dispatch event
+  with the exact stable version and full 40-character main revision.
 
-The only long-lived privileged credential is owned by the `automation`
-Environment: variable `AUTOMATION_APP_ID` and secret
-`AUTOMATION_APP_PRIVATE_KEY`. That Environment allows exactly the `main`
-branch. The App is installed only on this repository with Contents and Pull
-Requests read/write permissions and has no ruleset, workflow, package, or
-administration access. Release jobs publish to
-`ghcr.io/korioinc/multica-runtime-controller` with the ephemeral,
-repository-scoped `GITHUB_TOKEN`; no registry PAT or repository secret is
-required. The development publisher uses the same ephemeral credential in its
-package-write job and receives no Environment secret. Secret values must be
-entered through GitHub's secret UI or an
-interactive non-logging command and must never be placed in source, shell
+The release, development publisher, updater, CI dispatcher, merge, and develop
+promotion dispatcher use only GitHub's ephemeral repository-scoped `GITHUB_TOKEN` with
+job-specific permissions. There is no updater GitHub App, PAT, registry
+credential, repository or Environment secret, or automation Environment. The
+privileged merge workflow has no checkout, artifact download, pull request
+execution, or cache restore. Tokens must never be placed in source, shell
 history, workflow inputs, build arguments, artifacts, or cache keys.
+
+The non-secret repository variable `RELEASE_AUTOMATION_ENABLED` is the rollout
+gate. Bootstrap installs the reviewed workflows first; operators set it to
+`true` only after both branch rulesets are active and verified.
+
+GitHub creates an approval-required ordinary workflow run for pull requests
+opened or updated by `GITHUB_TOKEN`. Automation therefore sends a second,
+validated repository-dispatch CI run for the exact PR head. Repository dispatch
+always selects the reviewed default-branch workflow definition. The `develop` ruleset
+requires those source-pinned checks with strict base freshness and permits
+squash plus the ancestry-sync merge commit. The `main` ruleset is also strict
+and requires the same checks plus repository-owner review. `CODEOWNERS`
+protects every workflow and its policy validator; neither branch ruleset has a
+bypass actor. The release workflow independently revalidates that `jskorlol`
+approved the exact `develop` head and merged the promotion.
 
 The first GHCR candidate is private by default. Before a GitHub Release can be
 created, an organization owner must make the linked
@@ -124,7 +160,7 @@ GitHub's scheduled workflows are a polling cadence, not a four-hour SLA: runs
 can be delayed, and a public repository schedule can be disabled after 60 days
 without repository activity. Treat a last successful updater run older than
 eight hours as an operational alert, re-enable the workflow if needed, and use
-manual dispatch to reconcile it. Kubernetes/Helm deployment remains a separate
+the corresponding repository-dispatch event to reconcile it. Kubernetes/Helm deployment remains a separate
 operation and is not performed by either automation workflow.
 
 ## Mount Runtime Configuration
