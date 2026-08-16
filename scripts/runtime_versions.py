@@ -1222,6 +1222,8 @@ def validate_actions(directory: Path) -> dict[str, Any]:
         raise ResolverError("release_activation_gate_missing job=plan")
     if "docker/setup-qemu-action" in release or "platforms: linux/amd64,linux/arm64" in release:
         raise ResolverError("release_native_platform_build_required")
+    if ".bypass_actors == []" in release:
+        raise ResolverError("release_requires_private_ruleset_field")
     require_fragments(
         "release.yml",
         release,
