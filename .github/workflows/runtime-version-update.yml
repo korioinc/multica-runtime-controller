@@ -1,30 +1,29 @@
-name: Runtime Version Update
+name: CLI Version Update
 
 on:
   schedule:
     - cron: '0 */4 * * *'
-  repository_dispatch:
-    types: [runtime-version-update]
+  workflow_dispatch:
 
 permissions: {}
 
 concurrency:
-  group: runtime-version-update
+  group: cli-version-update
   cancel-in-progress: false
 
 jobs:
-  resolve:
-    name: resolve
-    if: vars.RELEASE_AUTOMATION_ENABLED == 'true'
+  update:
+    name: update-cli-version
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    env:
-      TARGET_ROOT: ${{ github.workspace }}
+    timeout-minutes: 60
     permissions:
-      contents: read
-    outputs:
-      updates: ${{ steps.check.outputs.updates }}
-      has_updates: ${{ steps.check.outputs.has_updates }}
+      checks: read
+      contents: write
+      pull-requests: write
+    env:
+      GH_REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ github.token }}
+      TARGET_ROOT: ${{ github.workspace }}
     steps:
       - name: Check out develop
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -32,211 +31,103 @@ jobs:
           ref: develop
           fetch-depth: 0
           persist-credentials: false
-      - name: Load the resolver from the exact trusted main revision
-        env:
-          EVENT_WORKFLOW_SHA: ${{ github.sha }}
-          GH_TOKEN: ${{ github.token }}
-          TRUSTED_RESOLVER: ${{ runner.temp }}/trusted-runtime-versions.py
+      - name: Update the Multica CLI and patch version
+        id: update
         run: |
           set -euo pipefail
-          live_main=$(gh api \
-            "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)
-          [ "$EVENT_WORKFLOW_SHA" = "$live_main" ] || {
-            printf 'trusted workflow moved: event=%s live-main=%s\n' \
-              "$EVENT_WORKFLOW_SHA" "$live_main" >&2
-            exit 1
-          }
-          git fetch --force origin "$live_main"
-          expected_blob=$(git rev-parse \
-            "$live_main:scripts/runtime_versions.py")
-          git show "$live_main:scripts/runtime_versions.py" \
-            >"$TRUSTED_RESOLVER"
-          [ "$(git hash-object "$TRUSTED_RESOLVER")" = "$expected_blob" ]
-          chmod 0555 "$TRUSTED_RESOLVER"
-      - name: Check official stable sources
-        id: check
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TRUSTED_RESOLVER: ${{ runner.temp }}/trusted-runtime-versions.py
-        run: |
-          # jq programs and Markdown format strings are intentionally literal.
-          # shellcheck disable=SC2016
-          set -eu
-          python3 -I "$TRUSTED_RESOLVER" --root "$TARGET_ROOT" check --format json \
-            >"$RUNNER_TEMP/versions.json"
-          updates=$(jq -c .updates "$RUNNER_TEMP/versions.json")
-          count=$(jq '.updates | length' "$RUNNER_TEMP/versions.json")
-          {
-            echo "updates=$updates"
-            if [ "$count" -eq 0 ]; then echo 'has_updates=false'; else echo 'has_updates=true'; fi
-          } >>"$GITHUB_OUTPUT"
-          if [ "$count" -eq 0 ]; then
-            printf "Outcome: \`up_to_date\`; updates: \`[]\`.\n" >>"$GITHUB_STEP_SUMMARY"
-          else
-            printf "Outcome: \`%s update(s)\`; details: \`%s\`.\n" \
-              "$count" "$updates" >>"$GITHUB_STEP_SUMMARY"
+          python3 scripts/runtime_versions.py --root "$TARGET_ROOT" update \
+            >"$RUNNER_TEMP/update.json"
+          cat "$RUNNER_TEMP/update.json"
+          if git diff --quiet -- build/runtime-versions.env VERSION; then
+            echo 'changed=false' >>"$GITHUB_OUTPUT"
+            exit 0
           fi
-
-  propose:
-    name: propose
-    needs: resolve
-    if: >-
-      vars.RELEASE_AUTOMATION_ENABLED == 'true' &&
-      needs.resolve.outputs.has_updates == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    env:
-      TARGET_ROOT: ${{ github.workspace }}
-    permissions:
-      contents: write
-      pull-requests: write
-    steps:
-      - name: Check out latest develop without persisted credentials
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: develop
-          fetch-depth: 0
-          persist-credentials: false
-      - name: Load the resolver from the exact trusted main revision
-        env:
-          EVENT_WORKFLOW_SHA: ${{ github.sha }}
-          GH_TOKEN: ${{ github.token }}
-          TRUSTED_RESOLVER: ${{ runner.temp }}/trusted-runtime-versions.py
-        run: |
-          set -euo pipefail
-          live_main=$(gh api \
-            "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)
-          [ "$EVENT_WORKFLOW_SHA" = "$live_main" ] || {
-            printf 'trusted workflow moved: event=%s live-main=%s\n' \
-              "$EVENT_WORKFLOW_SHA" "$live_main" >&2
-            exit 1
-          }
-          git fetch --force origin "$live_main"
-          expected_blob=$(git rev-parse \
-            "$live_main:scripts/runtime_versions.py")
-          git show "$live_main:scripts/runtime_versions.py" \
-            >"$TRUSTED_RESOLVER"
-          [ "$(git hash-object "$TRUSTED_RESOLVER")" = "$expected_blob" ]
-          chmod 0555 "$TRUSTED_RESOLVER"
-      - name: Update the exact runtime environment file
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TRUSTED_RESOLVER: ${{ runner.temp }}/trusted-runtime-versions.py
-        run: |
-          set -eu
-          python3 -I "$TRUSTED_RESOLVER" --root "$TARGET_ROOT" update --write
-          python3 -I "$TRUSTED_RESOLVER" --root "$TARGET_ROOT" validate \
+          python3 scripts/runtime_versions.py --root "$TARGET_ROOT" validate \
             --base-ref origin/develop --automation-diff
-      - name: Commit and push the bot-owned branch
-        env:
-          AUTOMATION_TOKEN: ${{ github.token }}
-          GH_TOKEN: ${{ github.token }}
+          echo 'changed=true' >>"$GITHUB_OUTPUT"
+      - name: Commit and push the update branch
+        if: steps.update.outputs.changed == 'true'
         run: |
           set -euo pipefail
-          branch=automation/runtime-versions
-          bot_login='github-actions[bot]'
-          bot_email='41898282+github-actions[bot]@users.noreply.github.com'
-          git config user.name "$bot_login"
-          git config user.email "$bot_email"
+          branch=automation/multica-cli-version
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git checkout -B "$branch"
-          git add build/runtime-versions.env
-          git commit --no-gpg-sign -m 'chore: update runtime versions'
-
-          remote_sha=$(git ls-remote --heads origin "$branch" | awk '{print $1}')
-          if [ -n "$remote_sha" ]; then
-            prs=$(gh pr list --state open --head "$branch" --json number --limit 10)
-            [ "$(printf '%s' "$prs" | jq 'length')" -eq 1 ] || {
-              echo 'bot branch exists without exactly one open PR' >&2
-              exit 1
-            }
-            number=$(printf '%s' "$prs" | jq -r '.[0].number')
-            existing=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$number")
-            printf '%s' "$existing" | jq -e \
-              --arg branch "$branch" \
-              --arg repository "$GITHUB_REPOSITORY" '
-                .state == "open" and
-                .user.login == "github-actions[bot]" and
-                .head.ref == $branch and
-                .head.repo.full_name == $repository and
-                .base.ref == "develop"
-              ' >/dev/null
-            remote_commit=$(gh api "repos/$GITHUB_REPOSITORY/commits/$remote_sha")
-            printf '%s' "$remote_commit" | jq -e '
-              .author.login == "github-actions[bot]" and
-              .committer.login == "github-actions[bot]"
-            ' >/dev/null
-          fi
-
-          askpass=$RUNNER_TEMP/git-askpass
-          cat >"$askpass" <<'EOF'
-          #!/bin/sh
-          case "$1" in
-            *Username*) printf '%s\n' x-access-token ;;
-            *Password*) printf '%s\n' "$AUTOMATION_TOKEN" ;;
-            *) exit 1 ;;
-          esac
-          EOF
-          chmod 0700 "$askpass"
-          if [ -n "$remote_sha" ]; then
-            lease="--force-with-lease=refs/heads/$branch:$remote_sha"
-          else
-            lease="--force-with-lease=refs/heads/$branch:"
-          fi
-          GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0 \
-            git push "$lease" "https://github.com/$GITHUB_REPOSITORY.git" \
-              "HEAD:refs/heads/$branch"
-      - name: Create or update one PR and dispatch exact-head CI
-        env:
-          GH_TOKEN: ${{ github.token }}
-          UPDATES: ${{ needs.resolve.outputs.updates }}
+          git add build/runtime-versions.env VERSION
+          git commit --no-gpg-sign -m 'chore: update Multica CLI version'
+          git remote set-url origin \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push --force origin "HEAD:refs/heads/$branch"
+      - name: Create the develop PR and start its checks
+        id: pr
+        if: steps.update.outputs.changed == 'true'
         run: |
-          # jq programs and Markdown format strings are intentionally literal.
-          # shellcheck disable=SC2016
           set -euo pipefail
-          branch=automation/runtime-versions
-          prs=$(gh pr list --state open --head "$branch" --json number --limit 10)
-          count=$(printf '%s' "$prs" | jq 'length')
-          [ "$count" -le 1 ] || { echo 'duplicate updater PRs detected' >&2; exit 1; }
-          cat >"$RUNNER_TEMP/pr-body.md" <<EOF
-          ## Runtime version update
-
-          Automated stable-source changes: \`$UPDATES\`
-
-          The changed tracked file is exactly \`build/runtime-versions.env\`.
-          The exact PR head must pass the \`verify\` and \`runtime-image\` jobs; no workflow has a ruleset bypass.
-          EOF
+          branch=automation/multica-cli-version
+          prs=$(gh pr list --state open --base develop --head "$branch" \
+            --json number --limit 2)
+          count=$(jq 'length' <<<"$prs")
+          [ "$count" -le 1 ]
           if [ "$count" -eq 0 ]; then
             url=$(gh pr create --base develop --head "$branch" \
-              --title 'chore: update runtime versions' \
-              --body-file "$RUNNER_TEMP/pr-body.md")
+              --title 'chore: update Multica CLI version' \
+              --body 'Updates the Multica CLI pin and increments the release patch version.')
             number=${url##*/}
           else
-            number=$(printf '%s' "$prs" | jq -r '.[0].number')
-            gh pr edit "$number" --title 'chore: update runtime versions' \
-              --body-file "$RUNNER_TEMP/pr-body.md"
+            number=$(jq -r '.[0].number' <<<"$prs")
           fi
-
-          head_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$branch" \
-            --jq .object.sha)
-          pr=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$number")
-          printf '%s' "$pr" | jq -e \
-            --arg branch "$branch" \
-            --arg head "$head_sha" \
-            --arg repository "$GITHUB_REPOSITORY" '
-              .state == "open" and
-              .user.login == "github-actions[bot]" and
-              .base.ref == "develop" and
-              .head.ref == $branch and
-              .head.sha == $head and
-              .head.repo.full_name == $repository
-            ' >/dev/null
-
+          head_sha=$(gh pr view "$number" --json headRefOid --jq .headRefOid)
           jq -n \
             --arg number "$number" \
-            --arg head "$head_sha" \
-            '{event_type:"automation-ci",client_payload:{kind:"runtime-update",pull_request_number:$number,head_sha:$head}}' \
-            | gh api --method POST \
-                "repos/$GITHUB_REPOSITORY/dispatches" \
-                --input -
-          printf "Updater PR: #%s; head: \`%s\`; env-only CI dispatched.\n" \
-            "$number" "$head_sha" >>"$GITHUB_STEP_SUMMARY"
+            --arg head_sha "$head_sha" \
+            '{event_type:"automation-ci",client_payload:{pull_request_number:$number,head_sha:$head_sha}}' \
+            | gh api --method POST "repos/$GH_REPO/dispatches" --input -
+          {
+            echo "number=$number"
+            echo "head_sha=$head_sha"
+          } >>"$GITHUB_OUTPUT"
+      - name: Wait for checks and merge into develop
+        if: steps.update.outputs.changed == 'true'
+        env:
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: |
+          # shellcheck disable=SC2016
+          set -euo pipefail
+          complete=false
+          for _ in $(seq 1 100); do
+            checks=$(gh api "repos/$GH_REPO/commits/$HEAD_SHA/check-runs?per_page=100")
+            failed=$(jq '[.check_runs[] | select(
+              (.name == "verify" or .name == "runtime-image") and
+              .status == "completed" and .conclusion != "success"
+            )] | length' <<<"$checks")
+            [ "$failed" -eq 0 ] || {
+              echo 'A required check failed.' >&2
+              exit 1
+            }
+            passed=$(jq '[.check_runs[] | select(
+              (.name == "verify" or .name == "runtime-image") and
+              .status == "completed" and .conclusion == "success"
+            ) | .name] | unique | length' <<<"$checks")
+            if [ "$passed" -eq 2 ]; then
+              complete=true
+              break
+            fi
+            sleep 30
+          done
+          [ "$complete" = true ] || {
+            echo 'Timed out waiting for verify and runtime-image.' >&2
+            exit 1
+          }
+          response=$(gh api --method PUT "repos/$GH_REPO/pulls/$PR_NUMBER/merge" \
+            -f sha="$HEAD_SHA" -f merge_method=squash)
+          jq -e '.merged == true' <<<"$response" >/dev/null
+          develop_sha=$(jq -r .sha <<<"$response")
+          gh api --method DELETE \
+            "repos/$GH_REPO/git/refs/heads/automation/multica-cli-version" || true
+          jq -n \
+            --arg develop_sha "$develop_sha" \
+            '{event_type:"create-develop-to-main-pr",client_payload:{develop_sha:$develop_sha}}' \
+            | gh api --method POST "repos/$GH_REPO/dispatches" --input -
+          printf "Merged PR #%s at '%s' and requested the develop-to-main PR.\n" \
+            "$PR_NUMBER" "$develop_sha" >>"$GITHUB_STEP_SUMMARY"
