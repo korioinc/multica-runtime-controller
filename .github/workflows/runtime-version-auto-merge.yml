@@ -16,7 +16,6 @@ jobs:
     if: >-
       vars.RELEASE_AUTOMATION_ENABLED == 'true' &&
       (github.event.client_payload.kind == 'runtime-update' ||
-       github.event.client_payload.kind == 'release-patch' ||
        github.event.client_payload.kind == 'sync-main')
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -63,7 +62,7 @@ jobs:
           [ "$EVENT_ACTOR" = 'github-actions[bot]' ]
           [ "$EVENT_TRIGGERING_ACTOR" = 'github-actions[bot]' ]
           case "$INPUT_KIND" in
-            runtime-update|release-patch|sync-main) ;;
+            runtime-update|sync-main) ;;
             *) printf 'unsupported automation kind: %s\n' "$INPUT_KIND" >&2; exit 1 ;;
           esac
           case "$INPUT_PULL_REQUEST_NUMBER" in
@@ -121,7 +120,7 @@ jobs:
 
           identity=$(printf '%s' "$run" | jq -er '
             .display_title |
-            capture("^CI automation (?<kind>runtime-update|release-patch|sync-main) PR-(?<number>[1-9][0-9]*) SHA-(?<head>[0-9a-f]{40})$") |
+            capture("^CI automation (?<kind>runtime-update|sync-main) PR-(?<number>[1-9][0-9]*) SHA-(?<head>[0-9a-f]{40})$") |
             [.kind, .number, .head] | @tsv
           ')
           IFS=$'\t' read -r automation_kind pull_request_number automation_head <<EOF
@@ -141,12 +140,7 @@ jobs:
           case "$automation_kind" in
             runtime-update)
               expected_branch=automation/runtime-versions
-              expected_files=$(printf '%s\n' VERSION build/runtime-versions.env | LC_ALL=C sort)
-              merge_method=squash
-              ;;
-            release-patch)
-              expected_branch=automation/release-patch
-              expected_files=VERSION
+              expected_files=build/runtime-versions.env
               merge_method=squash
               ;;
             sync-main)
@@ -257,10 +251,12 @@ jobs:
   dispatch-develop:
     name: dispatch-develop
     needs: merge
+    if: vars.RELEASE_AUTOMATION_ENABLED == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
-      contents: write
+      actions: write
+      contents: read
     steps:
       - name: Dispatch trusted reconciliation for the exact develop merge
         env:
@@ -280,11 +276,10 @@ jobs:
             (.status == "identical" or .status == "ahead") and .behind_by == 0
           ' >/dev/null
 
-          jq -n \
-            --arg revision "$MERGE_SHA" \
-            '{event_type:"reconcile-develop",client_payload:{revision:$revision}}' \
+          jq -n --arg revision "$MERGE_SHA" \
+            '{ref:"main",inputs:{revision:$revision}}' \
             | gh api --method POST \
-                "repos/$GITHUB_REPOSITORY/dispatches" \
+                "repos/$GITHUB_REPOSITORY/actions/workflows/create-develop-to-main-pr.yml/dispatches" \
                 --input -
           printf 'Dispatched trusted reconciliation for %s.\n' \
             "$MERGE_SHA" >>"$GITHUB_STEP_SUMMARY"

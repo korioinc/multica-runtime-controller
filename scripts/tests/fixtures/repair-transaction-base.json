@@ -1,0 +1,72 @@
+{
+  "actor": "jskorlol",
+  "launcher": "primary",
+  "request": {
+    "main_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "mode": "guard-repair",
+    "nonce": "repair-20260817-001",
+    "source_revision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "target_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "ruleset_digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+  "workflows": [
+    {
+      "original_state": "active",
+      "path": ".github/workflows/ci.yml",
+      "workflow_id": 101
+    },
+    {
+      "original_state": "active",
+      "path": ".github/workflows/release.yml",
+      "workflow_id": 102
+    },
+    {
+      "original_state": "active",
+      "path": ".github/workflows/release-repair.yml",
+      "workflow_id": 103
+    },
+    {
+      "original_state": "active",
+      "path": ".github/workflows/release-repair-guard.yml",
+      "workflow_id": 104
+    }
+  ],
+  "quiesced_workflow_ids": [101, 102, 104],
+  "surface": {
+    "check_runs": [
+      {
+        "app_id": 15368,
+        "conclusion": "success",
+        "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "id": 9001,
+        "name": "verify",
+        "status": "completed"
+      }
+    ],
+    "package": {
+      "name": "multica-runtime-controller",
+      "package_type": "container",
+      "visibility": "public"
+    },
+    "pull_requests": [],
+    "refs": [
+      {
+        "ref": "refs/heads/develop",
+        "sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      {
+        "ref": "refs/heads/main",
+        "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    ],
+    "releases": [
+      {
+        "draft": false,
+        "id": 30,
+        "prerelease": false,
+        "tag_name": "v0.3.20",
+        "target": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    ]
+  }
+}

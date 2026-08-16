@@ -1,0 +1,20 @@
+{
+  "git_tags": ["v0.3.20"],
+  "github_releases": [{"tag_name": "v0.3.20"}],
+  "registry_tags": ["0.3.20", "latest"],
+  "package": {
+    "name": "multica-runtime-controller",
+    "package_type": "container",
+    "visibility": "public"
+  },
+  "version_image": null,
+  "git_tag": null,
+  "github_release": null,
+  "latest": {
+    "revision": "0000000000000000000000000000000000000000",
+    "version": "0.3.20",
+    "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "platforms": ["linux/amd64", "linux/arm64"],
+    "source": "https://github.com/korioinc/multica-runtime-controller"
+  }
+}
