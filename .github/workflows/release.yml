@@ -353,7 +353,7 @@ jobs:
           platforms=
           verified=false
           attempt=1
-          while [ "$attempt" -le 18 ]; do
+          while [ "$attempt" -le 60 ]; do
             digest=$(docker buildx imagetools inspect \
               "$IMAGE:$VERSION" 2>/dev/null \
               | awk '$1 == "Digest:" {print $2; exit}') || digest=
@@ -370,7 +370,7 @@ jobs:
               verified=true
               break
             fi
-            [ "$attempt" -lt 18 ] || break
+            [ "$attempt" -lt 60 ] || break
             sleep 5
             attempt=$((attempt + 1))
           done
