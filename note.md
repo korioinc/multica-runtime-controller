@@ -5,6 +5,7 @@
 - Delivery has exactly three workflows: CLI update and develop auto-merge, develop-to-main PR creation with required checks, and main-push image/GitHub release.
 - The CLI update changes `MULTICA_CLI_VERSION` and increments the root patch `VERSION` together.
 - Bot-created PR checks are attached to the exact head through `repository_dispatch`; merging the main PR publishes the numeric and `latest` multi-platform GHCR tags.
+- Merge develop-to-main promotion PRs with a merge commit so `develop` remains an ancestor of `main`; no recurring ancestry-sync workflow is needed.
 
 ## Runtime
 
