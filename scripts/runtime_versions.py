@@ -476,7 +476,9 @@ def validate_actions(directory: Path) -> dict[str, Any]:
         "release.yml": (
             "branches: [main]",
             "docker/build-push-action@",
-            "platforms: linux/amd64,linux/arm64",
+            "platform: linux/amd64",
+            "platform: linux/arm64",
+            "docker buildx imagetools create",
             "gh release create",
             "VERSION=$(cat VERSION)",
         ),
