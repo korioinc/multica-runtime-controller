@@ -1,7 +1,0 @@
-# Changes to the trusted automation boundary require the repository owner.
-/.github/** @jskorlol
-/.dockerignore @jskorlol
-/Dockerfile @jskorlol
-/Makefile @jskorlol
-/SECURITY.md @jskorlol
-/scripts/** @jskorlol

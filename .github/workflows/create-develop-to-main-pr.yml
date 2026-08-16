@@ -254,6 +254,7 @@ jobs:
     steps:
       - name: Create or update the main ancestry PR and dispatch trusted CI
         env:
+          GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
           BASE_SHA: ${{ needs.resolve.outputs.develop_sha }}
           HEAD_SHA: ${{ needs.write-sync.outputs.head_sha }}
@@ -419,6 +420,7 @@ jobs:
     steps:
       - name: Create or update the develop release-patch PR
         env:
+          GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
           BASE_SHA: ${{ needs.resolve.outputs.develop_sha }}
           HEAD_SHA: ${{ needs.write-patch.outputs.head_sha }}
@@ -503,6 +505,7 @@ jobs:
     steps:
       - name: Create or update the promotion PR and dispatch exact-head checks
         env:
+          GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
           HEAD_SHA: ${{ needs.resolve.outputs.develop_sha }}
           VERSION: ${{ needs.resolve.outputs.version }}

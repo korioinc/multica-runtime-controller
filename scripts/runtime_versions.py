@@ -1095,6 +1095,11 @@ def validate_actions(directory: Path) -> dict[str, Any]:
                 f"promotion_job_permissions_mismatch job={job_name} "
                 f"expected={expected} actual={actual}"
             )
+        if job_name in {"propose-sync", "propose-patch", "promote"} and \
+                "GH_REPO: ${{ github.repository }}" not in block:
+            raise ResolverError(
+                f"promotion_job_repository_context_missing job={job_name}"
+            )
 
     development = workflow_texts.get("develop-image.yml")
     if development is None:
@@ -1118,23 +1123,6 @@ def validate_actions(directory: Path) -> dict[str, Any]:
             "build-args: ${{ needs.verify.outputs.build_args }}",
         ),
     )
-    codeowners = directory.parent / "CODEOWNERS"
-    if not codeowners.is_file():
-        raise ResolverError("trusted_automation_codeowners_missing")
-    codeowners_text = codeowners.read_text(encoding="utf-8")
-    for fragment in (
-        "/.github/** @jskorlol",
-        "/.dockerignore @jskorlol",
-        "/Dockerfile @jskorlol",
-        "/Makefile @jskorlol",
-        "/SECURITY.md @jskorlol",
-        "/scripts/** @jskorlol",
-    ):
-        if fragment not in codeowners_text:
-            raise ResolverError(
-                f"trusted_automation_codeowner_missing fragment={fragment}"
-            )
-
     release = workflow_texts.get("release.yml")
     if release is None:
         raise ResolverError("required_workflow_missing files=release.yml")

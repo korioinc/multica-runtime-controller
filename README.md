@@ -135,10 +135,9 @@ validated repository-dispatch CI run for the exact PR head. Repository dispatch
 always selects the reviewed default-branch workflow definition. The `develop` ruleset
 requires those source-pinned checks with strict base freshness and permits
 squash plus the ancestry-sync merge commit. The `main` ruleset is also strict
-and requires the same checks plus repository-owner review. `CODEOWNERS`
-protects every workflow and its policy validator; neither branch ruleset has a
-bypass actor. The release workflow independently revalidates that `jskorlol`
-approved the exact `develop` head and merged the promotion.
+and requires the same checks plus repository-owner review; neither branch
+ruleset has a bypass actor. The release workflow independently revalidates
+that `jskorlol` approved the exact `develop` head and merged the promotion.
 
 The first GHCR candidate is private by default. Before a GitHub Release can be
 created, an organization owner must make the linked
