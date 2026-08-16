@@ -127,7 +127,7 @@ jobs:
 
           jobs_pages=$(gh api --paginate --slurp \
             "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT/jobs?per_page=100")
-          expected_names='["automation-runtime-image","automation-verify","context","publish-checks"]'
+          expected_names='["automation-runtime-image","automation-runtime-image-amd64","automation-runtime-image-arm64","automation-verify","context","publish-checks"]'
           actual_names=$(printf '%s' "$jobs_pages" | jq -c \
             '[.[].jobs[].name] | sort')
           [ "$actual_names" = "$expected_names" ] || {
@@ -136,7 +136,7 @@ jobs:
           }
           printf '%s' "$jobs_pages" | jq -e '
             [.[].jobs[]] as $jobs |
-            ($jobs | length) == 4 and
+            ($jobs | length) == 6 and
             all($jobs[]; .status == "completed" and .conclusion == "success")
           ' >/dev/null
 

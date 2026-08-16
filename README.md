@@ -62,8 +62,10 @@ make image-push \
 ```
 
 Official stable publication is owned by the `Release` GitHub Actions workflow.
-It builds and verifies the immutable amd64/arm64 version image, creates the
-same-revision GitHub Release, and only then promotes that digest to `latest`.
+It builds amd64 on the native `ubuntu-24.04` runner and arm64 on the native
+`ubuntu-24.04-arm` runner, pushes each result by digest, and assembles the
+immutable multi-platform version manifest only after both builds pass. It then
+creates the same-revision GitHub Release and promotes that digest to `latest`.
 After publication, configure both `controller.image.reference` and
 `runtime.image.reference` with the recorded multi-platform digest.
 
@@ -77,7 +79,9 @@ issues, pull requests, logs, or artifacts.
 Six workflows own delivery:
 
 - `CI` is read-only and secret-free. Its literal `verify` and `runtime-image`
-  jobs are the required checks for every pull request. Automation uses a
+  jobs are the required checks for every pull request. The runtime image check
+  fans out to native amd64 and arm64 runners and succeeds only after both
+  architecture builds pass. Automation uses a
   `repository_dispatch` event so GitHub always loads the reviewed default-branch
   copy against an exact bot PR head; the workflow rejects a moved trusted ref
   or mismatched pull request.
@@ -108,14 +112,18 @@ Six workflows own delivery:
   merges it.
 - `Development Image` is repository-dispatch-only and always loads the reviewed
   default-branch workflow with the exact live `develop` SHA as input. A read-only verify job
-  resolves all build arguments before the separate package-write job checks
-  out the source and publishes the same multi-arch digest as `develop` and
-  `develop-<full-commit-SHA>`. It uses its own
-  `runtime-develop` write cache, may restore the trusted `runtime-main` cache,
-  and never changes stable version tags, `latest`, or a GitHub Release.
+  resolves all build arguments before separate native amd64 and arm64
+  package-write jobs check out the source and push per-architecture digests. A
+  final job publishes their verified manifest as `develop` and
+  `develop-<full-commit-SHA>`. Each architecture uses its own
+  `runtime-develop-<architecture>` write cache and may restore the matching
+  trusted `runtime-main-<architecture>` cache. The workflow never changes
+  stable version tags, `latest`, or a GitHub Release.
 - `Release` runs when the reviewed develop promotion changes `VERSION` on
   `main`. Recovery uses the `stable-release-recovery` repository-dispatch event
-  with the exact stable version and full 40-character main revision.
+  with the exact stable version and full 40-character main revision. Candidate
+  builds use the same native per-architecture fan-out and digest-based manifest
+  assembly as development publication.
 
 The release, development publisher, updater, CI dispatcher, merge, and develop
 promotion dispatcher use only GitHub's ephemeral repository-scoped `GITHUB_TOKEN` with
@@ -135,10 +143,9 @@ validated repository-dispatch CI run for the exact PR head. Repository dispatch
 always selects the reviewed default-branch workflow definition. The `develop` ruleset
 requires those source-pinned checks with strict base freshness and permits
 squash plus the ancestry-sync merge commit. The `main` ruleset is also strict
-and requires the same checks plus repository-owner review. `CODEOWNERS`
-protects every workflow and its policy validator; neither branch ruleset has a
-bypass actor. The release workflow independently revalidates that `jskorlol`
-approved the exact `develop` head and merged the promotion.
+and requires the same checks plus repository-owner review; neither branch
+ruleset has a bypass actor. The release workflow independently revalidates
+that `jskorlol` approved the exact `develop` head and merged the promotion.
 
 The first GHCR candidate is private by default. Before a GitHub Release can be
 created, an organization owner must make the linked
