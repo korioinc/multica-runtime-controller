@@ -9,7 +9,7 @@ from pathlib import Path
 from scripts import runtime_versions
 
 
-HELM_REPOSITORY_SECRET = "${{ secrets.HELM_REPOSITORY_TOKEN }}"
+TEST_SECRET_REFERENCE = "${{ secrets.TEST_TOKEN }}"
 
 
 def write_action_workflows(
@@ -26,7 +26,7 @@ def write_action_workflows(
       - name: {name}
         env:
 {environment}
-        run: gh api --method POST repos/korioinc/helm/dispatches
+        run: printf 'exercise secret reference\n'
 """
 
     workflows = {
@@ -83,7 +83,7 @@ jobs:
           echo 'docker buildx imagetools create'
           echo 'gh release create'
           echo 'VERSION=$(cat VERSION)'
-{secret_step("Dispatch the Helm chart update", release_secrets)}""",
+{secret_step("Unexpected secret consumer", release_secrets)}""",
     }
     for name, text in workflows.items():
         (directory / name).write_text(text, encoding="utf-8")
@@ -111,45 +111,31 @@ def multica_release(version: str) -> dict[str, object]:
 
 
 class RuntimeVersionTests(unittest.TestCase):
-    def test_validate_actions_allows_single_helm_repository_secret_in_release(
-        self,
-    ) -> None:
+    def test_validate_actions_accepts_secret_free_workflows(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workflows = Path(directory)
-            write_action_workflows(
-                workflows,
-                release_secrets=(("GH_TOKEN", HELM_REPOSITORY_SECRET),),
-            )
+            write_action_workflows(workflows)
 
             try:
                 result = runtime_versions.validate_actions(workflows)
             except runtime_versions.ResolverError as error:
-                self.fail(f"the release dispatch secret should be allowed: {error}")
+                self.fail(f"secret-free workflows should be accepted: {error}")
 
             self.assertEqual(result["workflows"], 3)
 
-    def test_validate_actions_rejects_secrets_outside_release_exception(self) -> None:
+    def test_validate_actions_rejects_any_secret_reference(self) -> None:
         cases = (
             (
-                "different release secret",
-                (("GH_TOKEN", "${{ secrets.OTHER_TOKEN }}"),),
+                "release workflow secret",
+                (("TEST_TOKEN", TEST_SECRET_REFERENCE),),
                 (),
                 "release.yml",
             ),
             (
-                "Helm secret in another workflow",
+                "runtime update workflow secret",
                 (),
-                (("GH_TOKEN", HELM_REPOSITORY_SECRET),),
+                (("TEST_TOKEN", TEST_SECRET_REFERENCE),),
                 "runtime-version-update.yml",
-            ),
-            (
-                "duplicate Helm secret",
-                (
-                    ("GH_TOKEN", HELM_REPOSITORY_SECRET),
-                    ("EXTRA_TOKEN", HELM_REPOSITORY_SECRET),
-                ),
-                (),
-                "release.yml",
             ),
         )
         for name, release_secrets, runtime_update_secrets, file_name in cases:

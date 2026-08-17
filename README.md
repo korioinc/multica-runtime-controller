@@ -55,10 +55,11 @@ make image \
 
 After a `develop`-to-`main` merge, the `Release` workflow publishes the
 multi-platform image as both the numeric version and `latest`, then creates the
-matching `v<VERSION>` GitHub Release. After both artifacts succeed, it sends a
-`runtime-released` repository dispatch to `korioinc/helm` with the runtime
-version, manifest digest, and source revision. That repository owns the chart
-source, validation, version update, and publishing. Configure both
+matching `v<VERSION>` GitHub Release. The runtime repository owns and completes
+only that image and GitHub Release flow. The Helm repository independently
+polls the public GHCR package hourly, or performs the same check when maintainers
+run its update workflow manually. That repository owns the chart source,
+validation, version update, and publishing. Configure both
 `controller.image.reference` and `runtime.image.reference` with the published
 digest.
 
@@ -80,15 +81,15 @@ Three workflows own delivery:
    maintainer to merge.
 3. `Release` runs for every `main` push. It reads `VERSION`, builds and pushes
    `linux/amd64` plus `linux/arm64` to GHCR as `<VERSION>` and `latest`, and
-   creates the matching GitHub Release before dispatching the dedicated Helm
-   repository to update the published chart version and image digest.
+   creates the matching GitHub Release. It does not invoke or authenticate to
+   the Helm repository.
 
 Bot-created pull requests use an exact-head `repository_dispatch` check run
 because events created by the repository `GITHUB_TOKEN` do not recursively
-start another workflow. The cross-repository chart dispatch uses a dedicated
-token only in its release step; the remaining GitHub access uses the ephemeral
-repository-scoped token and job-specific permissions. No release gate, repair
-workflow, or secondary auto-merge workflow is required.
+start another workflow. GitHub access uses the ephemeral repository-scoped token
+and job-specific permissions. The Helm repository discovers newer stable runtime
+images from public GHCR on its hourly schedule or through a manual workflow run.
+No release gate, repair workflow, or secondary auto-merge workflow is required.
 
 Stable versions match `MAJOR.MINOR.PATCH`. The CLI updater increments one patch
 per actual Multica release change. A release retry accepts only the same main
@@ -259,10 +260,11 @@ kubectl --namespace multica logs deployment/multica-runtime-controller \
   --container pi-package-0
 ```
 
-The runtime release publishes and verifies the image before dispatching the
-dedicated Helm repository. Its updater advances the chart version and both
-digest-pinned image references together. Roll those chart values and image
-digests back together on initialization or provider smoke-test failure.
+The runtime release publishes and verifies only its image and GitHub Release.
+The Helm repository independently polls public GHCR hourly, and its updater
+advances the chart version and both digest-pinned image references together when
+it discovers a newer stable runtime. Roll those chart values and image digests
+back together on initialization or provider smoke-test failure.
 
 ## Development
 

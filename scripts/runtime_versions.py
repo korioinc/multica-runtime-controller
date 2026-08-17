@@ -27,7 +27,6 @@ ASSIGNMENT_PATTERN = re.compile(r"([A-Z][A-Z0-9_]*)=([^\s]+)")
 SEMVER_PATTERN = re.compile(r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)")
 REVISION_PATTERN = re.compile(r"[0-9a-f]{40}")
 ACTION_USES_PATTERN = re.compile(r"^\s*uses:\s*([^\s#]+)\s*(?:#\s*(.*))?$")
-HELM_REPOSITORY_SECRET = "${{ secrets.HELM_REPOSITORY_TOKEN }}"
 
 
 class ResolverError(RuntimeError):
@@ -418,14 +417,7 @@ def validate_actions(directory: Path) -> dict[str, Any]:
         texts[path.name] = text
         if re.search(r"(?m)^permissions:\s*\{\}\s*$", text) is None:
             raise ResolverError(f"workflow_top_permissions_not_empty file={path.name}")
-        secret_exception = (
-            path.name == "release.yml"
-            and text.count(HELM_REPOSITORY_SECRET) == 1
-            and text.count("secrets.") == 1
-        )
-        if "pull_request_target:" in text or (
-            "secrets." in text and not secret_exception
-        ):
+        if "pull_request_target:" in text or "secrets." in text:
             raise ResolverError(f"workflow_privilege_contract_failed file={path.name}")
         for job_name, block in _job_blocks(text).items():
             if re.search(r"(?m)^    permissions:(?:\s*\{\})?\s*$", block) is None:
