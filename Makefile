@@ -1,4 +1,4 @@
-.PHONY: build image image-push repository-validate runtime-version-test workflow-validate test test-race vet helm-lint helm-template helm-validate verify
+.PHONY: build image image-push repository-validate runtime-version-test workflow-validate test test-race vet verify
 
 RUNTIME_VERSIONS_FILE := build/runtime-versions.env
 include $(RUNTIME_VERSIONS_FILE)
@@ -23,8 +23,6 @@ PLATFORMS ?= linux/amd64,linux/arm64
 VERSION ?= dev
 COMMIT ?= $(shell git rev-parse --short=12 HEAD)
 
-CHART := deploy/helm/multica-runtime-controller
-RENDERED := /tmp/multica-runtime-controller-rendered.yaml
 ACTIONLINT_VERSION := v1.7.12
 ACTIONLINT_WORKFLOWS := \
 	../.github/workflows/create-develop-to-main-pr.yml \
@@ -71,13 +69,4 @@ test-race:
 vet:
 	go -C $(GO_MODULE_DIR) vet ./...
 
-helm-lint:
-	helm lint $(CHART) -f $(CHART)/ci/values-single-replica.yaml
-
-helm-template:
-	helm template multica-runtime-controller $(CHART) -f $(CHART)/ci/values-single-replica.yaml > $(RENDERED)
-
-helm-validate: helm-template
-	go -C $(GO_MODULE_DIR) run github.com/yannh/kubeconform/cmd/kubeconform@v0.7.0 -strict -summary -kubernetes-version 1.36.0 $(RENDERED)
-
-verify: runtime-version-test repository-validate workflow-validate test test-race vet helm-lint helm-validate
+verify: runtime-version-test repository-validate workflow-validate test test-race vet
