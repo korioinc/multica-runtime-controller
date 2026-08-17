@@ -53,6 +53,7 @@ require_php_extension() {
 for command_name in \
   git git-lfs gh k9s kubectx kubens kubectl aws oci gcloud codebase-memory-mcp \
   php composer node npm python3 python go \
+  rustc cargo rustup \
   gcc g++ make pkg-config cmake ninja jq yq rg fdfind fd patch rsync zip xz \
   file tree ps lsof ip dig nc shellcheck shfmt uv uvx corepack; do
   require_command "${command_name}"
@@ -76,6 +77,9 @@ require_runnable npm npm --version
 require_runnable python3 python3 --version
 require_runnable python python --version
 require_runnable go go version
+require_runnable rustc rustc --version
+require_runnable cargo cargo --version
+require_runnable rustup rustup --version
 require_runnable gcc gcc --version
 require_runnable g++ g++ --version
 require_runnable make make --version

@@ -30,7 +30,7 @@ Controller and task Pods use the same immutable image digest. The image contains
 - the Kubernetes provider interception shim;
 - pinned Codex, Copilot, Antigravity, and Pi CLIs;
 - PHP 8.5 with Composer plus the MongoDB, Redis, and Zstandard extensions;
-- Node.js 26, Python 3 (`python` aliases `python3`), and Go;
+- Node.js 26, Python 3 (`python` aliases `python3`), Go, and Rust (`rustc`, Cargo, and rustup);
 - Git/Git LFS, GitHub CLI, k9s, kubectx/kubens, kubectl, AWS CLI, OCI CLI, and Google Cloud CLI;
 - zlib and Cyrus SASL runtime/development packages;
 - a native build toolchain (`gcc`, `g++`, `make`, pkg-config, CMake, and Ninja);
