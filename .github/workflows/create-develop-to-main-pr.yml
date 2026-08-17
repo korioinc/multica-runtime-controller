@@ -244,6 +244,7 @@ jobs:
           [ "$count" -le 1 ]
           if [ "$count" -eq 0 ]; then
             url=$(gh pr create --base main --head develop \
+              --assignee jskorlol \
               --title 'release: merge develop into main' \
               --body 'Merges the verified develop branch. Merging this PR publishes the versioned image and GitHub Release.')
             number=${url##*/}
