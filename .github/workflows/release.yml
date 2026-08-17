@@ -36,6 +36,7 @@ jobs:
         run: |
           set -euo pipefail
           VERSION=$(cat VERSION)
+          TAG="$VERSION"
           python3 scripts/runtime_versions.py --root "$GITHUB_WORKSPACE" validate
           live_main=$(gh api "repos/$GH_REPO/git/ref/heads/main" --jq .object.sha)
           [ "$live_main" = "$GITHUB_SHA" ] || {
@@ -43,23 +44,23 @@ jobs:
             exit 1
           }
           release_exists=false
-          if gh release view "v$VERSION" >/dev/null 2>&1; then
-            release_target=$(gh release view "v$VERSION" --json targetCommitish \
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            release_target=$(gh release view "$TAG" --json targetCommitish \
               --jq .targetCommitish)
             [ "$release_target" = "$GITHUB_SHA" ] || {
-              echo "Release v$VERSION belongs to another revision." >&2
+              echo "Release $TAG belongs to another revision." >&2
               exit 1
             }
             release_exists=true
           fi
-          tag_target=$(git ls-remote --tags origin "refs/tags/v$VERSION" | awk '{print $1}')
+          tag_target=$(git ls-remote --tags origin "refs/tags/$TAG" | awk '{print $1}')
           if [ -n "$tag_target" ] && [ "$tag_target" != "$GITHUB_SHA" ]; then
-            echo "Tag v$VERSION belongs to another revision." >&2
+            echo "Tag $TAG belongs to another revision." >&2
             exit 1
           fi
           {
             echo "version=$VERSION"
-            echo "tag=v$VERSION"
+            echo "tag=$TAG"
             echo "release_exists=$release_exists"
           } >>"$GITHUB_OUTPUT"
 
