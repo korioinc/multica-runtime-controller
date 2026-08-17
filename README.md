@@ -1,6 +1,6 @@
 # Multica Runtime Controller
 
-This chart runs the official Multica daemon on Kubernetes while moving every provider process into an isolated `task-<short-task-id>-<generated-suffix>` Pod. The Multica backend and task lifecycle remain entirely official; interception happens only at the provider executable boundary.
+This controller runs the official Multica daemon on Kubernetes while moving every provider process into an isolated `task-<short-task-id>-<generated-suffix>` Pod. The Multica backend and task lifecycle remain entirely official; interception happens only at the provider executable boundary.
 
 ## Runtime Model
 
@@ -55,7 +55,10 @@ make image \
 
 After a `develop`-to-`main` merge, the `Release` workflow publishes the
 multi-platform image as both the numeric version and `latest`, then creates the
-matching `v<VERSION>` GitHub Release. Configure both
+matching `v<VERSION>` GitHub Release. After both artifacts succeed, it sends a
+`runtime-released` repository dispatch to `korioinc/helm` with the runtime
+version, manifest digest, and source revision. That repository owns the chart
+source, validation, version update, and publishing. Configure both
 `controller.image.reference` and `runtime.image.reference` with the published
 digest.
 
@@ -77,14 +80,15 @@ Three workflows own delivery:
    maintainer to merge.
 3. `Release` runs for every `main` push. It reads `VERSION`, builds and pushes
    `linux/amd64` plus `linux/arm64` to GHCR as `<VERSION>` and `latest`, and
-   creates the matching GitHub Release.
+   creates the matching GitHub Release before dispatching the dedicated Helm
+   repository to update the published chart version and image digest.
 
 Bot-created pull requests use an exact-head `repository_dispatch` check run
 because events created by the repository `GITHUB_TOKEN` do not recursively
-start another workflow. All three workflows use only the ephemeral
-repository-scoped token and job-specific permissions; no PAT, repository
-secret, release gate, repair workflow, or secondary auto-merge workflow is
-required.
+start another workflow. The cross-repository chart dispatch uses a dedicated
+token only in its release step; the remaining GitHub access uses the ephemeral
+repository-scoped token and job-specific permissions. No release gate, repair
+workflow, or secondary auto-merge workflow is required.
 
 Stable versions match `MAJOR.MINOR.PATCH`. The CLI updater increments one patch
 per actual Multica release change. A release retry accepts only the same main
@@ -229,8 +233,10 @@ The controller token determines which workspaces the daemon registers. The chart
 Install the release:
 
 ```bash
+helm repo add korioinc https://korioinc.github.io/helm
+helm repo update
 helm upgrade --install multica-runtime-controller \
-  deploy/helm/multica-runtime-controller \
+  korioinc/multica-runtime-controller \
   --namespace multica \
   --create-namespace \
   -f operator-values.yaml
@@ -253,7 +259,10 @@ kubectl --namespace multica logs deployment/multica-runtime-controller \
   --container pi-package-0
 ```
 
-Publish and verify the new runtime image before updating the chart copy, package values, and both image digests in the deployment repository. Roll those chart values and image digests back together on initialization or provider smoke-test failure.
+The runtime release publishes and verifies the image before dispatching the
+dedicated Helm repository. Its updater advances the chart version and both
+digest-pinned image references together. Roll those chart values and image
+digests back together on initialization or provider smoke-test failure.
 
 ## Development
 
@@ -262,10 +271,9 @@ sole Go module boundary:
 
 ```text
 .
-├── src/       # go.mod, go.sum, cmd/, internal/
 ├── build/
-├── deploy/
-└── scripts/
+├── scripts/
+└── src/       # go.mod, go.sum, cmd/, internal/
 ```
 
 Run the supported build and verification workflows from the repository root:
@@ -276,7 +284,7 @@ make test
 make verify
 ```
 
-This runs Go tests, race tests, vet, Helm lint, Helm rendering, and strict Kubernetes schema validation.
+This runs Go tests, race tests, vet, repository validation, and workflow validation.
 
 For direct Go tool usage, select the nested module explicitly. Root-level
 module discovery such as `go test ./...` is not supported.
