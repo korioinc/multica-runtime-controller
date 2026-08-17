@@ -202,19 +202,23 @@ jobs:
         id: release
         run: |
           set -euo pipefail
+          starting_sha=$(git rev-parse HEAD)
+          git config user.name 'github-actions[bot]'
+          git config user.email \
+            '41898282+github-actions[bot]@users.noreply.github.com'
           git fetch --no-tags origin \
             '+refs/heads/main:refs/remotes/origin/main'
+          git merge --no-edit origin/main
           result=$(python3 scripts/runtime_versions.py \
             --root "$GITHUB_WORKSPACE" prepare-release --base-ref origin/main)
           printf '%s\n' "$result"
           if ! git diff --quiet -- VERSION; then
             [ "$(git diff --name-only)" = VERSION ]
             version=$(jq -r .release_version.to <<<"$result")
-            git config user.name 'github-actions[bot]'
-            git config user.email \
-              '41898282+github-actions[bot]@users.noreply.github.com'
             git add VERSION
             git commit --no-gpg-sign -m "chore(release): prepare v$version"
+          fi
+          if [ "$(git rev-parse HEAD)" != "$starting_sha" ]; then
             git remote set-url origin \
               "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
             git push origin HEAD:refs/heads/develop

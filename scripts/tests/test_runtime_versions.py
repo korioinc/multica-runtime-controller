@@ -64,6 +64,7 @@ jobs:
           echo 'types: [automation-ci, create-develop-to-main-pr]'
           echo '-f name="verify"'
           echo '-f name="runtime-image"'
+          echo 'git merge --no-edit origin/main'
           echo 'prepare-release --base-ref origin/main'
           echo '--base main --head develop'
           echo 'gh pr create --base main --head develop'

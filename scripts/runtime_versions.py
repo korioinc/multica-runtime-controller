@@ -501,6 +501,7 @@ def validate_actions(directory: Path) -> dict[str, Any]:
             "types: [automation-ci, create-develop-to-main-pr]",
             '-f name="verify"',
             '-f name="runtime-image"',
+            "git merge --no-edit origin/main",
             "prepare-release --base-ref origin/main",
             "--base main --head develop",
             "gh pr create --base main --head develop",
