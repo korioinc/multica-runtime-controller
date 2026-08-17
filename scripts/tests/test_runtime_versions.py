@@ -81,12 +81,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - run: |
+          VERSION=$(cat VERSION)
+          TAG="$VERSION"
           echo 'docker/build-push-action@'
           echo 'platform: linux/amd64'
           echo 'platform: linux/arm64'
           echo 'docker buildx imagetools create'
-          echo 'gh release create'
-          echo 'VERSION=$(cat VERSION)'
+          gh release view "$TAG"
+          git ls-remote --tags origin "refs/tags/$TAG"
+          echo "tag=$TAG"
+          gh release create "$TAG"
 {secret_step("Unexpected secret consumer", release_secrets)}""",
     }
     for name, text in workflows.items():
@@ -244,6 +248,24 @@ class RuntimeVersionTests(unittest.TestCase):
                 self.fail(f"secret-free workflows should be accepted: {error}")
 
             self.assertEqual(result["workflows"], 3)
+
+    def test_validate_actions_requires_unprefixed_runtime_release_tag(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workflows = Path(directory)
+            write_action_workflows(workflows)
+            release_workflow = workflows / "release.yml"
+            release_workflow.write_text(
+                release_workflow.read_text(encoding="utf-8").replace(
+                    'TAG="$VERSION"', 'TAG="v$VERSION"'
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                runtime_versions.ResolverError,
+                "^workflow_release_tag_must_match_version$",
+            ):
+                runtime_versions.validate_actions(workflows)
 
     def test_validate_actions_rejects_any_secret_reference(self) -> None:
         cases = (

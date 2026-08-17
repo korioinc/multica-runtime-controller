@@ -512,10 +512,16 @@ def validate_actions(directory: Path) -> dict[str, Any]:
             "platform: linux/amd64",
             "platform: linux/arm64",
             "docker buildx imagetools create",
-            "gh release create",
             "VERSION=$(cat VERSION)",
+            'TAG="$VERSION"',
+            'gh release view "$TAG"',
+            "refs/tags/$TAG",
+            'echo "tag=$TAG"',
+            'gh release create "$TAG"',
         ),
     }
+    if 'TAG="$VERSION"' not in texts["release.yml"]:
+        raise ResolverError("workflow_release_tag_must_match_version")
     for file_name, fragments in required_fragments.items():
         for fragment in fragments:
             if fragment not in texts[file_name]:
