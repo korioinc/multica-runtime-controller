@@ -178,10 +178,11 @@ jobs:
   promote:
     name: create-develop-to-main-pr
     if: >-
-      github.event_name == 'push' ||
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'repository_dispatch' &&
-       github.event.action == 'create-develop-to-main-pr')
+       github.event.action == 'create-develop-to-main-pr') ||
+      (github.event_name == 'push' &&
+       !startsWith(github.event.head_commit.message, 'chore(release): prepare '))
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -191,12 +192,47 @@ jobs:
       GH_REPO: ${{ github.repository }}
       GH_TOKEN: ${{ github.token }}
     steps:
+      - name: Check out develop for release preparation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: develop
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Prepare the next patch release
+        id: release
+        run: |
+          set -euo pipefail
+          starting_sha=$(git rev-parse HEAD)
+          git config user.name 'github-actions[bot]'
+          git config user.email \
+            '41898282+github-actions[bot]@users.noreply.github.com'
+          git fetch --no-tags origin \
+            '+refs/heads/main:refs/remotes/origin/main'
+          git merge --no-edit origin/main
+          result=$(python3 scripts/runtime_versions.py \
+            --root "$GITHUB_WORKSPACE" prepare-release --base-ref origin/main)
+          printf '%s\n' "$result"
+          if ! git diff --quiet -- VERSION; then
+            [ "$(git diff --name-only)" = VERSION ]
+            version=$(jq -r .release_version.to <<<"$result")
+            git add VERSION
+            git commit --no-gpg-sign -m "chore(release): prepare v$version"
+          fi
+          if [ "$(git rev-parse HEAD)" != "$starting_sha" ]; then
+            git remote set-url origin \
+              "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+            git push origin HEAD:refs/heads/develop
+          fi
+          echo "develop_sha=$(git rev-parse HEAD)" >>"$GITHUB_OUTPUT"
       - name: Maintain one develop to main PR
+        env:
+          DEVELOP_SHA: ${{ steps.release.outputs.develop_sha }}
         run: |
           # shellcheck disable=SC2016
           set -euo pipefail
           main_sha=$(gh api "repos/$GH_REPO/git/ref/heads/main" --jq .object.sha)
           develop_sha=$(gh api "repos/$GH_REPO/git/ref/heads/develop" --jq .object.sha)
+          [ "$develop_sha" = "$DEVELOP_SHA" ]
           compare=$(gh api "repos/$GH_REPO/compare/$main_sha...$develop_sha")
           if [ "$(jq -r .status <<<"$compare")" = identical ]; then
             echo 'develop and main are identical.' >>"$GITHUB_STEP_SUMMARY"

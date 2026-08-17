@@ -325,6 +325,37 @@ def build_args(
     return assignments | {"VERSION": release_version, "COMMIT": revision}
 
 
+def prepare_release_version(base_ref: str) -> dict[str, Any]:
+    base_result = _run("git", "show", f"{base_ref}:VERSION", check=False)
+    if base_result.returncode != 0:
+        raise ResolverError(f"release_base_version_missing ref={base_ref}")
+
+    base_version = SemVer.parse(base_result.stdout.strip(), field="base_VERSION")
+    current_version = read_version(VERSION_PATH)
+    next_version = base_version.bump_patch()
+    changed = False
+
+    if current_version == base_version:
+        version_temp = _write_temp(
+            VERSION_PATH, f"{next_version}\n".encode("ascii")
+        )
+        try:
+            os.replace(version_temp, VERSION_PATH)
+        finally:
+            version_temp.unlink(missing_ok=True)
+        changed = True
+    elif current_version != next_version:
+        raise ResolverError(
+            f"release_version_mismatch expected={next_version} actual={current_version}"
+        )
+
+    return {
+        "base_ref": base_ref,
+        "changed": changed,
+        "release_version": {"from": str(base_version), "to": str(next_version)},
+    }
+
+
 def validate_repository(base_ref: str | None, *, automation_diff: bool = False) -> dict[str, Any]:
     current_env = parse_env_bytes(ENV_PATH.read_bytes())
     current_version = read_version(VERSION_PATH)
@@ -470,6 +501,8 @@ def validate_actions(directory: Path) -> dict[str, Any]:
             "types: [automation-ci, create-develop-to-main-pr]",
             '-f name="verify"',
             '-f name="runtime-image"',
+            "git merge --no-edit origin/main",
+            "prepare-release --base-ref origin/main",
             "--base main --head develop",
             "gh pr create --base main --head develop",
         ),
@@ -530,6 +563,9 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("--base-ref")
     validate.add_argument("--automation-diff", action="store_true")
 
+    release = commands.add_parser("prepare-release")
+    release.add_argument("--base-ref", required=True)
+
     arguments = commands.add_parser("build-args")
     arguments.add_argument("--revision")
     arguments.add_argument("--version")
@@ -557,6 +593,8 @@ def main(argv: list[str] | None = None) -> int:
             result = validate_repository(
                 arguments.base_ref, automation_diff=arguments.automation_diff
             )
+        elif arguments.command == "prepare-release":
+            result = prepare_release_version(arguments.base_ref)
         elif arguments.command == "build-args":
             result = build_args(
                 ENV_PATH,
