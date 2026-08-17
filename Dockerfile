@@ -26,6 +26,7 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 FROM php:${PHP_VERSION}-cli-bookworm AS runtime-base
+ARG CODEBASE_MEMORY_MCP_VERSION
 ARG COREPACK_VERSION
 ARG MONGODB_PHP_EXTENSION_VERSION
 ARG PHPREDIS_VERSION
@@ -53,13 +54,18 @@ RUN /usr/local/sbin/install-runtime-tools \
  && npm install --global --ignore-scripts --no-audit --no-fund "corepack@${COREPACK_VERSION}" \
  && corepack --version | grep --fixed-strings "${COREPACK_VERSION}" \
  && npm cache clean --force
-RUN curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh \
-      | bash -s -- --dir=/usr/local/bin --skip-config \
+RUN curl -fsSL \
+      -o /tmp/codebase-memory-mcp-install.sh \
+      "https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/v${CODEBASE_MEMORY_MCP_VERSION}/install.sh" \
+ && CBM_DOWNLOAD_URL="https://github.com/DeusData/codebase-memory-mcp/releases/download/v${CODEBASE_MEMORY_MCP_VERSION}" \
+      bash /tmp/codebase-memory-mcp-install.sh --dir=/usr/local/bin --skip-config \
+ && rm /tmp/codebase-memory-mcp-install.sh \
  && install -d -o 65532 -g 65532 -m 0700 /home/multica/.cache/codebase-memory-mcp \
  && runuser --user multica -- env \
       CBM_CACHE_DIR=/home/multica/.cache/codebase-memory-mcp \
       codebase-memory-mcp config set auto_index true \
- && codebase-memory-mcp --version
+ && codebase-memory-mcp --version \
+      | grep --fixed-strings "codebase-memory-mcp ${CODEBASE_MEMORY_MCP_VERSION}"
 COPY scripts/runtime-entrypoint.sh /usr/local/bin/runtime-entrypoint
 COPY scripts/verify-runtime-tools.sh /usr/local/bin/verify-runtime-tools
 RUN chmod 0555 /usr/local/bin/runtime-entrypoint /usr/local/bin/verify-runtime-tools
@@ -160,6 +166,7 @@ ARG UV_VERSION
 ARG YQ_VERSION
 ARG SHFMT_VERSION
 ARG COREPACK_VERSION
+ARG CODEBASE_MEMORY_MCP_VERSION
 ARG MULTICA_CLI_VERSION
 ARG CODEX_VERSION
 ARG COPILOT_VERSION
@@ -172,6 +179,6 @@ LABEL org.opencontainers.image.title="Multica Runtime Controller" \
       io.multica.cli-version="${MULTICA_CLI_VERSION}" \
       io.multica.execution-modes="official-daemon,kubernetes-provider-intercept" \
       io.multica.providers="antigravity@${ANTIGRAVITY_VERSION},codex@${CODEX_VERSION},copilot@${COPILOT_VERSION},pi@${PI_VERSION}" \
-      io.multica.toolchain="aws-cli@${AWS_CLI_VERSION},composer@${COMPOSER_VERSION},corepack@${COREPACK_VERSION},gcloud@${GCLOUD_CLI_VERSION},gh@${GH_VERSION},go@${GO_VERSION},k9s@${K9S_VERSION},kubectx@${KUBECTX_VERSION},kubectl@${KUBECTL_VERSION},node@${NODE_VERSION},oci-cli@${OCI_CLI_VERSION},php@${PHP_VERSION},shfmt@${SHFMT_VERSION},uv@${UV_VERSION},yq@${YQ_VERSION}" \
+      io.multica.toolchain="aws-cli@${AWS_CLI_VERSION},codebase-memory-mcp@${CODEBASE_MEMORY_MCP_VERSION},composer@${COMPOSER_VERSION},corepack@${COREPACK_VERSION},gcloud@${GCLOUD_CLI_VERSION},gh@${GH_VERSION},go@${GO_VERSION},k9s@${K9S_VERSION},kubectx@${KUBECTX_VERSION},kubectl@${KUBECTL_VERSION},node@${NODE_VERSION},oci-cli@${OCI_CLI_VERSION},php@${PHP_VERSION},shfmt@${SHFMT_VERSION},uv@${UV_VERSION},yq@${YQ_VERSION}" \
       io.multica.php-extensions="mongodb@${MONGODB_PHP_EXTENSION_VERSION},redis@${PHPREDIS_VERSION},zstd@${ZSTD_PHP_EXTENSION_VERSION}"
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/runtime-entrypoint"]
