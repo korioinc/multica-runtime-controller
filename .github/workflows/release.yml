@@ -232,22 +232,3 @@ jobs:
           fi
           printf "Released '%s' as '%s@%s'.\n" \
             "$TAG" "$IMAGE" "$DIGEST" >>"$GITHUB_STEP_SUMMARY"
-      - name: Dispatch the Helm chart update
-        env:
-          DIGEST: ${{ steps.manifest.outputs.digest }}
-          GH_TOKEN: ${{ secrets.HELM_REPOSITORY_TOKEN }}
-        run: |
-          set -euo pipefail
-          jq -n \
-            --arg version "$VERSION" \
-            --arg manifest_digest "$DIGEST" \
-            --arg source_revision "$GITHUB_SHA" \
-            '{
-              event_type: "runtime-released",
-              client_payload: {
-                version: $version,
-                manifest_digest: $manifest_digest,
-                source_revision: $source_revision
-              }
-            }' \
-            | gh api --method POST repos/korioinc/helm/dispatches --input -
