@@ -53,20 +53,8 @@ RUN /usr/local/sbin/install-runtime-tools \
  && npm install --global --ignore-scripts --no-audit --no-fund "corepack@${COREPACK_VERSION}" \
  && corepack --version | grep --fixed-strings "${COREPACK_VERSION}" \
  && npm cache clean --force
-RUN install -d /opt/codebase-memory-mcp-install/home \
- && curl -fsSL \
-      -o /tmp/codebase-memory-mcp-install.sh \
-      https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/c0bd4bbf8dace58cffdb24fad86d95e325df99f4/install.sh \
- && printf '%s  %s\n' \
-      2fdd4d6563fc8e540bb32e233c5fdef22ecf05d7ebd5a80657cd4fec953b3475 \
-      /tmp/codebase-memory-mcp-install.sh \
-      | sha256sum --check --strict \
- && HOME=/opt/codebase-memory-mcp-install/home \
-      bash /tmp/codebase-memory-mcp-install.sh \
-        --dir=/opt/codebase-memory-mcp-install --skip-config \
- && install -m 0555 /opt/codebase-memory-mcp-install/codebase-memory-mcp \
-      /usr/local/bin/codebase-memory-mcp \
- && rm -rf /opt/codebase-memory-mcp-install /tmp/codebase-memory-mcp-install.sh \
+RUN curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh \
+      | bash -s -- --dir=/usr/local/bin --skip-config \
  && install -d -o 65532 -g 65532 -m 0700 /home/multica/.cache/codebase-memory-mcp \
  && runuser --user multica -- env \
       CBM_CACHE_DIR=/home/multica/.cache/codebase-memory-mcp \
