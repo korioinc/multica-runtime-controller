@@ -51,6 +51,8 @@ jobs:
         "create-develop-to-main-pr.yml": """\
 name: Create develop to main PR
 on:
+  push:
+    branches: [develop]
   pull_request:
 permissions: {}
 jobs:
@@ -62,6 +64,7 @@ jobs:
           echo 'types: [automation-ci, create-develop-to-main-pr]'
           echo '-f name="verify"'
           echo '-f name="runtime-image"'
+          echo 'prepare-release --base-ref origin/main'
           echo '--base main --head develop'
           echo 'gh pr create --base main --head develop'
 """,
@@ -111,6 +114,124 @@ def multica_release(version: str) -> dict[str, object]:
 
 
 class RuntimeVersionTests(unittest.TestCase):
+    def initialize_release_repository(
+        self, root: Path, *, base_version: str, current_version: str | None = None
+    ) -> None:
+        subprocess.run(["git", "init", "-q", "-b", "main"], cwd=root, check=True)
+        subprocess.run(["git", "config", "user.name", "test"], cwd=root, check=True)
+        subprocess.run(
+            ["git", "config", "user.email", "test@example.com"], cwd=root, check=True
+        )
+        (root / "VERSION").write_text(f"{base_version}\n", encoding="ascii")
+        subprocess.run(["git", "add", "VERSION"], cwd=root, check=True)
+        subprocess.run(["git", "commit", "-qm", "base"], cwd=root, check=True)
+        subprocess.run(["git", "checkout", "-qb", "develop"], cwd=root, check=True)
+        if current_version is not None:
+            (root / "VERSION").write_text(f"{current_version}\n", encoding="ascii")
+
+    def test_prepare_release_version_bumps_patch_from_base(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.initialize_release_repository(root, base_version="0.3.23")
+
+            previous = runtime_versions.PROJECT_ROOT
+            try:
+                runtime_versions.activate_target_root(root.resolve())
+                result = runtime_versions.prepare_release_version("main")
+            finally:
+                runtime_versions.activate_target_root(previous)
+
+            self.assertEqual(
+                result,
+                {
+                    "base_ref": "main",
+                    "changed": True,
+                    "release_version": {"from": "0.3.23", "to": "0.3.24"},
+                },
+            )
+            self.assertEqual((root / "VERSION").read_text(encoding="ascii"), "0.3.24\n")
+
+    def test_prepare_release_version_is_idempotent_after_bump(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.initialize_release_repository(root, base_version="0.3.23")
+
+            previous = runtime_versions.PROJECT_ROOT
+            try:
+                runtime_versions.activate_target_root(root.resolve())
+                runtime_versions.prepare_release_version("main")
+                result = runtime_versions.prepare_release_version("main")
+            finally:
+                runtime_versions.activate_target_root(previous)
+
+            self.assertEqual(
+                result,
+                {
+                    "base_ref": "main",
+                    "changed": False,
+                    "release_version": {"from": "0.3.23", "to": "0.3.24"},
+                },
+            )
+            self.assertEqual((root / "VERSION").read_text(encoding="ascii"), "0.3.24\n")
+
+    def test_prepare_release_version_rejects_versions_outside_allowed_transition(
+        self,
+    ) -> None:
+        for current_version in ("0.3.22", "0.3.25"):
+            with (
+                self.subTest(current_version=current_version),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                self.initialize_release_repository(
+                    root, base_version="0.3.23", current_version=current_version
+                )
+
+                previous = runtime_versions.PROJECT_ROOT
+                try:
+                    runtime_versions.activate_target_root(root.resolve())
+                    with self.assertRaises(runtime_versions.ResolverError):
+                        runtime_versions.prepare_release_version("main")
+                finally:
+                    runtime_versions.activate_target_root(previous)
+
+                self.assertEqual(
+                    (root / "VERSION").read_text(encoding="ascii"),
+                    f"{current_version}\n",
+                )
+
+    def test_prepare_release_cli_writes_version_and_reports_result(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.initialize_release_repository(root, base_version="0.3.23")
+
+            completed = subprocess.run(
+                [
+                    "python3",
+                    str(Path(runtime_versions.__file__).resolve()),
+                    "--root",
+                    str(root.resolve()),
+                    "prepare-release",
+                    "--base-ref",
+                    "main",
+                ],
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(
+                json.loads(completed.stdout),
+                {
+                    "base_ref": "main",
+                    "changed": True,
+                    "release_version": {"from": "0.3.23", "to": "0.3.24"},
+                },
+            )
+            self.assertEqual((root / "VERSION").read_text(encoding="ascii"), "0.3.24\n")
+
     def test_validate_actions_accepts_secret_free_workflows(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workflows = Path(directory)
