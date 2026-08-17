@@ -9,6 +9,86 @@ from pathlib import Path
 from scripts import runtime_versions
 
 
+HELM_REPOSITORY_SECRET = "${{ secrets.HELM_REPOSITORY_TOKEN }}"
+
+
+def write_action_workflows(
+    directory: Path,
+    *,
+    release_secrets: tuple[tuple[str, str], ...] = (),
+    runtime_update_secrets: tuple[tuple[str, str], ...] = (),
+) -> None:
+    def secret_step(name: str, secrets: tuple[tuple[str, str], ...]) -> str:
+        if not secrets:
+            return ""
+        environment = "\n".join(f"          {key}: {value}" for key, value in secrets)
+        return f"""\
+      - name: {name}
+        env:
+{environment}
+        run: gh api --method POST repos/korioinc/helm/dispatches
+"""
+
+    workflows = {
+        "runtime-version-update.yml": f"""\
+name: Runtime version update
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+permissions: {{}}
+jobs:
+  update:
+    permissions: {{}}
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo 'build/runtime-versions.env VERSION'
+          echo 'gh pr create'
+          echo 'pulls/$PR_NUMBER/merge'
+          echo 'event_type:"create-develop-to-main-pr"'
+{secret_step("Unexpected secret consumer", runtime_update_secrets)}""",
+        "create-develop-to-main-pr.yml": """\
+name: Create develop to main PR
+on:
+  pull_request:
+permissions: {}
+jobs:
+  create:
+    permissions: {}
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo 'types: [automation-ci, create-develop-to-main-pr]'
+          echo '-f name="verify"'
+          echo '-f name="runtime-image"'
+          echo '--base main --head develop'
+          echo 'gh pr create --base main --head develop'
+""",
+        "release.yml": f"""\
+name: Release
+on:
+  push:
+    branches: [main]
+permissions: {{}}
+jobs:
+  release:
+    permissions: {{}}
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo 'docker/build-push-action@'
+          echo 'platform: linux/amd64'
+          echo 'platform: linux/arm64'
+          echo 'docker buildx imagetools create'
+          echo 'gh release create'
+          echo 'VERSION=$(cat VERSION)'
+{secret_step("Dispatch the Helm chart update", release_secrets)}""",
+    }
+    for name, text in workflows.items():
+        (directory / name).write_text(text, encoding="utf-8")
+
+
 def multica_release(version: str) -> dict[str, object]:
     return {
         "draft": False,
@@ -31,6 +111,62 @@ def multica_release(version: str) -> dict[str, object]:
 
 
 class RuntimeVersionTests(unittest.TestCase):
+    def test_validate_actions_allows_single_helm_repository_secret_in_release(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workflows = Path(directory)
+            write_action_workflows(
+                workflows,
+                release_secrets=(("GH_TOKEN", HELM_REPOSITORY_SECRET),),
+            )
+
+            try:
+                result = runtime_versions.validate_actions(workflows)
+            except runtime_versions.ResolverError as error:
+                self.fail(f"the release dispatch secret should be allowed: {error}")
+
+            self.assertEqual(result["workflows"], 3)
+
+    def test_validate_actions_rejects_secrets_outside_release_exception(self) -> None:
+        cases = (
+            (
+                "different release secret",
+                (("GH_TOKEN", "${{ secrets.OTHER_TOKEN }}"),),
+                (),
+                "release.yml",
+            ),
+            (
+                "Helm secret in another workflow",
+                (),
+                (("GH_TOKEN", HELM_REPOSITORY_SECRET),),
+                "runtime-version-update.yml",
+            ),
+            (
+                "duplicate Helm secret",
+                (
+                    ("GH_TOKEN", HELM_REPOSITORY_SECRET),
+                    ("EXTRA_TOKEN", HELM_REPOSITORY_SECRET),
+                ),
+                (),
+                "release.yml",
+            ),
+        )
+        for name, release_secrets, runtime_update_secrets, file_name in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                workflows = Path(directory)
+                write_action_workflows(
+                    workflows,
+                    release_secrets=release_secrets,
+                    runtime_update_secrets=runtime_update_secrets,
+                )
+
+                with self.assertRaisesRegex(
+                    runtime_versions.ResolverError,
+                    rf"^workflow_privilege_contract_failed file={file_name}$",
+                ):
+                    runtime_versions.validate_actions(workflows)
+
     def test_cli_requires_an_explicit_absolute_target_root(self) -> None:
         with self.assertRaises(runtime_versions.ResolverError):
             runtime_versions.activate_target_root(Path("relative"))
