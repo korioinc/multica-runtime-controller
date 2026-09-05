@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -43,14 +44,11 @@ func main() {
 			}
 			return
 		case "daemon":
-			if err := writeOfficialCLIConfig(os.Getenv); err != nil {
+			if err := runOfficialDaemon(); err != nil {
 				_, _ = fmt.Fprintln(os.Stderr, err)
 				os.Exit(1)
 			}
-			if err := intercept.PersistLauncherConfig(); err != nil {
-				_, _ = fmt.Fprintln(os.Stderr, err)
-				os.Exit(1)
-			}
+			return
 		}
 	}
 
@@ -76,7 +74,7 @@ func commandFor(args []string, getenv func(string) string) (string, []string, er
 	if args[0] != "daemon" {
 		return "", nil, fmt.Errorf("unknown mode %q", args[0])
 	}
-	path := valueOr(getenv("MULTICA_BINARY"), "/usr/local/bin/multica")
+	path := "/usr/local/bin/multica"
 	runtimeName := valueOr(getenv("MULTICA_RUNTIME_NAME"), "runtime-controller")
 	daemonID, err := configuredDaemonID(getenv)
 	if err != nil {
@@ -181,6 +179,13 @@ func daemonEnvironment(environ []string, getenv func(string) string) []string {
 	values["MULTICA_WORKSPACES_ROOT"] = "/workspace"
 	values["MULTICA_DAEMON_AUTO_UPDATE"] = "false"
 	values["MULTICA_DAEMON_AUTO_RELOAD"] = "false"
+	// The child connects through loopback, so preserve the official Cloud GC
+	// default using the operator's original backend origin. Explicit policy wins.
+	if strings.TrimSpace(values["MULTICA_GC_COMPLETED_TASK_TTL"]) == "" {
+		if backend, err := url.Parse(strings.TrimSpace(values["MULTICA_BASE_URL"])); err == nil && strings.EqualFold(backend.Hostname(), "api.multica.ai") {
+			values["MULTICA_GC_COMPLETED_TASK_TTL"] = "336h"
+		}
+	}
 	configureGitHubEnvironment(values)
 	result := make([]string, 0, len(values))
 	for key, value := range values {
