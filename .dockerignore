@@ -10,7 +10,4 @@
 !scripts/install-runtime-tools.sh
 !scripts/runtime-entrypoint.sh
 !scripts/verify-runtime-tools.sh
-!build/
-!build/multica-worker-checkout.patch
-!build/multica-task-grants.patch
 **/*_test.go

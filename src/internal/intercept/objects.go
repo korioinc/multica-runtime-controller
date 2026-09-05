@@ -21,6 +21,7 @@ const (
 	ManagedByLabel      = "app.kubernetes.io/managed-by"
 	ManagedByValue      = "multica-runtime-controller"
 	TaskIDLabel         = "multica.ai/task-id"
+	StorageIDLabel      = "multica.ai/storage-id"
 	RequestKey          = "request.json"
 	requestPath         = "/var/run/multica/intercept/request.json"
 	workspaceRoot       = "/workspace"
@@ -42,10 +43,14 @@ var providerExecutables = map[string]string{
 }
 
 type Request struct {
-	Provider string   `json:"provider"`
-	Args     []string `json:"args,omitempty"`
-	Env      []string `json:"env"`
-	WorkDir  string   `json:"work_dir"`
+	Provider       string   `json:"provider"`
+	Args           []string `json:"args,omitempty"`
+	Env            []string `json:"env"`
+	WorkDir        string   `json:"work_dir"`
+	WorkerSubPath  string   `json:"worker_sub_path,omitempty"`
+	BrokerPort     int      `json:"broker_port,omitempty"`
+	BrokerToken    string   `json:"broker_token,omitempty"`
+	RepositoryURLs []string `json:"repository_urls,omitempty"`
 }
 
 type Config struct {
@@ -53,6 +58,7 @@ type Config struct {
 	Image              string
 	ImagePullPolicy    corev1.PullPolicy
 	DaemonProxyURL     string
+	BackendURL         string
 	ServiceAccountName string
 	WorkspacePVCName   string
 	ExtraVolumes       []corev1.Volume
@@ -120,7 +126,7 @@ func taskEnvironment(environ []string) []string {
 
 func omitTaskEnvironment(key string) bool {
 	switch key {
-	case "MULTICA_CONTROLLER_TOKEN_FILE", "MULTICA_CONTROLLER_GRANT_KEY", "MULTICA_RUNTIME_IMAGE", "MULTICA_RUNTIME_IMAGE_PULL_POLICY",
+	case "MULTICA_CONTROLLER_TOKEN_FILE", "MULTICA_RUNTIME_IMAGE", "MULTICA_RUNTIME_IMAGE_PULL_POLICY",
 		"MULTICA_DAEMON_PROXY_URL",
 		"MULTICA_WORKER_SERVICE_ACCOUNT", "MULTICA_WORKSPACE_PVC_NAME", "MULTICA_WORKER_EXTRA_VOLUMES",
 		"MULTICA_WORKER_EXTRA_VOLUME_MOUNTS", "MULTICA_WORKER_CPU_REQUEST", "MULTICA_WORKER_CPU_LIMIT",
@@ -143,7 +149,7 @@ func requestSecret(cfg Config, taskID string, request Request, owner metav1.Owne
 	if err != nil {
 		return nil, fmt.Errorf("encode provider request: %w", err)
 	}
-	labels := map[string]string{ManagedByLabel: ManagedByValue, TaskIDLabel: taskID}
+	labels := map[string]string{ManagedByLabel: ManagedByValue, TaskIDLabel: taskID, StorageIDLabel: filepath.Base(request.WorkerSubPath)}
 	ownerReferences := []metav1.OwnerReference{owner}
 	return &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
@@ -156,7 +162,7 @@ func requestSecret(cfg Config, taskID string, request Request, owner metav1.Owne
 }
 
 func taskPod(cfg Config, taskID, requestSecretName string, request Request, owner metav1.OwnerReference) (*corev1.Pod, error) {
-	generateName, err := taskGenerateNameFor(taskID)
+	_, err := taskGenerateNameFor(taskID)
 	if err != nil {
 		return nil, err
 	}
@@ -166,8 +172,15 @@ func taskPod(cfg Config, taskID, requestSecretName string, request Request, owne
 	if requestEnvironmentValue(request.Env, "MULTICA_TASK_ID") != taskID {
 		return nil, errors.New("provider request does not match the task identity")
 	}
-	taskRoot, taskSubPath, err := taskStorageRoot(request)
+	taskRoot, _, err := taskStorageRoot(request)
 	if err != nil {
+		return nil, err
+	}
+	if !strings.HasPrefix(request.WorkerSubPath, ".runtime-workers/") ||
+		filepath.Dir(request.WorkerSubPath) != ".runtime-workers" {
+		return nil, errors.New("task requires separately bound worker storage")
+	}
+	if _, err := uuid.Parse(filepath.Base(request.WorkerSubPath)); err != nil {
 		return nil, err
 	}
 	piSession, err := taskPiSession(request)
@@ -178,7 +191,7 @@ func taskPod(cfg Config, taskID, requestSecretName string, request Request, owne
 	if requestSecretName == "" || len(k8svalidation.IsDNS1123Subdomain(requestSecretName)) != 0 {
 		return nil, errors.New("provider request Secret name must be a valid DNS subdomain")
 	}
-	labels := map[string]string{ManagedByLabel: ManagedByValue, TaskIDLabel: taskID}
+	labels := map[string]string{ManagedByLabel: ManagedByValue, TaskIDLabel: taskID, StorageIDLabel: filepath.Base(request.WorkerSubPath)}
 	ownerReferences := []metav1.OwnerReference{owner}
 
 	volumes := []corev1.Volume{
@@ -189,7 +202,7 @@ func taskPod(cfg Config, taskID, requestSecretName string, request Request, owne
 	}
 	mounts := []corev1.VolumeMount{
 		{Name: "request", MountPath: "/var/run/multica/intercept", ReadOnly: true},
-		{Name: "workspace", MountPath: taskRoot, SubPath: taskSubPath},
+		{Name: "workspace", MountPath: taskRoot, SubPath: request.WorkerSubPath},
 		{Name: "agent-home", MountPath: agentHome, SubPath: agentHomeSubPath},
 		{Name: "tmp", MountPath: "/tmp"},
 	}
@@ -198,6 +211,9 @@ func taskPod(cfg Config, taskID, requestSecretName string, request Request, owne
 			Name: "workspace", MountPath: piSession,
 			SubPath: ".multica/pi-sessions/" + filepath.Base(piSession),
 		})
+	}
+	if request.Provider == "codex" {
+		mounts = append(mounts, corev1.VolumeMount{Name: "workspace", MountPath: agentHome + "/.codex/skills", SubPath: request.WorkerSubPath + "/codex-skills", ReadOnly: true})
 	}
 	for i := range cfg.ExtraVolumes {
 		volumes = append(volumes, *cfg.ExtraVolumes[i].DeepCopy())
@@ -214,7 +230,7 @@ func taskPod(cfg Config, taskID, requestSecretName string, request Request, owne
 	}
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			GenerateName: generateName, Namespace: cfg.Namespace, Labels: maps.Clone(labels), OwnerReferences: ownerReferences,
+			Name: "task-worker-" + filepath.Base(request.WorkerSubPath), Namespace: cfg.Namespace, Labels: maps.Clone(labels), OwnerReferences: ownerReferences,
 		},
 		Spec: corev1.PodSpec{
 			ServiceAccountName:            cfg.ServiceAccountName,

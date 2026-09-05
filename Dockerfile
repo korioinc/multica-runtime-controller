@@ -121,31 +121,6 @@ RUN case "${TARGETARCH}" in \
  && chmod 0555 /out/multica \
  && /out/multica version | grep --fixed-strings "multica ${MULTICA_CLI_VERSION}"
 
-# The released CLI remains in workers. The daemon adds a plan-only checkout
-# mode so it never executes Git against worker-controlled repository metadata.
-FROM cli-download-base AS multica-source
-ARG MULTICA_CLI_VERSION
-RUN curl --fail --location --silent --show-error \
-      --output /tmp/multica-source.tar.gz \
-      "https://github.com/multica-ai/multica/archive/refs/tags/v${MULTICA_CLI_VERSION}.tar.gz" \
- && mkdir -p /src \
- && tar -xzf /tmp/multica-source.tar.gz -C /src --strip-components=1
-
-FROM go-runtime AS multica-daemon-build
-ARG MULTICA_CLI_VERSION
-ENV GOTOOLCHAIN=auto
-WORKDIR /src
-COPY --from=multica-source /src/server/ ./server/
-COPY build/multica-worker-checkout.patch /tmp/multica-worker-checkout.patch
-COPY build/multica-task-grants.patch /tmp/multica-task-grants.patch
-RUN git apply --check /tmp/multica-worker-checkout.patch /tmp/multica-task-grants.patch \
- && git apply /tmp/multica-worker-checkout.patch /tmp/multica-task-grants.patch \
- && cd server \
- && IS_SANDBOX=1 MULTICA_CONTROLLER_GRANT_KEY=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f go test ./internal/daemon -run '^TestTaskRepoGrants' \
- && CGO_ENABLED=0 go build -trimpath \
-      -ldflags "-s -w -X main.version=${MULTICA_CLI_VERSION} -X main.commit=v${MULTICA_CLI_VERSION}+worker-isolation" \
-      -o /out/multica-daemon ./cmd/multica
-
 FROM cli-download-base AS antigravity-download
 ARG TARGETARCH
 ARG ANTIGRAVITY_VERSION
@@ -166,7 +141,6 @@ FROM provider-runtime AS runtime
 COPY --from=controller-build /out/multica-runtime /usr/local/bin/multica-runtime
 COPY --from=controller-build /out/multica-provider-shim /usr/local/bin/multica-provider-shim
 COPY --from=multica-download /out/multica /usr/local/bin/multica
-COPY --from=multica-daemon-build /out/multica-daemon /opt/multica/controller/multica
 COPY --from=antigravity-download /out/agy /opt/multica/providers/bin/agy
 RUN chmod 0555 \
       /usr/local/bin/multica-runtime \

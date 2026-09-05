@@ -1,30 +1,31 @@
 package checkout_test
 
 import (
+	"bytes"
 	"context"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/korioinc/multica-runtime-controller/internal/checkout"
+	"github.com/korioinc/multica-runtime-controller/internal/snapshot"
 )
 
 // These tests use actual repositories and Git subprocesses: their oracles are
 // repository contents and preserved agent data, not Git command choreography.
-func TestCheckoutSelectedRevisionAndRepeatPreservesAgentWork(t *testing.T) {
+func TestSnapshotRevisionAndRepeatPreserveAgentWork(t *testing.T) {
 	env := gitEnvironment(t)
 	source := createRepository(t, env, filepath.Join(t.TempDir(), "project"), "main content")
 	git(t, env, source, "checkout", "-b", "review")
 	write(t, filepath.Join(source, "source.txt"), "review content")
 	git(t, env, source, "commit", "-am", "review revision")
-	git(t, env, source, "checkout", "main")
 	root := t.TempDir()
-	plan := checkout.Plan{URL: source, Ref: "review", WorkDir: root, TaskID: "task-a", AgentName: "reviewer"}
+	plan := checkout.Plan{URL: source, Ref: "review", WorkDir: root, TaskID: "task-a"}
 	executor := newExecutor(t, root, env)
-	result, err := executor.Checkout(context.Background(), plan)
+	result, err := checkoutArchive(t, executor, plan, source)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -34,7 +35,7 @@ func TestCheckoutSelectedRevisionAndRepeatPreservesAgentWork(t *testing.T) {
 
 	// A restarted proxy can recover the same checkout without discarding work.
 	executor = newExecutor(t, root, env)
-	if _, err := executor.Checkout(context.Background(), plan); err != nil {
+	if _, err := checkoutArchive(t, executor, plan, source); err != nil {
 		t.Fatal(err)
 	}
 	assertContent(t, filepath.Join(result.Path, "source.txt"), "agent tracked edit")
@@ -51,7 +52,7 @@ func TestCheckoutSelectedRevisionAndRepeatPreservesAgentWork(t *testing.T) {
 	}
 	executor = newExecutor(t, root, continuedEnv)
 	plan.TaskID = "task-b"
-	continued, err := executor.Checkout(context.Background(), plan)
+	continued, err := checkoutArchive(t, executor, plan, source)
 	if err != nil {
 		t.Fatalf("authorized continuation cannot recover prior work: %v", err)
 	}
@@ -61,7 +62,7 @@ func TestCheckoutSelectedRevisionAndRepeatPreservesAgentWork(t *testing.T) {
 		t.Fatal("authorized continuation replaced the branch carrying prior work")
 	}
 	plan.Ref = "main"
-	if _, err := executor.Checkout(context.Background(), plan); err == nil {
+	if _, err := checkoutArchive(t, executor, plan, source); err == nil {
 		t.Fatal("checkout silently accepted a ref change on existing agent work")
 	}
 	assertContent(t, filepath.Join(result.Path, "source.txt"), "agent tracked edit")
@@ -75,13 +76,13 @@ func TestSameBasenameRepositoriesKeepSeparateContents(t *testing.T) {
 	root := t.TempDir()
 	executor := newExecutor(t, root, env)
 	plan := checkout.Plan{URL: first, WorkDir: root, TaskID: "task-a"}
-	firstResult, err := executor.Checkout(context.Background(), plan)
+	firstResult, err := checkoutArchive(t, executor, plan, first)
 	if err != nil {
 		t.Fatal(err)
 	}
 	write(t, filepath.Join(firstResult.Path, "source.txt"), "first agent work")
 	plan.URL = second
-	secondResult, err := executor.Checkout(context.Background(), plan)
+	secondResult, err := checkoutArchive(t, executor, plan, second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,12 +90,50 @@ func TestSameBasenameRepositoriesKeepSeparateContents(t *testing.T) {
 	assertContent(t, filepath.Join(firstResult.Path, "source.txt"), "first agent work")
 }
 
+func TestOfficialHookUpdatesCommitAttributionWithoutResettingWork(t *testing.T) {
+	env := gitEnvironment(t)
+	source := createRepository(t, env, filepath.Join(t.TempDir(), "project"), "repository content")
+	hook := filepath.Join(source, ".git", "hooks", "prepare-commit-msg")
+	const attribution = "fixture-author-credit"
+	enable := func() {
+		write(t, hook, "#!/bin/sh\nprintf '\\n"+attribution+"\\n' >> \"$1\"\n")
+		if err := os.Chmod(hook, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	enable()
+	root := t.TempDir()
+	executor := newExecutor(t, root, env)
+	plan := checkout.Plan{URL: source, WorkDir: root, TaskID: "task-a"}
+	result, err := checkoutArchive(t, executor, plan, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(result.Path, "source.txt"), "unfinished edit")
+	for _, enabled := range []bool{true, false, true} {
+		if enabled {
+			enable()
+		} else if err := os.Remove(hook); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := checkoutArchive(t, executor, plan, source); err != nil {
+			t.Fatal(err)
+		}
+		git(t, env, result.Path, "commit", "--allow-empty", "-m", "worker commit")
+		message := git(t, env, result.Path, "log", "-1", "--format=%B")
+		if strings.Contains(message, attribution) != enabled {
+			t.Fatal("commit did not use the current official attribution setting")
+		}
+		assertContent(t, filepath.Join(result.Path, "source.txt"), "unfinished edit")
+	}
+}
+
 func TestCheckoutObjectsSurviveSourceObjectCorruption(t *testing.T) {
 	env := gitEnvironment(t)
 	source := createRepository(t, env, filepath.Join(t.TempDir(), "project"), "independent repository content")
 	root := t.TempDir()
 	executor := newExecutor(t, root, env)
-	result, err := executor.Checkout(context.Background(), checkout.Plan{URL: source, WorkDir: root, TaskID: "task-a"})
+	result, err := checkoutArchive(t, executor, checkout.Plan{URL: source, WorkDir: root, TaskID: "task-a"}, source)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,7 +168,7 @@ func TestFailedCheckoutPreservesUnownedExistingPath(t *testing.T) {
 	root := t.TempDir()
 	executor := newExecutor(t, root, env)
 	plan := checkout.Plan{URL: source, WorkDir: root, TaskID: "task-a"}
-	result, err := executor.Checkout(context.Background(), plan)
+	result, err := checkoutArchive(t, executor, plan, source)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,87 +177,62 @@ func TestFailedCheckoutPreservesUnownedExistingPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	write(t, filepath.Join(result.Path, "valuable.txt"), "unrelated user data")
-	if _, err := executor.Checkout(context.Background(), plan); err == nil {
+	if _, err := checkoutArchive(t, executor, plan, source); err == nil {
 		t.Fatal("checkout adopted an unowned user directory")
 	}
 	assertContent(t, filepath.Join(result.Path, "valuable.txt"), "unrelated user data")
 	assertContent(t, filepath.Join(result.Path+"-saved", "source.txt"), "repository content")
 }
 
-func TestCheckoutDoesNotReplaceUserPathCreatedDuringClone(t *testing.T) {
+func TestCheckoutDoesNotReplaceUserPathCreatedDuringExtraction(t *testing.T) {
 	env := gitEnvironment(t)
 	source := createRepository(t, env, filepath.Join(t.TempDir(), "project"), "repository content")
-	transport := t.TempDir()
-	ssh := filepath.Join(transport, "ssh")
-	// This controlled transport runs the real Git server. The second clone is
-	// held after it starts so unrelated user work can occupy the final path.
-	write(t, ssh, `#!/bin/sh
-if [ -f "$FIXTURE_GATE" ]; then
-  touch "$FIXTURE_STARTED"
-  while [ ! -f "$FIXTURE_RELEASE" ]; do sleep 0.01; done
-fi
-exec git-upload-pack "$FIXTURE_SOURCE"
-`)
-	if err := os.Chmod(ssh, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	gate := filepath.Join(transport, "gate")
-	started := filepath.Join(transport, "started")
-	release := filepath.Join(transport, "release")
-	env = append(env, "GIT_SSH="+ssh, "GIT_SSH_VARIANT=ssh", "FIXTURE_SOURCE="+source,
-		"FIXTURE_GATE="+gate, "FIXTURE_STARTED="+started, "FIXTURE_RELEASE="+release)
 	root := t.TempDir()
 	executor := newExecutor(t, root, env)
-	plan := checkout.Plan{URL: "ssh://fixture/project.git", WorkDir: root, TaskID: "task-a"}
-	result, err := executor.Checkout(context.Background(), plan)
+	plan := checkout.Plan{URL: source, WorkDir: root, TaskID: "task-a"}
+	result, err := checkoutArchive(t, executor, plan, source)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Rename(result.Path, result.Path+"-saved"); err != nil {
 		t.Fatal(err)
 	}
-	write(t, gate, "block next clone")
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-	done := make(chan error, 1)
-	go func() {
-		_, err := executor.Checkout(ctx, plan)
-		done <- err
-	}()
-	defer func() {
-		// Release the child transport even if the assertion above fails.
-		_ = os.WriteFile(release, nil, 0o600)
-	}()
-	for {
-		if _, err := os.Stat(started); err == nil {
-			break
-		}
-		select {
-		case err := <-done:
-			t.Fatalf("clone ended before reaching controlled transport: %v", err)
-		case <-ctx.Done():
-			t.Fatal("clone did not reach controlled transport")
-		case <-time.After(10 * time.Millisecond):
-		}
-	}
-	// An empty user directory is significant: ordinary os.Rename can replace
-	// it, while the required no-replace publish must preserve even that path.
-	if err := os.Mkdir(result.Path, 0o755); err != nil {
+	var archive bytes.Buffer
+	if err := snapshot.Write(&archive, source); err != nil {
 		t.Fatal(err)
 	}
-	before, err := os.Stat(result.Path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	write(t, release, "continue")
-	if err := <-done; err == nil {
-		t.Fatal("checkout replaced a user directory created during clone")
+	var before os.FileInfo
+	reader := &onRead{Reader: &archive, action: func() {
+		if err := os.Mkdir(result.Path, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		before, err = os.Stat(result.Path)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}}
+	if _, err := executor.Checkout(context.Background(), plan, "main", reader); err == nil {
+		t.Fatal("checkout replaced a directory created before publication")
 	}
 	after, err := os.Stat(result.Path)
 	if err != nil || !os.SameFile(before, after) {
-		t.Fatal("failed publish replaced the concurrently created user directory")
+		t.Fatal("publication replaced the user's existing directory")
 	}
 	assertContent(t, filepath.Join(result.Path+"-saved", "source.txt"), "repository content")
+}
+
+type onRead struct {
+	io.Reader
+	action func()
+}
+
+func (r *onRead) Read(p []byte) (int, error) {
+	if r.action != nil {
+		action := r.action
+		r.action = nil
+		action()
+	}
+	return r.Reader.Read(p)
 }
 
 func TestCheckoutCannotWriteThroughAnotherTasksDirectory(t *testing.T) {
@@ -232,7 +246,7 @@ func TestCheckoutCannotWriteThroughAnotherTasksDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, workDir := range []string{outside, filepath.Join(link, "new-directory")} {
-		_, err := executor.Checkout(context.Background(), checkout.Plan{URL: source, WorkDir: workDir, TaskID: "task-a"})
+		_, err := checkoutArchive(t, executor, checkout.Plan{URL: source, WorkDir: workDir, TaskID: "task-a"}, source)
 		if err == nil {
 			t.Fatal("checkout allowed a write outside the task root")
 		}
@@ -245,7 +259,7 @@ func TestCheckoutCannotWriteThroughAnotherTasksDirectory(t *testing.T) {
 		t.Fatal("rejected checkout wrote into another task directory")
 	}
 	unauthorized := filepath.Join(root, "unauthorized")
-	if _, err := executor.Checkout(context.Background(), checkout.Plan{URL: source, WorkDir: unauthorized, TaskID: "task-b"}); err == nil {
+	if _, err := checkoutArchive(t, executor, checkout.Plan{URL: source, WorkDir: unauthorized, TaskID: "task-b"}, source); err == nil {
 		t.Fatal("checkout accepted a different task identity")
 	}
 	if _, err := os.Stat(unauthorized); !os.IsNotExist(err) {
@@ -316,4 +330,13 @@ func assertContent(t *testing.T, path, want string) {
 	if string(got) != want {
 		t.Fatalf("agent data changed: got %q, want %q", got, want)
 	}
+}
+
+func checkoutArchive(t *testing.T, executor *checkout.Executor, plan checkout.Plan, source string) (checkout.Result, error) {
+	t.Helper()
+	var archive bytes.Buffer
+	if err := snapshot.Write(&archive, source); err != nil {
+		t.Fatal(err)
+	}
+	return executor.Checkout(context.Background(), plan, "main", &archive)
 }

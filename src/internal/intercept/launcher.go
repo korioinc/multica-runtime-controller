@@ -11,6 +11,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -49,6 +50,17 @@ func NewLauncher(ctx context.Context, cfg Config, controllerPodName string) (*La
 }
 
 func (l *Launcher) Run(ctx context.Context, taskID string, request Request, streams Streams) error {
+	releaseStorage, err := l.prepareTaskStorage(ctx, taskID, &request)
+	if err != nil {
+		return err
+	}
+	defer releaseStorage()
+	port, token, closeBroker, err := startCheckoutBroker(request)
+	if err != nil {
+		return err
+	}
+	defer closeBroker()
+	request.BrokerPort, request.BrokerToken = port, token
 	secret, err := requestSecret(l.config, taskID, request, l.owner)
 	if err != nil {
 		return err
@@ -60,23 +72,25 @@ func (l *Launcher) Run(ctx context.Context, taskID string, request Request, stre
 		return fmt.Errorf("create provider request Secret with prefix %s: %w", secret.GenerateName, err)
 	}
 	createdSecretName := createdSecret.Name
+	createdSecretUID := createdSecret.UID
 	createdPodName := ""
+	var createdPodUID types.UID
 	defer func() {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		if createdPodName != "" {
-			_ = pods.Delete(cleanupCtx, createdPodName, metav1.DeleteOptions{})
+			_ = pods.Delete(cleanupCtx, createdPodName, metav1.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &createdPodUID}})
 			_ = wait.PollUntilContextTimeout(cleanupCtx, 200*time.Millisecond, 20*time.Second, true, func(ctx context.Context) (bool, error) {
-				_, err := pods.Get(ctx, createdPodName, metav1.GetOptions{})
-				return apierrors.IsNotFound(err), nil
+				pod, err := pods.Get(ctx, createdPodName, metav1.GetOptions{})
+				return apierrors.IsNotFound(err) || (err == nil && pod.UID != createdPodUID), nil
 			})
 		}
-		if createdSecretName != "" {
-			_ = secrets.Delete(cleanupCtx, createdSecretName, metav1.DeleteOptions{})
+		if createdSecretName != "" && createdSecretUID != "" {
+			_ = secrets.Delete(cleanupCtx, createdSecretName, metav1.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &createdSecretUID}})
 		}
 	}()
-	if createdSecretName == "" {
-		return errors.New("Kubernetes API returned a provider request Secret without a name")
+	if createdSecretName == "" || createdSecretUID == "" {
+		return errors.New("Kubernetes API did not confirm the provider request Secret identity")
 	}
 
 	pod, err := taskPod(l.config, taskID, createdSecretName, request, l.owner)
@@ -86,12 +100,12 @@ func (l *Launcher) Run(ctx context.Context, taskID string, request Request, stre
 
 	createdPod, err := pods.Create(ctx, pod, metav1.CreateOptions{})
 	if err != nil {
-		return fmt.Errorf("create task Pod with prefix %s: %w", pod.GenerateName, err)
+		return fmt.Errorf("create exclusive task Pod %s: %w", pod.Name, err)
 	}
-	createdPodName = createdPod.Name
-	if createdPodName == "" {
-		return errors.New("Kubernetes API returned a task Pod without a name")
+	if createdPod.Name != pod.Name || createdPod.UID == "" {
+		return errors.New("Kubernetes API did not confirm the expected task Pod identity")
 	}
+	createdPodName, createdPodUID = createdPod.Name, createdPod.UID
 	if err := l.waitUntilRunning(ctx, createdPodName); err != nil {
 		return err
 	}

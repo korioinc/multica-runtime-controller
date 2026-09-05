@@ -1,5 +1,4 @@
-// Package checkout runs approved repository checkout plans inside a task Pod.
-// It never uses the controller's repository cache or linked Git worktrees.
+// Package checkout publishes official repository snapshots inside a task Pod.
 package checkout
 
 import (
@@ -8,21 +7,22 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/korioinc/multica-runtime-controller/internal/snapshot"
 )
 
 type Plan struct {
-	URL                 string `json:"url"`
-	Ref                 string `json:"ref"`
-	WorkDir             string `json:"workdir"`
-	AgentName           string `json:"agent_name"`
-	TaskID              string `json:"task_id"`
-	CoAuthoredByEnabled bool   `json:"co_authored_by_enabled"`
+	URL     string `json:"url"`
+	Ref     string `json:"ref"`
+	WorkDir string `json:"workdir"`
+	TaskID  string `json:"task_id"`
 }
 
 type Result struct {
@@ -79,8 +79,9 @@ func New(workDir string, environ []string) (*Executor, error) {
 }
 
 type identity struct {
-	URL string `json:"url"`
-	Ref string `json:"ref"`
+	URL      string `json:"url"`
+	Ref      string `json:"ref"`
+	HookHash string `json:"hook_hash,omitempty"`
 }
 
 const identityFile = "multica-checkout.json"
@@ -89,7 +90,7 @@ const identityFile = "multica-checkout.json"
 // is the daemon's responsibility; this worker enforces the task and path binding.
 // Repeating a plan preserves all agent changes. Selecting a different ref in an
 // existing checkout is ordinary agent Git work and is never done implicitly.
-func (e *Executor) Checkout(ctx context.Context, plan Plan) (Result, error) {
+func (e *Executor) Checkout(ctx context.Context, plan Plan, branch string, archive io.Reader) (Result, error) {
 	select {
 	case e.guard <- struct{}{}:
 		defer func() { <-e.guard }()
@@ -113,33 +114,34 @@ func (e *Executor) Checkout(ctx context.Context, plan Plan) (Result, error) {
 	}
 	target := filepath.Join(workDir, repositoryName(plan.URL))
 	want := identity{URL: plan.URL, Ref: plan.Ref}
+	reuse := false
 	if _, err := os.Lstat(target); err == nil {
-		return e.reuse(ctx, target, want, plan.CoAuthoredByEnabled)
+		reuse = true
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return Result{}, err
 	}
 
-	// Git owns only this newly created staging directory. Failed Git commands
-	// can never cause deletion of the final path, including a racing user path.
+	// A failed or incomplete snapshot never alters the final directory.
 	stage, err := os.MkdirTemp(workDir, ".multica-checkout-")
 	if err != nil {
 		return Result{}, fmt.Errorf("create checkout staging directory: %w", err)
 	}
 	defer os.RemoveAll(stage)
-	if _, err := e.git(ctx, workDir, "clone", "--no-local", "--no-hardlinks", "--no-checkout", "--template=", "--", plan.URL, stage); err != nil {
-		return Result{}, fmt.Errorf("clone approved repository: %w", err)
+	if err := snapshot.Extract(archive, stage); err != nil {
+		return Result{}, fmt.Errorf("extract approved checkout: %w", err)
 	}
-	commit, err := e.resolveCommit(ctx, stage, plan.Ref)
+	info, err := os.Lstat(filepath.Join(stage, ".git"))
+	if err != nil || !info.IsDir() {
+		return Result{}, errors.New("snapshot is not a standalone Git checkout")
+	}
+	_, want.HookHash, err = snapshotHook(stage)
 	if err != nil {
 		return Result{}, err
 	}
-	branch := branchName(plan.AgentName, plan.TaskID)
-	if _, err := e.git(ctx, stage, "checkout", "--no-track", "-b", branch, commit, "--"); err != nil {
-		return Result{}, fmt.Errorf("checkout selected commit: %w", err)
+	if reuse {
+		return e.reuse(ctx, target, want, stage)
 	}
-	if err := reconcileCoauthor(stage, plan.CoAuthoredByEnabled); err != nil {
-		return Result{}, err
-	}
+
 	raw, err := json.Marshal(want)
 	if err != nil {
 		return Result{}, err
@@ -156,7 +158,7 @@ func (e *Executor) Checkout(ctx context.Context, plan Plan) (Result, error) {
 	return Result{Path: target, BranchName: branch}, nil
 }
 
-func (e *Executor) reuse(ctx context.Context, target string, want identity, coauthor bool) (Result, error) {
+func (e *Executor) reuse(ctx context.Context, target string, want identity, stage string) (Result, error) {
 	for _, path := range []string{target, filepath.Join(target, ".git")} {
 		info, err := os.Lstat(path)
 		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
@@ -174,7 +176,7 @@ func (e *Executor) reuse(ctx context.Context, target string, want identity, coau
 	if have.Ref != want.Ref {
 		return Result{}, fmt.Errorf("checkout at %s already uses requested ref %q; changing to %q would modify existing work; use git inside the task to change refs explicitly", target, have.Ref, want.Ref)
 	}
-	if err := reconcileCoauthor(target, coauthor); err != nil {
+	if err := refreshSnapshotHook(target, stage, have, want); err != nil {
 		return Result{}, err
 	}
 	branch, err := e.git(ctx, target, "symbolic-ref", "--quiet", "--short", "HEAD")
@@ -233,26 +235,6 @@ func within(root, path string) bool {
 	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel)
 }
 
-func (e *Executor) resolveCommit(ctx context.Context, dir, ref string) (string, error) {
-	candidates := []string{"refs/remotes/origin/HEAD", "refs/remotes/origin/main", "refs/remotes/origin/master", "HEAD"}
-	if ref != "" {
-		candidates = []string{"refs/remotes/origin/" + ref, ref}
-	}
-	for _, candidate := range candidates {
-		if commit, err := e.git(ctx, dir, "rev-parse", "--verify", "--end-of-options", candidate+"^{commit}"); err == nil {
-			return commit, nil
-		}
-	}
-	if ref != "" && !strings.HasPrefix(ref, "-") {
-		if _, err := e.git(ctx, dir, "fetch", "--no-tags", "origin", ref); err == nil {
-			if commit, err := e.git(ctx, dir, "rev-parse", "--verify", "FETCH_HEAD^{commit}"); err == nil {
-				return commit, nil
-			}
-		}
-	}
-	return "", fmt.Errorf("cannot resolve requested repository ref %q; confirm the branch, tag, or commit exists on the approved remote", ref)
-}
-
 func (e *Executor) git(ctx context.Context, dir string, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
@@ -293,12 +275,4 @@ func repositoryName(url string) string {
 	name := strings.TrimSuffix(filepath.Base(strings.TrimRight(url, "/")), ".git")
 	sum := sha256.Sum256([]byte(url))
 	return fmt.Sprintf("%s-%x", slug(name, "repo"), sum[:8])
-}
-
-func branchName(agent, task string) string {
-	id := strings.ReplaceAll(task, "-", "")
-	if len(id) > 12 {
-		id = id[len(id)-12:]
-	}
-	return "agent/" + slug(agent, "agent") + "/" + slug(id, "task")
 }

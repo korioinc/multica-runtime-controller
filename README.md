@@ -1,43 +1,46 @@
 # Multica Runtime Controller
 
-This controller runs Multica on Kubernetes while moving every provider process into an isolated `task-<short-task-id>-<generated-suffix>` Pod. Workers use the official Multica CLI. The controller builds the daemon from the same release with two security patches: checkout planning without worker Git execution, and repository-aware environment reuse. The Multica backend remains unchanged.
+This controller runs the **unmodified official Multica 0.4.40 release binary** on Kubernetes and moves provider processes into isolated task Pods. The image does not download, patch, or compile Multica daemon source. Both controller and workers use the same checksum-verified official CLI.
 
 ## Runtime Model
 
-An installation has one long-lived `multica-runtime-controller` Deployment and one workspace PersistentVolumeClaim. The Deployment runs `multica daemon start --foreground` with the full claim. Each task Pod mounts only its prepared task directory through a Kubernetes `subPath`, at its original absolute path. Pi additionally mounts the single session file selected by the daemon.
+One controller Deployment owns the workspace PVC. The runtime wrapper starts the official daemon and a loopback API bridge. Provider shims launch short-lived task Pods and relay stdin, stdout, stderr, cancellation, and exit status through Kubernetes exec.
 
-The image exposes `agy`, `codex`, `copilot`, and `pi` as provider shims. The official daemon discovers those commands normally. Before the daemon starts, Pi itself installs the declared packages into its normal `$HOME/.pi/agent` directory on the shared workspace claim. When the daemon starts a task, it supplies `MULTICA_TASK_ID`, the prepared work directory, arguments, environment, and stdio. The shim then:
+The controller's preparation directory and the worker's writable directory are physically different. A worker mounts only its bound `.runtime-workers/<storage-id>` PVC subdirectory at the absolute task path expected by the daemon. It cannot see the controller task directories, other worker directories, shared `.repos` cache, or controller state registry. Operator credentials remain shared as configured.
 
-1. Creates an immutable request Secret with a Kubernetes-generated attempt name, then creates a short-lived Pod that references that exact Secret.
-2. Mounts that task's directory from the workspace PVC and the operator-provided configuration volumes. Other tasks, the shared `.repos` cache, and the workspace root are not mounted into the worker.
-3. Executes the real provider binary in that Pod through the Kubernetes exec streaming protocol.
-4. Proxies stdin, stdout, stderr, cancellation, and the provider exit status back to the official daemon.
-5. Deletes only that attempt's Pod and request Secret when the provider exits normally.
+Task claiming, scheduling, prompt construction, default repository refs, provider sessions, and completion reporting remain owned by the official daemon. The wrapper observes successful task claims through the existing HTTP batch/legacy and WebSocket `tasks.claim` contracts. It records only task identity, a credential fingerprint, repository scope, and storage/session bindings in the controller-only `.runtime-controller/state-v2` directory. It preserves unknown API fields and never retries a claim itself.
 
-One logical task may have multiple provider launch attempts. Every attempt receives a distinct generated Secret and Pod name, so residue from a shim process that was killed before deferred cleanup cannot block a retry with `AlreadyExists`. Cleanup remains best effort after abrupt process termination; the Pod deadline and controller-Pod ownership bound any retained resources.
+Before the daemon receives a claim, the bridge verifies any prior work directory and Pi session against that repository scope. Unknown or mismatched references are cleared using the official prior-session fields, including its continuity notice. The provider shim independently requires a matching observed claim and validates the actual prepared root and session before mounting storage. An existing TaskID cannot change its repository scope. Missing registry state does not adopt old worker directories.
 
-The daemon still owns claiming, progress, cancellation, completion, workspace preparation, and Multica API requests. No custom Multica backend image is required.
+Same-scope follow-up tasks retain their worker files and the verified Pi session. Same-TaskID retries also retain worker files when the daemon resets its own scratch directory. A worker-storage lock and an API check for surviving Pods prevent overlapping launches from using that directory after a shim crash. Each launch has its own immutable request Secret and authenticated loopback checkout broker. The Pod name is derived solely from its storage UUID, so Kubernetes permits only one Pod object for that writable directory, including after a delayed create or shim crash. Terminal Pods are replaced only after UID-checked deletion; cleanup cannot delete a later replacement. Cleanup deletes only that launch's resources.
 
-Every CLI request in a task Pod goes to a loopback-only proxy on the normal daemon port. That proxy authenticates to a gateway beside the controller with its exact request Secret name, task identity, and token. The gateway gets that Secret directly, verifies its ownership labels and task request, and strips all private authentication headers. For `POST /repo/checkout`, it forces `checkout_mode: worker-plan`. The patched daemon approves the repository and task context, resolves the default ref and coauthor setting, and returns a plan before creating a checkout. The worker executes that plan using its own Git process. Other daemon requests pass through.
+### Repository checkout
 
-Multica 0.4.40 prepares the task's `workdir` before starting its provider. `multica repo checkout <url> [--ref <branch-or-sha>]` then clones directly from the approved remote inside the worker, with independent Git objects and metadata. The controller's bare cache stays private and is not used to accelerate worker clones. Repository paths include a URL hash so repositories with the same basename remain distinct. Repeating the same checkout preserves existing edits; changing its requested ref requires explicit Git commands inside the task.
+`multica repo checkout <url> [--ref <branch-or-sha>]` reaches the task's loopback proxy, then an authenticated controller gateway. The gateway verifies the exact immutable request Secret and routes checkout to that launch's broker. A random broker capability is checked again there, so a recycled TCP port cannot identify another launch.
 
-The mount root comes from the daemon's reserved `MULTICA_TASK_CONFIG_ROOT`, checked against the provider working directory. Missing or inconsistent roots reject Pod creation; there is no full-PVC fallback. A prior root and session can be reused only when the repository URL set and task context match a signed controller record. Changed, missing, or unverifiable grants select a fresh environment and session. An existing current-task directory without a valid matching grant is rejected without deleting its contents. Tasks without repositories remain supported.
+The broker first checks the URL against the task's observed repository URLs, preventing broader workspace authorization from exposing another task's cached bytes. It then requests the official daemon's supported `checkout_mode: isolated` in a newly created controller-only staging directory. The daemon performs its normal task authentication, workspace repository authorization, default-ref selection, branch creation, coauthor setup, and Git operations. The broker then streams the resulting standalone repository as file bytes, including `.git`. Local-clone hardlinks never cross this boundary. The worker extracts into an empty confined stage and publishes without replacing an existing path. There is no reverse synchronization into controller directories.
 
-Reuse records live in `.runtime-controller/repo-grants` on the PVC and are authenticated with a controller-only signing key stored in an immutable Kubernetes Secret named `multica-repo-grants-<PVC-name-hash>`. The key survives controller replacement, is removed from the daemon environment before child processes start, and is excluded from worker requests. Preserve this Secret alongside the PVC to retain verified continuation; losing it safely invalidates old records.
+Repository names include a URL hash to separate identical basenames. Repeated checkout preserves existing edits and branches; changing an existing checkout's requested ref requires explicit Git commands. Coauthor hook bytes come from the official checkout. A later checkout refreshes the Multica-owned hook without overwriting custom hooks. Live setting changes take effect at the next checkout, rather than the next commit; the controller cache state file is intentionally not mounted into workers.
 
-This runtime supports daemon-managed `workdir` tasks on the workspace PVC. Explicit `local_directory` execution in `worktree` or `in_place` mode is rejected because it uses a different filesystem boundary.
+Workers can proxy checkout and health requests. Controller management operations such as daemon shutdown are not available through the task gateway.
 
-This boundary prevents filesystem access to other cached repositories. GitHub credentials remain shared as configured, and the daemon still controls checkout URL authorization. It does not restrict repositories those credentials or the upstream workspace policy permit an agent to clone over the network. Worker-controlled Git configuration and hooks execute only inside the worker's restricted filesystem view.
+### Context and persistence
 
-This intentionally places authenticated task code in the daemon's control-plane trust boundary. A task can call every daemon route, including control routes such as `POST /shutdown`; the task-scoped token and NetworkPolicy restrict who can reach the proxy, not which daemon operation that task can invoke.
+Only the official current sidecar manifest's files, runtime `AGENTS.md` brief, and Codex skills are copied into the worker. Previous repositories, staging checkouts, logs, and session directories are not copied. Context writes use confined filesystem operations and replace files without following worker-created symlinks. The root `AGENTS.md` Multica section is refreshed while surrounding worker text is retained. Repository-local files remain worker-owned.
+
+Pi mounts only the separately verified session file selected and locked by the daemon; other sessions remain hidden. Codex continues to use its ephemeral native home and operator-provided configuration as before. The controller does not copy its generated Codex configuration or rollouts into that home, so Codex file/session continuation has the same limitations as the existing intercepted runtime.
+
+The controller stores the daemon-root to worker-storage mapping persistently. Actual edited files live under `.runtime-workers`, while the official task result reports its original daemon work-directory path. Preserve the registry and worker directories together for continuation and recovery. Official daemon GC owns its preparation/cache directories. An hourly controller sweep retires a known worker directory only after all associated preparation roots have disappeared, no task Pod or storage lock holds it, and every associated claim is older than the task deadline (at least six hours) plus a 24-hour grace period. Retirement renames it into controller-owned trash before deleting bytes outside the registry lock. Unknown directories are retained for operator recovery. This follows the official daemon GC policy: self-host completed-task GC remains disabled unless configured through `MULTICA_GC_COMPLETED_TASK_TTL`; the official Cloud default remains 14 days.
+
+This boundary restricts filesystem access. Shared GitHub credentials and the official workspace checkout policy can still permit cloning other remote repositories over the network. Explicit `local_directory` execution is rejected; this runtime supports canonical daemon-managed `workdir` tasks on the PVC.
+
+Compatibility checks for a CLI upgrade must cover the three claim envelopes, prior-session fields, current sidecar manifest, and the official isolated checkout API. These adapters are controller code; there is no forked daemon build to maintain.
 
 ## Runtime Image
 
 Controller and task Pods use the same immutable image digest. The image contains:
 
 - the official Multica CLI release downloaded from `multica-ai/multica` and verified by SHA-256;
-- a controller-only daemon built from the same tag with the patches in `build/multica-*.patch`;
 - the Kubernetes provider interception shim;
 - pinned Codex, Copilot, Antigravity, and Pi CLIs;
 - PHP 8.5 with Composer plus the MongoDB, Redis, and Zstandard extensions;
@@ -49,7 +52,7 @@ Controller and task Pods use the same immutable image digest. The image contains
 - process/network diagnostics (`procps`, lsof, iproute2, dnsutils, and netcat);
 - ShellCheck/shfmt, uv/uvx, and Corepack.
 
-The image never compiles Multica from a local source checkout.
+The image never compiles Multica daemon source.
 
 Pinned runtime, extension, cloud CLI, Multica, and provider versions live in
 `build/runtime-versions.env`. The four-hour automation checks the official
@@ -203,7 +206,7 @@ Pi packages are executable code. They run with the Pi process's task credentials
 
 Task changes to Pi packages or settings are local to the Pod. The persistent package seed is an operator-controlled input, not a place for task-produced state.
 
-When upgrading from a version with the full workspace mount, stop old task Pods before accepting new work. Use a clean workspace PVC and rebuild the shared `.pi` seed from reviewed ConfigMap contents and package declarations; old writable Git caches and executable package state must not be assumed trustworthy. Keep the old PVC separately if its source changes or sessions need recovery. Deploy controller and workers together from this image, including the daemon patches and Multica CLI 0.4.40. Existing Pods retain their old mounts until replaced. Legacy roots and sessions have no signed grants and are not automatically imported or converted.
+When upgrading from a version with the full workspace mount, stop old task Pods before accepting new work. Use a clean workspace PVC and rebuild the shared `.pi` seed from reviewed ConfigMap contents and package declarations; old writable Git caches and executable package state must not be assumed trustworthy. Keep the old PVC separately if its source changes or sessions need recovery. Deploy controller and workers together from the official-binary image. Existing Pods retain their old mounts until replaced. Old patched images and signing Secrets are not used by this runtime. Legacy roots and sessions without the new controller registry are not imported automatically; their original contents are retained for recovery.
 
 The official daemon injects task-scoped Multica credentials and agent custom environment variables into the provider shim. Each launch attempt stores the request only in its own immutable, owner-scoped Kubernetes Secret. Normal provider exit deletes that attempt's Secret and Pod; abrupt shim termination may leave them until their existing Kubernetes lifetime bounds remove them.
 

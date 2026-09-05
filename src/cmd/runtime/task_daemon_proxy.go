@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -41,7 +43,7 @@ func newTaskDaemonProxy(upstream, requestSecretName string, request intercept.Re
 		return nil, err
 	}
 
-	return &httputil.ReverseProxy{
+	proxy := &httputil.ReverseProxy{
 		Rewrite: func(request *httputil.ProxyRequest) {
 			request.SetURL(target)
 			request.Out.Header.Set(intercept.DaemonProxyRequestSecretHeader, requestSecretName)
@@ -52,22 +54,19 @@ func newTaskDaemonProxy(upstream, requestSecretName string, request intercept.Re
 			if response.Request.Method != http.MethodPost || response.Request.URL.Path != "/repo/checkout" || response.StatusCode != http.StatusOK {
 				return nil
 			}
-			// The gateway forces a plan-only response. No Git operation happens
-			// until the trusted daemon has approved this task's URL and ref.
-			const limit = 1 << 20
-			raw, err := io.ReadAll(io.LimitReader(response.Body, limit+1))
-			_ = response.Body.Close()
-			var plan checkout.Plan
-			if err != nil || len(raw) > limit || json.Unmarshal(raw, &plan) != nil || plan.URL == "" {
-				setCheckoutResponse(response, http.StatusBadGateway, []byte("controller did not return a worker checkout plan; update the controller and worker images together\n"))
+			defer response.Body.Close()
+			plan, ok := response.Request.Context().Value(checkoutPlanKey{}).(checkout.Plan)
+			branch, err := base64.RawURLEncoding.DecodeString(response.Header.Get(intercept.CheckoutBranchHeader))
+			if !ok || err != nil || response.Header.Get("Content-Type") != intercept.CheckoutArchiveType {
+				setCheckoutResponse(response, http.StatusBadGateway, []byte("controller did not return an official checkout snapshot\n"))
 				return nil
 			}
-			result, err := worker.Checkout(response.Request.Context(), plan)
+			result, err := worker.Checkout(response.Request.Context(), plan, string(branch), response.Body)
 			if err != nil {
 				setCheckoutResponse(response, http.StatusConflict, []byte(err.Error()+"\n"))
 				return nil
 			}
-			raw, err = json.Marshal(result)
+			raw, err := json.Marshal(result)
 			if err != nil {
 				return err
 			}
@@ -78,8 +77,24 @@ func newTaskDaemonProxy(upstream, requestSecretName string, request intercept.Re
 		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, _ error) {
 			http.Error(w, "connect to runtime controller daemon proxy", http.StatusBadGateway)
 		},
-	}, nil
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/repo/checkout" {
+			raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
+			var plan checkout.Plan
+			if err != nil || json.Unmarshal(raw, &plan) != nil {
+				http.Error(w, "invalid checkout request", http.StatusBadRequest)
+				return
+			}
+			r = r.WithContext(context.WithValue(r.Context(), checkoutPlanKey{}, plan))
+			r.Body = io.NopCloser(bytes.NewReader(raw))
+			r.ContentLength = int64(len(raw))
+		}
+		proxy.ServeHTTP(w, r)
+	}), nil
 }
+
+type checkoutPlanKey struct{}
 
 func setCheckoutResponse(response *http.Response, status int, body []byte) {
 	response.StatusCode = status
