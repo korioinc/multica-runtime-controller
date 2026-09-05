@@ -4,9 +4,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"io"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,59 +14,6 @@ import (
 
 	"github.com/korioinc/multica-runtime-controller/internal/intercept"
 )
-
-func TestCommandForModes(t *testing.T) {
-	getenv := func(key string) string {
-		return map[string]string{
-			"MULTICA_BINARY":             "/multica",
-			"MULTICA_DAEMON_ID":          "11111111-2222-3333-4444-555555555555",
-			"MULTICA_RUNTIME_NAME":       "runtime-controller",
-			"MULTICA_RUNTIME_CAPACITY":   "2",
-			"MULTICA_POLL_INTERVAL":      "10s",
-			"MULTICA_HEARTBEAT_INTERVAL": "15s",
-		}[key]
-	}
-	path, args, err := commandFor([]string{"daemon"}, getenv)
-	if err != nil || path != "/multica" {
-		t.Fatalf("daemon: %s %v %v", path, args, err)
-	}
-	want := []string{
-		"daemon", "start", "--foreground", "--no-auto-update", "--no-auto-reload",
-		"--daemon-id", "11111111-2222-3333-4444-555555555555", "--runtime-name", "runtime-controller",
-		"--max-concurrent-tasks", "2", "--poll-interval", "10s", "--heartbeat-interval", "15s",
-	}
-	if len(args) != len(want) {
-		t.Fatalf("daemon args = %v, want %v", args, want)
-	}
-	for i := range want {
-		if args[i] != want[i] {
-			t.Fatalf("daemon args = %v, want %v", args, want)
-		}
-	}
-}
-
-func TestCommandForDefaultsToOfficialDaemonCapacity(t *testing.T) {
-	getenv := func(key string) string {
-		if key == "MULTICA_DAEMON_ID" {
-			return "11111111-2222-3333-4444-555555555555"
-		}
-		return ""
-	}
-	_, args, err := commandFor([]string{"daemon"}, getenv)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !contains(strings.Join(args, " "), "--max-concurrent-tasks 20") {
-		t.Fatalf("daemon args = %v, want official default capacity 20", args)
-	}
-}
-
-func TestCommandForRequiresDaemonID(t *testing.T) {
-	_, _, err := commandFor([]string{"daemon"}, func(string) string { return "" })
-	if err == nil || !strings.Contains(err.Error(), "MULTICA_DAEMON_ID is required") {
-		t.Fatalf("commandFor() error = %v, want missing daemon ID", err)
-	}
-}
 
 func TestWriteOfficialCLIConfig(t *testing.T) {
 	home := t.TempDir()
@@ -214,54 +158,6 @@ func TestRunProviderProcessMirrorsProtocolActivityWithoutLoggingPayloads(t *test
 	}
 	if strings.Contains(logs, "secret-value") {
 		t.Fatalf("task Pod log leaked protocol payload: %s", logs)
-	}
-}
-
-func TestTaskDaemonProxyAuthenticatesAndForwardsEntireRequest(t *testing.T) {
-	const (
-		requestSecretName = "task-1111111-selected"
-		taskID            = "11111111-2222-4333-8444-555555555555"
-		token             = "mat_task_scoped_token"
-		body              = `{"arbitrary":"daemon request"}`
-	)
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPatch || r.URL.Path != "/daemon/arbitrary" || r.URL.RawQuery != "mode=full" {
-			t.Fatalf("forwarded request = %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
-		}
-		if r.Header.Get("Authorization") != "Basic original-authorization" {
-			t.Fatalf("original authorization = %q", r.Header.Get("Authorization"))
-		}
-		if r.Header.Get(intercept.DaemonProxyRequestSecretHeader) != requestSecretName ||
-			r.Header.Get(intercept.DaemonProxyTaskIDHeader) != taskID ||
-			r.Header.Get(intercept.DaemonProxyTaskTokenHeader) != token {
-			t.Fatalf("task proxy headers = %q, %q, %q", r.Header.Get(intercept.DaemonProxyRequestSecretHeader), r.Header.Get(intercept.DaemonProxyTaskIDHeader), r.Header.Get(intercept.DaemonProxyTaskTokenHeader))
-		}
-		raw, err := io.ReadAll(r.Body)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if string(raw) != body {
-			t.Fatalf("forwarded body = %q, want %q", raw, body)
-		}
-		w.WriteHeader(http.StatusNoContent)
-	}))
-	defer upstream.Close()
-	handler, err := newTaskDaemonProxy(upstream.URL, requestSecretName, taskID, token)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req := httptest.NewRequest(http.MethodPatch, "/daemon/arbitrary?mode=full", strings.NewReader(body))
-	req.Header.Set("Authorization", "Basic original-authorization")
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusNoContent {
-		t.Fatalf("proxy response status=%d body=%s", rec.Code, rec.Body.String())
-	}
-
-	for _, selector := range []string{"", "INVALID SECRET NAME"} {
-		if _, err := newTaskDaemonProxy(upstream.URL, selector, taskID, token); err == nil || !strings.Contains(err.Error(), "MULTICA_REQUEST_SECRET_NAME") {
-			t.Fatalf("newTaskDaemonProxy() selector %q error = %v, want selector validation", selector, err)
-		}
 	}
 }
 

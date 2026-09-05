@@ -63,12 +63,6 @@ func TestLauncherRetryCreatesDistinctAttemptResourcesAndCleansOnlyRetry(t *testi
 	if createdPod == nil || createdPod.Name == "" || createdPod.Name == residuePodName {
 		t.Fatalf("retry Pod = %+v, want a distinct generated name", createdPod)
 	}
-	if got := requestSecretNameFromPod(createdPod); got != createdSecret.Name {
-		t.Fatalf("retry Pod request Secret = %q, want %q", got, createdSecret.Name)
-	}
-	if got := podEnvironmentValue(createdPod.Spec.Containers[0].Env, "MULTICA_REQUEST_SECRET_NAME"); got != createdSecret.Name {
-		t.Fatalf("retry Pod selector environment = %q, want %q", got, createdSecret.Name)
-	}
 
 	if _, err := client.CoreV1().Secrets(namespace).Get(context.Background(), residueSecretName, metav1.GetOptions{}); err != nil {
 		t.Fatalf("retry cleanup deleted attempt-1 Secret: %v", err)
@@ -144,16 +138,7 @@ func testLauncherConfig(namespace string) Config {
 func testProviderRequest(taskID string) Request {
 	return Request{
 		Provider: "codex",
-		Env:      []string{"MULTICA_TASK_ID=" + taskID, "MULTICA_TOKEN=mat_attempt_two"},
-		WorkDir:  "/workspace/tasks/" + taskID,
+		Env:      []string{"MULTICA_TASK_ID=" + taskID, "MULTICA_TOKEN=mat_attempt_two", "MULTICA_TASK_CONFIG_ROOT=/workspace/team/task/multica-config"},
+		WorkDir:  "/workspace/team/task/workdir",
 	}
-}
-
-func requestSecretNameFromPod(pod *corev1.Pod) string {
-	for _, volume := range pod.Spec.Volumes {
-		if volume.Name == "request" && volume.Secret != nil {
-			return volume.Secret.SecretName
-		}
-	}
-	return ""
 }

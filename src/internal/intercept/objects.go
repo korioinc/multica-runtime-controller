@@ -31,7 +31,7 @@ const (
 	piHomeMountPath     = agentHome + "/.pi"
 	piHomeSubPath       = ".pi"
 	piSessionsMountPath = agentHome + "/.multica/pi-sessions"
-	piSessionsSubPath   = ".multica/pi-sessions"
+	piSeedMountPath     = "/var/run/multica/pi-seed"
 )
 
 var providerExecutables = map[string]string{
@@ -108,6 +108,7 @@ func taskEnvironment(environ []string) []string {
 	values["TMP"] = "/tmp"
 	values["TEMP"] = "/tmp"
 	values["PATH"] = providerBinDir + ":/usr/local/bin:/usr/bin:/bin"
+	values["MULTICA_REPO_CHECKOUT_MODE"] = "isolated"
 
 	keys := slices.Sorted(maps.Keys(values))
 	result := make([]string, 0, len(keys))
@@ -119,7 +120,7 @@ func taskEnvironment(environ []string) []string {
 
 func omitTaskEnvironment(key string) bool {
 	switch key {
-	case "MULTICA_CONTROLLER_TOKEN_FILE", "MULTICA_RUNTIME_IMAGE", "MULTICA_RUNTIME_IMAGE_PULL_POLICY",
+	case "MULTICA_CONTROLLER_TOKEN_FILE", "MULTICA_CONTROLLER_GRANT_KEY", "MULTICA_RUNTIME_IMAGE", "MULTICA_RUNTIME_IMAGE_PULL_POLICY",
 		"MULTICA_DAEMON_PROXY_URL",
 		"MULTICA_WORKER_SERVICE_ACCOUNT", "MULTICA_WORKSPACE_PVC_NAME", "MULTICA_WORKER_EXTRA_VOLUMES",
 		"MULTICA_WORKER_EXTRA_VOLUME_MOUNTS", "MULTICA_WORKER_CPU_REQUEST", "MULTICA_WORKER_CPU_LIMIT",
@@ -154,12 +155,23 @@ func requestSecret(cfg Config, taskID string, request Request, owner metav1.Owne
 	}, nil
 }
 
-func taskPod(cfg Config, taskID, requestSecretName string, owner metav1.OwnerReference) (*corev1.Pod, error) {
+func taskPod(cfg Config, taskID, requestSecretName string, request Request, owner metav1.OwnerReference) (*corev1.Pod, error) {
 	generateName, err := taskGenerateNameFor(taskID)
 	if err != nil {
 		return nil, err
 	}
 	if err := validateTaskConfig(cfg); err != nil {
+		return nil, err
+	}
+	if requestEnvironmentValue(request.Env, "MULTICA_TASK_ID") != taskID {
+		return nil, errors.New("provider request does not match the task identity")
+	}
+	taskRoot, taskSubPath, err := taskStorageRoot(request)
+	if err != nil {
+		return nil, err
+	}
+	piSession, err := taskPiSession(request)
+	if err != nil {
 		return nil, err
 	}
 	requestSecretName = strings.TrimSpace(requestSecretName)
@@ -177,11 +189,15 @@ func taskPod(cfg Config, taskID, requestSecretName string, owner metav1.OwnerRef
 	}
 	mounts := []corev1.VolumeMount{
 		{Name: "request", MountPath: "/var/run/multica/intercept", ReadOnly: true},
-		{Name: "workspace", MountPath: workspaceRoot},
+		{Name: "workspace", MountPath: taskRoot, SubPath: taskSubPath},
 		{Name: "agent-home", MountPath: agentHome, SubPath: agentHomeSubPath},
-		{Name: "workspace", MountPath: piHomeMountPath, SubPath: piHomeSubPath},
-		{Name: "workspace", MountPath: piSessionsMountPath, SubPath: piSessionsSubPath},
 		{Name: "tmp", MountPath: "/tmp"},
+	}
+	if piSession != "" {
+		mounts = append(mounts, corev1.VolumeMount{
+			Name: "workspace", MountPath: piSession,
+			SubPath: ".multica/pi-sessions/" + filepath.Base(piSession),
+		})
 	}
 	for i := range cfg.ExtraVolumes {
 		volumes = append(volumes, *cfg.ExtraVolumes[i].DeepCopy())
@@ -228,13 +244,15 @@ func taskPod(cfg Config, taskID, requestSecretName string, owner metav1.OwnerRef
 				Image:           cfg.Image,
 				ImagePullPolicy: cfg.ImagePullPolicy,
 				Command:         []string{"/bin/sh", "-ec"},
-				Args: []string{
-					"install -d -m 0700 " + agentHomeVolumePath + "/" + agentHomeSubPath +
-						" && install -d -m 0700 " + agentHomeVolumePath + "/" + agentHomeSubPath + "/.codex",
+				Args:            []string{taskHomeInitScript},
+				Env: []corev1.EnvVar{
+					{Name: "PI_SEED", Value: piSeedMountPath},
+					{Name: "AGENT_HOME", Value: agentHomeVolumePath + "/" + agentHomeSubPath},
 				},
 				Resources: cfg.Resources,
 				VolumeMounts: []corev1.VolumeMount{
 					{Name: "agent-home", MountPath: agentHomeVolumePath},
+					{Name: "workspace", MountPath: piSeedMountPath, SubPath: piHomeSubPath, ReadOnly: true},
 					{Name: "tmp", MountPath: "/tmp"},
 				},
 				SecurityContext: &corev1.SecurityContext{

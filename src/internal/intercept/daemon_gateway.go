@@ -70,6 +70,9 @@ func (g *daemonGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
 		return
 	}
+	if !prepareDaemonRequest(w, r) {
+		return
+	}
 	g.proxy.ServeHTTP(w, r)
 }
 

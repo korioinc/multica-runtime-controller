@@ -49,8 +49,7 @@ func runTaskPod() error {
 	handler, err := newTaskDaemonProxy(
 		os.Getenv("MULTICA_DAEMON_PROXY_URL"),
 		os.Getenv("MULTICA_REQUEST_SECRET_NAME"),
-		taskID,
-		environmentValue(request.Env, "MULTICA_TOKEN"),
+		request,
 	)
 	if err != nil {
 		return err

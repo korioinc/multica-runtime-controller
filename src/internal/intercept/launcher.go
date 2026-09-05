@@ -79,7 +79,7 @@ func (l *Launcher) Run(ctx context.Context, taskID string, request Request, stre
 		return errors.New("Kubernetes API returned a provider request Secret without a name")
 	}
 
-	pod, err := taskPod(l.config, taskID, createdSecretName, l.owner)
+	pod, err := taskPod(l.config, taskID, createdSecretName, request, l.owner)
 	if err != nil {
 		return err
 	}

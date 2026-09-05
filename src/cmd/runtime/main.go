@@ -51,6 +51,15 @@ func main() {
 				_, _ = fmt.Fprintln(os.Stderr, err)
 				os.Exit(1)
 			}
+			key, err := intercept.ControllerGrantKey(context.Background())
+			if err != nil {
+				_, _ = fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+			if err := os.Setenv("MULTICA_CONTROLLER_GRANT_KEY", key); err != nil {
+				_, _ = fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
 		}
 	}
 
@@ -76,7 +85,9 @@ func commandFor(args []string, getenv func(string) string) (string, []string, er
 	if args[0] != "daemon" {
 		return "", nil, fmt.Errorf("unknown mode %q", args[0])
 	}
-	path := valueOr(getenv("MULTICA_BINARY"), "/usr/local/bin/multica")
+	// The daemon's repository-grant and plan-only checks are mandatory. A
+	// legacy MULTICA_BINARY override must not select an unpatched daemon.
+	path := "/opt/multica/controller/multica"
 	runtimeName := valueOr(getenv("MULTICA_RUNTIME_NAME"), "runtime-controller")
 	daemonID, err := configuredDaemonID(getenv)
 	if err != nil {
