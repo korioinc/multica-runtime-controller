@@ -10,16 +10,18 @@ import (
 	"strings"
 	"time"
 
+	"github.com/korioinc/multica-runtime-controller/internal/claimproxy"
+
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 const (
-	launcherConfigFileEnv = "MULTICA_LAUNCHER_CONFIG_FILE"
 	defaultLauncherConfig = "/tmp/multica-runtime-controller/launcher.json"
 )
 
 var launcherConfigKeys = []string{
+	"MULTICA_BASE_URL",
 	"POD_NAMESPACE",
 	"POD_NAME",
 	"MULTICA_RUNTIME_IMAGE",
@@ -41,34 +43,13 @@ type launcherConfigSnapshot struct {
 }
 
 func LoadConfig() (Config, string, error) {
-	path, err := launcherConfigPath(os.Getenv)
-	if err != nil {
-		return Config{}, "", err
-	}
-	cfg, controllerPodName, err := loadLauncherConfig(path)
-	if err == nil {
-		return cfg, controllerPodName, nil
-	}
-	if !errors.Is(err, os.ErrNotExist) {
-		return Config{}, "", err
-	}
-	return loadConfig(os.Getenv)
+	// Agent custom environment is not an authority for Kubernetes volumes,
+	// image selection or Secrets. Only the startup snapshot is accepted.
+	return loadLauncherConfig(defaultLauncherConfig)
 }
 
 func PersistLauncherConfig() error {
-	path, err := launcherConfigPath(os.Getenv)
-	if err != nil {
-		return err
-	}
-	return persistLauncherConfig(path, os.Getenv)
-}
-
-func launcherConfigPath(getenv func(string) string) (string, error) {
-	path := valueOrDefault(getenv(launcherConfigFileEnv), defaultLauncherConfig)
-	if !filepath.IsAbs(path) {
-		return "", fmt.Errorf("%s must be an absolute path", launcherConfigFileEnv)
-	}
-	return filepath.Clean(path), nil
+	return persistLauncherConfig(defaultLauncherConfig, os.Getenv)
 }
 
 func persistLauncherConfig(path string, getenv func(string) string) error {
@@ -125,6 +106,10 @@ func loadLauncherConfig(path string) (Config, string, error) {
 }
 
 func loadConfig(getenv func(string) string) (Config, string, error) {
+	backendURL, err := claimproxy.NormalizeBackendURL(getenv("MULTICA_BASE_URL"))
+	if err != nil {
+		return Config{}, "", err
+	}
 	var extraVolumes []corev1.Volume
 	if raw := strings.TrimSpace(getenv("MULTICA_WORKER_EXTRA_VOLUMES")); raw != "" {
 		if err := json.Unmarshal([]byte(raw), &extraVolumes); err != nil {
@@ -159,6 +144,7 @@ func loadConfig(getenv func(string) string) (Config, string, error) {
 		Image:              strings.TrimSpace(getenv("MULTICA_RUNTIME_IMAGE")),
 		ImagePullPolicy:    pullPolicy,
 		DaemonProxyURL:     strings.TrimSpace(getenv("MULTICA_DAEMON_PROXY_URL")),
+		BackendURL:         backendURL,
 		ServiceAccountName: strings.TrimSpace(getenv("MULTICA_WORKER_SERVICE_ACCOUNT")),
 		WorkspacePVCName:   strings.TrimSpace(getenv("MULTICA_WORKSPACE_PVC_NAME")),
 		ExtraVolumes:       extraVolumes,

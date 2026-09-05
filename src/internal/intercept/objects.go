@@ -21,6 +21,7 @@ const (
 	ManagedByLabel      = "app.kubernetes.io/managed-by"
 	ManagedByValue      = "multica-runtime-controller"
 	TaskIDLabel         = "multica.ai/task-id"
+	StorageIDLabel      = "multica.ai/storage-id"
 	RequestKey          = "request.json"
 	requestPath         = "/var/run/multica/intercept/request.json"
 	workspaceRoot       = "/workspace"
@@ -31,7 +32,7 @@ const (
 	piHomeMountPath     = agentHome + "/.pi"
 	piHomeSubPath       = ".pi"
 	piSessionsMountPath = agentHome + "/.multica/pi-sessions"
-	piSessionsSubPath   = ".multica/pi-sessions"
+	piSeedMountPath     = "/var/run/multica/pi-seed"
 )
 
 var providerExecutables = map[string]string{
@@ -42,10 +43,14 @@ var providerExecutables = map[string]string{
 }
 
 type Request struct {
-	Provider string   `json:"provider"`
-	Args     []string `json:"args,omitempty"`
-	Env      []string `json:"env"`
-	WorkDir  string   `json:"work_dir"`
+	Provider       string   `json:"provider"`
+	Args           []string `json:"args,omitempty"`
+	Env            []string `json:"env"`
+	WorkDir        string   `json:"work_dir"`
+	WorkerSubPath  string   `json:"worker_sub_path,omitempty"`
+	BrokerPort     int      `json:"broker_port,omitempty"`
+	BrokerToken    string   `json:"broker_token,omitempty"`
+	RepositoryURLs []string `json:"repository_urls,omitempty"`
 }
 
 type Config struct {
@@ -53,6 +58,7 @@ type Config struct {
 	Image              string
 	ImagePullPolicy    corev1.PullPolicy
 	DaemonProxyURL     string
+	BackendURL         string
 	ServiceAccountName string
 	WorkspacePVCName   string
 	ExtraVolumes       []corev1.Volume
@@ -108,6 +114,7 @@ func taskEnvironment(environ []string) []string {
 	values["TMP"] = "/tmp"
 	values["TEMP"] = "/tmp"
 	values["PATH"] = providerBinDir + ":/usr/local/bin:/usr/bin:/bin"
+	values["MULTICA_REPO_CHECKOUT_MODE"] = "isolated"
 
 	keys := slices.Sorted(maps.Keys(values))
 	result := make([]string, 0, len(keys))
@@ -142,7 +149,7 @@ func requestSecret(cfg Config, taskID string, request Request, owner metav1.Owne
 	if err != nil {
 		return nil, fmt.Errorf("encode provider request: %w", err)
 	}
-	labels := map[string]string{ManagedByLabel: ManagedByValue, TaskIDLabel: taskID}
+	labels := map[string]string{ManagedByLabel: ManagedByValue, TaskIDLabel: taskID, StorageIDLabel: filepath.Base(request.WorkerSubPath)}
 	ownerReferences := []metav1.OwnerReference{owner}
 	return &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
@@ -154,19 +161,37 @@ func requestSecret(cfg Config, taskID string, request Request, owner metav1.Owne
 	}, nil
 }
 
-func taskPod(cfg Config, taskID, requestSecretName string, owner metav1.OwnerReference) (*corev1.Pod, error) {
-	generateName, err := taskGenerateNameFor(taskID)
+func taskPod(cfg Config, taskID, requestSecretName string, request Request, owner metav1.OwnerReference) (*corev1.Pod, error) {
+	_, err := taskGenerateNameFor(taskID)
 	if err != nil {
 		return nil, err
 	}
 	if err := validateTaskConfig(cfg); err != nil {
 		return nil, err
 	}
+	if requestEnvironmentValue(request.Env, "MULTICA_TASK_ID") != taskID {
+		return nil, errors.New("provider request does not match the task identity")
+	}
+	taskRoot, _, err := taskStorageRoot(request)
+	if err != nil {
+		return nil, err
+	}
+	if !strings.HasPrefix(request.WorkerSubPath, ".runtime-workers/") ||
+		filepath.Dir(request.WorkerSubPath) != ".runtime-workers" {
+		return nil, errors.New("task requires separately bound worker storage")
+	}
+	if _, err := uuid.Parse(filepath.Base(request.WorkerSubPath)); err != nil {
+		return nil, err
+	}
+	piSession, err := taskPiSession(request)
+	if err != nil {
+		return nil, err
+	}
 	requestSecretName = strings.TrimSpace(requestSecretName)
 	if requestSecretName == "" || len(k8svalidation.IsDNS1123Subdomain(requestSecretName)) != 0 {
 		return nil, errors.New("provider request Secret name must be a valid DNS subdomain")
 	}
-	labels := map[string]string{ManagedByLabel: ManagedByValue, TaskIDLabel: taskID}
+	labels := map[string]string{ManagedByLabel: ManagedByValue, TaskIDLabel: taskID, StorageIDLabel: filepath.Base(request.WorkerSubPath)}
 	ownerReferences := []metav1.OwnerReference{owner}
 
 	volumes := []corev1.Volume{
@@ -177,11 +202,18 @@ func taskPod(cfg Config, taskID, requestSecretName string, owner metav1.OwnerRef
 	}
 	mounts := []corev1.VolumeMount{
 		{Name: "request", MountPath: "/var/run/multica/intercept", ReadOnly: true},
-		{Name: "workspace", MountPath: workspaceRoot},
+		{Name: "workspace", MountPath: taskRoot, SubPath: request.WorkerSubPath},
 		{Name: "agent-home", MountPath: agentHome, SubPath: agentHomeSubPath},
-		{Name: "workspace", MountPath: piHomeMountPath, SubPath: piHomeSubPath},
-		{Name: "workspace", MountPath: piSessionsMountPath, SubPath: piSessionsSubPath},
 		{Name: "tmp", MountPath: "/tmp"},
+	}
+	if piSession != "" {
+		mounts = append(mounts, corev1.VolumeMount{
+			Name: "workspace", MountPath: piSession,
+			SubPath: ".multica/pi-sessions/" + filepath.Base(piSession),
+		})
+	}
+	if request.Provider == "codex" {
+		mounts = append(mounts, corev1.VolumeMount{Name: "workspace", MountPath: agentHome + "/.codex/skills", SubPath: request.WorkerSubPath + "/codex-skills", ReadOnly: true})
 	}
 	for i := range cfg.ExtraVolumes {
 		volumes = append(volumes, *cfg.ExtraVolumes[i].DeepCopy())
@@ -198,7 +230,7 @@ func taskPod(cfg Config, taskID, requestSecretName string, owner metav1.OwnerRef
 	}
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			GenerateName: generateName, Namespace: cfg.Namespace, Labels: maps.Clone(labels), OwnerReferences: ownerReferences,
+			Name: "task-worker-" + filepath.Base(request.WorkerSubPath), Namespace: cfg.Namespace, Labels: maps.Clone(labels), OwnerReferences: ownerReferences,
 		},
 		Spec: corev1.PodSpec{
 			ServiceAccountName:            cfg.ServiceAccountName,
@@ -228,13 +260,15 @@ func taskPod(cfg Config, taskID, requestSecretName string, owner metav1.OwnerRef
 				Image:           cfg.Image,
 				ImagePullPolicy: cfg.ImagePullPolicy,
 				Command:         []string{"/bin/sh", "-ec"},
-				Args: []string{
-					"install -d -m 0700 " + agentHomeVolumePath + "/" + agentHomeSubPath +
-						" && install -d -m 0700 " + agentHomeVolumePath + "/" + agentHomeSubPath + "/.codex",
+				Args:            []string{taskHomeInitScript},
+				Env: []corev1.EnvVar{
+					{Name: "PI_SEED", Value: piSeedMountPath},
+					{Name: "AGENT_HOME", Value: agentHomeVolumePath + "/" + agentHomeSubPath},
 				},
 				Resources: cfg.Resources,
 				VolumeMounts: []corev1.VolumeMount{
 					{Name: "agent-home", MountPath: agentHomeVolumePath},
+					{Name: "workspace", MountPath: piSeedMountPath, SubPath: piHomeSubPath, ReadOnly: true},
 					{Name: "tmp", MountPath: "/tmp"},
 				},
 				SecurityContext: &corev1.SecurityContext{

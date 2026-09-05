@@ -26,10 +26,11 @@ func readProviderRequest(path string) (intercept.Request, error) {
 	if err := json.Unmarshal(raw, &request); err != nil {
 		return intercept.Request{}, fmt.Errorf("decode provider request: %w", err)
 	}
-	request, err = intercept.PrepareRequest(request.Provider, request.Args, request.Env, request.WorkDir)
+	validated, err := intercept.PrepareRequest(request.Provider, request.Args, request.Env, request.WorkDir)
 	if err != nil {
 		return intercept.Request{}, err
 	}
+	request.Args, request.Env, request.WorkDir = validated.Args, validated.Env, validated.WorkDir
 	return request, nil
 }
 
@@ -49,8 +50,7 @@ func runTaskPod() error {
 	handler, err := newTaskDaemonProxy(
 		os.Getenv("MULTICA_DAEMON_PROXY_URL"),
 		os.Getenv("MULTICA_REQUEST_SECRET_NAME"),
-		taskID,
-		environmentValue(request.Env, "MULTICA_TOKEN"),
+		request,
 	)
 	if err != nil {
 		return err
