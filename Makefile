@@ -1,4 +1,4 @@
-.PHONY: build image image-push repository-validate runtime-version-test workflow-validate test test-race vet verify-local verify
+.PHONY: build image image-push repository-validate runtime-version-test workflow-validate test test-race vet verify-core verify-local verify
 
 RUNTIME_VERSIONS_FILE := build/runtime-versions.env
 include $(RUNTIME_VERSIONS_FILE)
@@ -62,7 +62,9 @@ test-race:
 vet:
 	go -C $(GO_MODULE_DIR) vet ./...
 
-verify-local:
-	./scripts/verify-local.sh
+verify-core:
+	./scripts/verify-local.sh --core-only
 
-verify: runtime-version-test repository-validate workflow-validate test test-race vet verify-local
+verify-local: verify-core
+
+verify: runtime-version-test repository-validate workflow-validate test test-race vet verify-core

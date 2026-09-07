@@ -468,9 +468,11 @@ def validate_actions(directory: Path) -> dict[str, Any]:
                 continue
             action_count += 1
             action, separator, revision = reference.rpartition("@")
-            if not separator or re.fullmatch(r"[0-9a-f]{40}", revision) is None:
-                raise ResolverError(f"action_not_full_sha file={path.name} action={action}")
-            if not comment or re.search(r"v[0-9]", comment) is None:
+            sha = re.fullmatch(r"[0-9a-f]{40}", revision) is not None
+            version = re.fullmatch(r"v[0-9]+(?:\.[0-9]+){0,2}", revision) is not None
+            if not separator or not (sha or version):
+                raise ResolverError(f"action_reference_requires_version_or_sha file={path.name} action={action}")
+            if sha and (not comment or re.search(r"v[0-9]", comment) is None):
                 raise ResolverError(
                     f"action_version_comment_missing file={path.name} action={action}"
                 )

@@ -6,12 +6,13 @@ The runtime core and development environment are separate images. Changing PHP, 
 
 ## Install
 
-The chart lives in the adjacent Helm repository at `../helm/charts/multica-runtime-controller`. Its README contains the complete values and bootstrap examples.
+The chart is maintained independently in [korioinc/helm](https://github.com/korioinc/helm). Its README contains the complete values and bootstrap examples.
 
 Supply a **new core artifact digest**, a controller token Secret, the Multica backend URL and suitable storage. The chart intentionally has no old runtime image as a fallback. A release of this rewrite must provide the core digest; an old combined runtime image cannot execute this chart.
 
 ```sh
-helm upgrade --install multica-runtime ../helm/charts/multica-runtime-controller \
+helm repo add korioinc https://korioinc.github.io/helm
+helm upgrade --install multica-runtime korioinc/multica-runtime-controller \
   --namespace multica --create-namespace \
   --values operator-values.yaml \
   --set-string runtime.image.reference="$CORE_IMAGE_DIGEST"
@@ -83,10 +84,18 @@ make test-race
 make vet
 make repository-validate
 make workflow-validate
-make verify-local
+make verify-core
 make verify
 ```
 
-`verify-local` requires Docker, Go, Helm and the external chart source. It builds the current artifacts and uses an explicitly disposable Docker/K3s cluster, local backend and local Git repository. It never reads an ambient kubeconfig. Evidence is saved under a printed temporary directory. `scripts/verify-local.sh --keep-on-failure` retains only that fixture's resources for diagnosis.
+`make verify` validates this repository independently. Its `verify-core` step requires Docker, Go and Make, builds the current core, and exercises the actual official CLI in a disposable container. It does not read or download a Helm repository. `verify-local` is an alias for `verify-core`.
+
+Release integration is a separate command with an explicit chart target:
+
+```sh
+./scripts/verify-local.sh --chart /absolute/path/to/the/chart
+```
+
+This integration command additionally requires Helm and runs a disposable Docker/K3s cluster, local backend and local Git repository. It never reads an ambient kubeconfig. Evidence is saved under a printed temporary directory. Add `--keep-on-failure` to retain only that fixture's resources for diagnosis. Chart linting, schemas and release automation belong to the Helm repository's own checks.
 
 The local fixtures exercise real official binaries, preparation, Pods, Secrets, exec, checkout, continuation and recovery. Offline provider/version fixtures do not prove live provider authentication or model-service behavior. Local storage checks establish the tested Docker/K3s behavior; they do not certify every RWX driver or production failover configuration.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise current source and the external chart using disposable local services."""
+"""Verify the core, or an explicitly selected chart, in disposable local services."""
 from __future__ import annotations
 
 import argparse
@@ -24,8 +24,9 @@ OWNER_LABEL = "io.multica.localverify"
 
 
 class Verification:
-    def __init__(self, chart: Path, keep: bool, resume: Path | None = None):
-        self.chart = chart.resolve()
+    def __init__(self, chart: Path | None, keep: bool, resume: Path | None = None):
+        self.chart = chart.resolve() if chart is not None else None
+        self.mode = "integration" if self.chart is not None else "core"
         self.keep = keep
         self.root = resume.resolve() if resume else Path(tempfile.mkdtemp(prefix="multica-rewrite-verify-")).resolve()
         self.lease = (self.root / ".orchestration.lock").open("a+")
@@ -65,6 +66,7 @@ class Verification:
                  "environment_image": self.environment, "arch": self.arch,
                  "containers": self.containers, "volumes": self.volumes, "images": self.images,
                  "phase": self.phase, "kubeconfig": str(self.kubeconfig),
+                 "mode": self.mode, "chart": str(self.chart) if self.chart is not None else None,
                  "completed_steps": self.completed_steps, "passed": self.passed, "pid": os.getpid(),
                  "source": self.source}
         pending = self.root / "state.json.tmp"
@@ -130,11 +132,13 @@ class Verification:
 
     def inspect_image(self, tag):
         info = json.loads(self.docker("image", "inspect", tag))[0]
+        self.images[tag] = info["Id"]
+        self.save_state()
+        if self.chart is None:
+            return info["Id"]
         refs = info.get("RepoDigests", [])
         if not refs:
             raise RuntimeError("Docker did not retain a RepoDigest for the locally built image: " + tag)
-        self.images[tag] = info["Id"]
-        self.save_state()
         return self.canonical(refs[0])
 
     def create_container(self, name, arguments):
@@ -154,12 +158,10 @@ class Verification:
         for name in ("src/go.mod", "src/go.sum", "Dockerfile", ".dockerignore", "Makefile",
                      "VERSION", "build/runtime-versions.env", "scripts/localverify/Dockerfile"):
             paths.append(("runtime/" + name, ROOT / name))
-        for path in self.chart.rglob("*"):
-            if path.suffix in {".yaml", ".yml", ".json", ".tpl", ".sh", ".env"} or "Dockerfile" in path.name:
-                paths.append(("chart/" + str(path.relative_to(self.chart)), path))
-        helm_root = self.chart.parents[1]
-        for name in ("scripts/update_chart.py", "scripts/test_update_chart.py", ".github/workflows/ci.yml"):
-            paths.append(("helm/" + name, helm_root / name))
+        if self.chart is not None:
+            for path in self.chart.rglob("*"):
+                if path.suffix in {".yaml", ".yml", ".json", ".tpl", ".sh", ".env"} or "Dockerfile" in path.name:
+                    paths.append(("chart/" + str(path.relative_to(self.chart)), path))
         for label, path in sorted(paths):
             if path.is_file():
                 files[label] = {"sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
@@ -180,11 +182,12 @@ class Verification:
 
     def build(self):
         self.stage("Building the current core and verification executables")
-        for name in ("docker", "go", "helm", "make"):
+        required = ("docker", "go", "make") + (("helm",) if self.chart is not None else ())
+        for name in required:
             if not shutil.which(name):
                 raise RuntimeError(f"{name} is required; local verification was not run")
-        if not (self.chart / "Chart.yaml").is_file():
-            raise RuntimeError("the external Helm chart source is required for complete verification")
+        if self.chart is not None and not (self.chart / "Chart.yaml").is_file():
+            raise RuntimeError("the explicitly selected Helm chart is missing Chart.yaml")
         self.docker("info")
         self.source = self.source_snapshot()
         (self.evidence / "source-build.json").write_text(json.dumps(self.source, indent=2))
@@ -201,11 +204,14 @@ class Verification:
         self.docker("build", "--build-arg", "ENVIRONMENT_IMAGE=" + BASE, "-t", environment_tag,
                     str(self.context), log="environment-build.log")
         self.environment = self.inspect_image(environment_tag)
-        self.docker("save", "-o", str(self.root / "images.tar"), core_tag, environment_tag)
+        if self.chart is not None:
+            self.docker("save", "-o", str(self.root / "images.tar"), core_tag, environment_tag)
         self.verify_source_freshness()
         self.save_state()
         (self.evidence / "artifacts.json").write_text(json.dumps({"core": self.core,
-            "environment": self.environment, "platform": "linux/" + self.arch}, indent=2))
+            "environment": self.environment, "platform": "linux/" + self.arch,
+            "identityKind": "local-image-id" if self.chart is None else "oci-reference",
+            "mode": self.mode}, indent=2))
         return core_tag, environment_tag
 
     def official(self, core_tag, environment_tag):
@@ -374,6 +380,8 @@ class Verification:
 
     def restore(self):
         state = json.loads((self.root / "state.json").read_text())
+        if state.get("mode") != "integration" or state.get("chart") != str(self.chart):
+            raise RuntimeError("resume requires the same explicitly selected integration chart")
         if state["root"] != str(self.root) or state["evidence"] != str(self.evidence) or state["node"] != self.node:
             raise RuntimeError("resume state does not identify this owned work directory")
         self.containers = state["containers"]
@@ -688,6 +696,7 @@ MANIFEST
             except ValueError:
                 pass
         (self.evidence / "summary.json").write_text(json.dumps({"passed": self.passed, "complete": success,
+            "mode": self.mode, "chart": str(self.chart) if self.chart is not None else None,
             "phase": self.phase, "error": failure, "sourceSHA256": self.source["sha256"] if self.source else None}, indent=2))
         if success or not self.keep:
             self.cleanup_profiles()
@@ -710,21 +719,27 @@ MANIFEST
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--chart", type=Path, default=ROOT.parent / "helm/charts/multica-runtime-controller")
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--core-only", action="store_true", help="verify this repository's core and official CLI without Helm")
+    mode.add_argument("--chart", type=Path, help="run release integration against this explicit chart directory")
     parser.add_argument("--keep-on-failure", action="store_true")
     parser.add_argument("--resume", type=Path, help="resume the exact retained disposable work directory after its process has stopped")
     args = parser.parse_args()
+    if args.resume and args.core_only:
+        parser.error("--resume requires an explicit --chart and a retained integration cluster")
     verification = Verification(args.chart, args.keep_on_failure, args.resume)
     print("Local verification work directory:", verification.root, flush=True)
     success = False
     failure = ""
     try:
         if args.resume:
+            verification.verify_source_freshness()
             verification.runtime()
         else:
             images = verification.build()
             verification.official(*images)
-            verification.cluster(*images)
+            if args.chart is not None:
+                verification.cluster(*images)
         verification.verify_source_freshness()
         success = True
     except BaseException as exc:
