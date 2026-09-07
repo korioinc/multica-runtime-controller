@@ -322,7 +322,10 @@ def build_args(
         revision = _run("git", "rev-parse", "HEAD").stdout.strip()
     if REVISION_PATTERN.fullmatch(revision) is None:
         raise ResolverError("COMMIT must be a full 40-hex revision")
-    return assignments | {"VERSION": release_version, "COMMIT": revision}
+    if "GO_VERSION" not in assignments:
+        raise ResolverError("missing_core_compiler_pin")
+    SemVer.parse(assignments["GO_VERSION"], field="GO_VERSION")
+    return {field: assignments[field] for field in ("GO_VERSION", "MULTICA_CLI_VERSION")} | {"VERSION": release_version, "COMMIT": revision}
 
 
 def prepare_release_version(base_ref: str) -> dict[str, Any]:

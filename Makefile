@@ -1,19 +1,11 @@
-.PHONY: build image image-push repository-validate runtime-version-test workflow-validate test test-race vet verify
+.PHONY: build image image-push repository-validate runtime-version-test workflow-validate test test-race vet verify-local verify
 
 RUNTIME_VERSIONS_FILE := build/runtime-versions.env
 include $(RUNTIME_VERSIONS_FILE)
 
 GO_MODULE_DIR := src
 
-RUNTIME_VERSION_ARGS := \
-	NODE_VERSION PHP_VERSION GO_VERSION RUST_VERSION COMPOSER_VERSION \
-	MONGODB_PHP_EXTENSION_VERSION PHPREDIS_VERSION ZSTD_PHP_EXTENSION_VERSION \
-	GH_VERSION K9S_VERSION KUBECTX_VERSION KUBECTL_VERSION \
-	AWS_CLI_VERSION OCI_CLI_VERSION GCLOUD_CLI_VERSION \
-	CODEBASE_MEMORY_MCP_VERSION UV_VERSION YQ_VERSION SHFMT_VERSION COREPACK_VERSION \
-	MULTICA_CLI_VERSION \
-	CODEX_VERSION COPILOT_VERSION PI_VERSION \
-	ANTIGRAVITY_VERSION
+RUNTIME_VERSION_ARGS := GO_VERSION MULTICA_CLI_VERSION
 RUNTIME_BUILD_ARGS := $(foreach name,$(RUNTIME_VERSION_ARGS),--build-arg $(name)=$($(name)))
 
 HOST_ARCH := $(shell uname -m | sed -e 's/^x86_64$$/amd64/' -e 's/^aarch64$$/arm64/')
@@ -30,7 +22,8 @@ ACTIONLINT_WORKFLOWS := \
 	../.github/workflows/runtime-version-update.yml
 
 build:
-	go -C $(GO_MODULE_DIR) build ./cmd/runtime ./cmd/provider-shim
+	mkdir -p bin
+	go -C $(GO_MODULE_DIR) build -o ../bin/runtime ./cmd/runtime
 
 image:
 	docker buildx build --load \
@@ -69,4 +62,7 @@ test-race:
 vet:
 	go -C $(GO_MODULE_DIR) vet ./...
 
-verify: runtime-version-test repository-validate workflow-validate test test-race vet
+verify-local:
+	./scripts/verify-local.sh
+
+verify: runtime-version-test repository-validate workflow-validate test test-race vet verify-local
