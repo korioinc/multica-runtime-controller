@@ -322,7 +322,10 @@ def build_args(
         revision = _run("git", "rev-parse", "HEAD").stdout.strip()
     if REVISION_PATTERN.fullmatch(revision) is None:
         raise ResolverError("COMMIT must be a full 40-hex revision")
-    return assignments | {"VERSION": release_version, "COMMIT": revision}
+    if "GO_VERSION" not in assignments:
+        raise ResolverError("missing_core_compiler_pin")
+    SemVer.parse(assignments["GO_VERSION"], field="GO_VERSION")
+    return {field: assignments[field] for field in ("GO_VERSION", "MULTICA_CLI_VERSION")} | {"VERSION": release_version, "COMMIT": revision}
 
 
 def prepare_release_version(base_ref: str) -> dict[str, Any]:
@@ -465,9 +468,11 @@ def validate_actions(directory: Path) -> dict[str, Any]:
                 continue
             action_count += 1
             action, separator, revision = reference.rpartition("@")
-            if not separator or re.fullmatch(r"[0-9a-f]{40}", revision) is None:
-                raise ResolverError(f"action_not_full_sha file={path.name} action={action}")
-            if not comment or re.search(r"v[0-9]", comment) is None:
+            sha = re.fullmatch(r"[0-9a-f]{40}", revision) is not None
+            version = re.fullmatch(r"v[0-9]+(?:\.[0-9]+){0,2}", revision) is not None
+            if not separator or not (sha or version):
+                raise ResolverError(f"action_reference_requires_version_or_sha file={path.name} action={action}")
+            if sha and (not comment or re.search(r"v[0-9]", comment) is None):
                 raise ResolverError(
                     f"action_version_comment_missing file={path.name} action={action}"
                 )

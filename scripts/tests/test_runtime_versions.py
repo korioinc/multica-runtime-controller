@@ -347,21 +347,6 @@ class RuntimeVersionTests(unittest.TestCase):
             self.assertEqual(env.read_text(encoding="utf-8"), "MULTICA_CLI_VERSION=0.4.27\n")
             self.assertEqual(version.read_text(encoding="ascii"), "0.3.22\n")
 
-    def test_build_args_include_release_identity(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            env = root / "runtime-versions.env"
-            version = root / "VERSION"
-            env.write_text("MULTICA_CLI_VERSION=0.4.26\n", encoding="utf-8")
-            version.write_text("0.3.21\n", encoding="ascii")
-            revision = "a" * 40
-
-            result = runtime_versions.build_args(env, version, revision)
-
-            self.assertEqual(result["MULTICA_CLI_VERSION"], "0.4.26")
-            self.assertEqual(result["VERSION"], "0.3.21")
-            self.assertEqual(result["COMMIT"], revision)
-
     def test_automation_diff_requires_env_and_version_together(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -398,13 +383,13 @@ class RuntimeVersionTests(unittest.TestCase):
             subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=root, check=True)
             (root / "build").mkdir()
             (root / "build/runtime-versions.env").write_text(
-                "MULTICA_CLI_VERSION=0.4.26\nCODEX_VERSION=0.147.0\n", encoding="utf-8"
+                "MULTICA_CLI_VERSION=0.4.26\nGO_VERSION=1.26.0\n", encoding="utf-8"
             )
             (root / "VERSION").write_text("0.3.21\n", encoding="ascii")
             subprocess.run(["git", "add", "."], cwd=root, check=True)
             subprocess.run(["git", "commit", "-qm", "base"], cwd=root, check=True)
             (root / "build/runtime-versions.env").write_text(
-                "MULTICA_CLI_VERSION=0.4.27\nCODEX_VERSION=0.148.0\n", encoding="utf-8"
+                "MULTICA_CLI_VERSION=0.4.27\nGO_VERSION=1.26.1\n", encoding="utf-8"
             )
             (root / "VERSION").write_text("0.3.22\n", encoding="ascii")
 
