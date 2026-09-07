@@ -101,7 +101,6 @@ func podObject(cfg Config, ref Reference, request wire.Request, gateway string) 
 		mounts = append(mounts, corev1.VolumeMount{Name: "runtime-workspace", MountPath: wire.ControlRoot + "/assigned-skills", SubPath: request.WorkerSubPath + "/codex-skills", ReadOnly: true})
 	}
 	volumes = append(volumes, cfg.ConfigVolumes...)
-	mounts = append(mounts, cfg.ConfigMounts...)
 	env := append([]corev1.EnvVar{}, cfg.ConfigEnv...)
 	for i := range env {
 		env[i].Name = "MULTICA_OPERATOR_" + env[i].Name
@@ -132,11 +131,17 @@ func podObject(cfg Config, ref Reference, request wire.Request, gateway string) 
 		Containers:     []corev1.Container{{Name: "worker", Image: cfg.EnvironmentImage, ImagePullPolicy: cfg.EnvironmentPullPolicy, Command: []string{wire.CoreRoot + "/runtime", "worker", "serve"}, Env: env, EnvFrom: from, VolumeMounts: mounts, Resources: cfg.Resources, SecurityContext: security, ReadinessProbe: &corev1.Probe{ProbeHandler: corev1.ProbeHandler{Exec: &corev1.ExecAction{Command: []string{wire.CoreRoot + "/runtime", "worker", "ready"}}}, PeriodSeconds: 2, FailureThreshold: 30}, Ports: []corev1.ContainerPort{{Name: "daemon", ContainerPort: int32(port)}}}},
 	}}
 	homeCommand := []string{wire.CoreRoot + "/runtime", "home", "layout"}
-	for _, mount := range cfg.ConfigMounts {
-		if parent := filepath.Dir(mount.MountPath); parent != wire.Home {
-			homeCommand = append(homeCommand, "--home-parent="+parent)
+	homeMounts := []corev1.VolumeMount{{Name: "runtime-core", MountPath: wire.CoreRoot, ReadOnly: true}, {Name: "runtime-home", MountPath: wire.Home}}
+	for index, mount := range cfg.ConfigMounts {
+		source := wire.ConfigInputRoot + "/" + strconv.Itoa(index)
+		copyJSON, err := json.Marshal(wire.ConfigCopy{Source: source, Target: mount.MountPath})
+		if err != nil {
+			return nil, err
 		}
+		homeCommand = append(homeCommand, "--config-copy="+string(copyJSON))
+		mount.MountPath = source
+		homeMounts = append(homeMounts, mount)
 	}
-	pod.Spec.InitContainers = append(pod.Spec.InitContainers, corev1.Container{Name: "home-layout", Image: cfg.EnvironmentImage, ImagePullPolicy: cfg.EnvironmentPullPolicy, Command: homeCommand, SecurityContext: security, VolumeMounts: []corev1.VolumeMount{{Name: "runtime-core", MountPath: wire.CoreRoot, ReadOnly: true}, {Name: "runtime-home", MountPath: wire.Home}}})
+	pod.Spec.InitContainers = append(pod.Spec.InitContainers, corev1.Container{Name: "home-layout", Image: cfg.EnvironmentImage, ImagePullPolicy: cfg.EnvironmentPullPolicy, Command: homeCommand, SecurityContext: security, VolumeMounts: homeMounts})
 	return pod, nil
 }
