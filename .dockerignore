@@ -7,7 +7,5 @@
 !src/internal/
 !src/internal/**
 !scripts/
-!scripts/install-runtime-tools.sh
-!scripts/runtime-entrypoint.sh
-!scripts/verify-runtime-tools.sh
+!scripts/core_contract.py
 **/*_test.go
