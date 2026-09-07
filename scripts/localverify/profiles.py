@@ -18,6 +18,9 @@ import subprocess
 import sys
 import uuid
 
+# An explicit input for these installation examples, not a chart default.
+EXAMPLE_IMAGE = "docker.io/library/buildpack-deps:bookworm-scm@sha256:4274ea4975976f86239384ac206f98af5f0978fd8f054886eec1371fc7664025"
+
 
 class Profiles:
     def __init__(self, args):
@@ -127,11 +130,15 @@ class Profiles:
             argv.extend(["--env", key + "=" + str(value)])
         return self.run([*argv, image, *command], name + (log_suffix or ""))
 
-    def default_input(self):
+    def example_input(self):
+        values = {"runtime": {"image": {"reference": self.args.core_image}}, "environment": {
+            "image": {"reference": EXAMPLE_IMAGE}, "platform": self.platform,
+            "providers": ["pi", "codex", "copilot", "antigravity"],
+            "bootstrap": {"source": "bundled"}}}
+        path = self.output / "example-values.json"
+        path.write_text(json.dumps(values) + "\n")
         raw = self.run(["helm", "template", "verify", str(self.chart), "--namespace", "runtime-verify",
-                        "--set-string", "runtime.image.reference=" + self.args.core_image,
-                        "--set-string", "environment.platform=" + self.platform,
-                        "--show-only", "templates/environment-config.yaml"], "render-profile-default")
+                        "--values", str(path), "--show-only", "templates/environment-config.yaml"], "render-profile-example")
         # input.json is itself encoded as a JSON-compatible quoted scalar by the
         # chart; parse those JSON bytes instead of implementing a YAML loader.
         entries = [line.strip().removeprefix("input.json: ") for line in raw.decode().splitlines()
@@ -292,9 +299,9 @@ class Profiles:
                 "environmentImage": image, "prepared": True, "worker": True}
 
     def execute(self):
-        base = self.default_input()
+        base = self.example_input()
         image = base["environmentImage"]
-        self.run(["docker", "pull", "--platform", self.platform, image], "pull-default-profile-image")
+        self.run(["docker", "pull", "--platform", self.platform, image], "pull-example-image")
         php_tag = self.prefix + "-php-python:local"
         dockerfile = self.chart / "files/environments/Dockerfile.php-python"
         source_hash = hashlib.sha256(dockerfile.read_bytes()).hexdigest()
@@ -312,7 +319,7 @@ class Profiles:
         self.images.add(php_tag)
         self.record_resources()
         php_image = self.image_reference(php_tag)
-        prepared = [self.prepare("default", "default.sh", base, image),
+        prepared = [self.prepare("default", "node-providers.sh", base, image),
                     self.prepare("go-rust", "go-rust.sh", base, image),
                     self.prepare("php-python", "php-python.sh", base, php_image)]
         if self.args.prepare_only:
