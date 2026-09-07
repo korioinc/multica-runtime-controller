@@ -47,7 +47,7 @@ def main():
     command(["go", "-C", str(ROOT / "src"), "build", "-o", str(binary), "./cmd/runtime"])
     shared = json.loads((args.chart / "files/environments/identity-cases.json").read_text())
     external_script = "#!/bin/bash\nprintf 'external identity fixture\\n'\n"
-    cases = [{"name": "bundled", "values": {}}] + shared + [{
+    cases = [{"name": "bundled-example", "values": {"environment": {"bootstrap": {"source": "bundled"}}}}] + shared + [{
         "name": "external-configmap",
         "values": {"environment": {"bootstrap": {"source": "configMap", "configMap": {
             "name": "external-identity-fixture", "key": "install.sh",
@@ -56,7 +56,10 @@ def main():
     for case in cases:
         values = case["values"]
         values["runtime"] = {"image": {"reference": state["core_image"]}}
-        values.setdefault("environment", {})["platform"] = "linux/" + state["arch"]
+        environment = values.setdefault("environment", {})
+        environment["image"] = {"reference": state["environment_image"]}
+        environment["platform"] = "linux/" + state["arch"]
+        environment.setdefault("providers", ["codex"])
         values_file = evidence / (case["name"] + "-values.json")
         values_file.write_text(json.dumps(values, ensure_ascii=False))
         rendered = command(["helm", "template", "identity", str(args.chart), "--namespace", "runtime-verify", "-f", str(values_file)])
@@ -80,7 +83,7 @@ def main():
             raise SystemExit("Helm changed supplied inline script bytes")
         outcomes.append({"case": case["name"], "environmentID": go_id, "scriptSHA256": input_data["scriptSHA256"], "passed": True})
     (evidence / "result.json").write_text(json.dumps(outcomes, indent=2) + "\n")
-    print("Go/Helm identity and exact script bytes agree for bundled, inline Unicode/newline, and external sources")
+    print("Go/Helm identity and exact script bytes agree for the explicitly selected example, inline Unicode/newline, and external sources")
 
 
 if __name__ == "__main__":

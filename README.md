@@ -18,7 +18,7 @@ helm upgrade --install multica-runtime korioinc/multica-runtime-controller \
   --set-string runtime.image.reference="$CORE_IMAGE_DIGEST"
 ```
 
-Both `runtime.image.reference` and `environment.image.reference` require an OCI `@sha256:` reference. The default environment is pinned `buildpack-deps:bookworm-scm`; `linux/amd64` and `linux/arm64` are supported. Select the actual platform in `environment.platform`.
+Both `runtime.image.reference` and `environment.image.reference` require an OCI `@sha256:` reference. Chart 0.3.0 leaves the environment image, providers and bootstrap script unconfigured. Supply these explicitly before installation; missing inputs fail chart rendering without installing languages or providers. `linux/amd64` and `linux/arm64` are supported. Select the actual platform in `environment.platform`.
 
 This rewrite uses a new workspace format and a separate tools PVC. Install with fresh PVCs, or reconnect PVCs already initialized by the same installation of this rewrite. There is no legacy reader, migration or fallback to the previous runtime. The stable chart-owned daemon identity must match the stored installation owner.
 
@@ -28,9 +28,9 @@ The controller has one replica and uses `Recreate`. Workspace and tools must use
 
 The chart supports three paths through the same preparation contract:
 
-- **Bundled profile:** pinned Node and `pi`, `codex`, `copilot`, `antigravity` installations. The Antigravity executable alias is `agy`.
+- **Explicit installation example:** opt in to `bootstrap.source: bundled` to use the chart's `files/environments/node-providers.sh` example. It installs pinned Node and `pi`, `codex`, `copilot`, `antigravity`; the Antigravity executable alias is `agy`. This example is never selected by the chart defaults.
 - **Operator script:** choose `inline`, or a ConfigMap name/key with an expected SHA-256. The chart includes complete Go/Rust and other installation examples.
-- **Operator image:** build native OS packages into a compatible Linux/glibc image, then supply a bootstrap that creates wrappers and the environment manifest. The PHP/native-extension and Python venv example follows this path.
+- **Prepared image:** select an existing compatible Linux/glibc image, or build native OS packages into your own image, then supply a bootstrap that registers the installed executables and writes the environment manifest. No package installation is required in that bootstrap when the image already contains the selected tools.
 
 The same environment image and installed generation are used by installer, controller and worker. Core init containers inject the identical core artifact into each Pod. Main containers run explicit runtime commands and do not depend on the image ENTRYPOINT.
 
@@ -48,6 +48,10 @@ The bootstrap inputs are:
 | `ENV_PROVIDERS` | JSON array of enabled builtin provider IDs |
 
 `environment.bootstrap.secretEnvFrom` belongs only to installation. `operator.envFrom`, `operator.configVolumes` and `operator.configMounts` supply native runtime configuration separately. Operator environment sources preserve their declared prefix. Explicit operator environment values support literals and `valueFrom`, without Kubernetes `$(NAME)` interpolation.
+
+With chart 0.3.0 and core 0.3.39 or later, `configMounts.mountPath` is the destination of a startup copy into private HOME. ConfigMap, Secret and projected inputs are mounted read-only only in the layout init container; controller and task containers receive ordinary writable files. Whole `.codex` and `.pi/agent` directories are supported. The runtime checks each copied entry to protect daemon identity, assigned Codex skills and Pi sessions. Inputs cannot replace those protected subtrees.
+
+Operator copies run before `homeSeed`, so operator settings win on a new Pod. Each completed file is published atomically without overwriting an existing file. Init retries preserve completed copies and native changes; the complete tree is not a transaction. A new Pod receives fresh input files, and changes made within an old Pod's HOME are not persisted. Use the paired chart and core release when upgrading from direct read-only config mounts.
 
 The manifest declares schema version 1, provider entrypoints/versions, relative `binDirs`, optional environment variables, a non-secret `homeSeed`, and optional argv-based checks. Entrypoints must resolve to executable regular files within the tools prefix. A wrapper can invoke a program installed in the environment image.
 
@@ -75,7 +79,7 @@ There is no automatic tools-generation GC. Worker storage retirement requires th
 
 Preparation progress appears in init-container logs. Main readiness follows environment validation and the runtime gateway. Failure categories distinguish configuration, core compatibility, preparation/integrity, provider startup, authorization, transport and pending cleanup. Provider protocol streams do not contain runtime diagnostic records for ordinary provider exit codes.
 
-Core artifacts contain only the static runtime, the original Multica CLI **0.4.40**, and hashed contract metadata. The Go compiler exists only in the build stage. Core compiler and CLI pins are in `build/runtime-versions.env`; language/provider pins belong to Helm environment assets.
+Core artifacts contain only the static runtime, the original Multica CLI **0.4.40**, and hashed contract metadata. The Go compiler exists only in the build stage. Core compiler and CLI pins are in `build/runtime-versions.env`; language/provider installation and versions belong to the operator's environment. The chart's opt-in examples contain their own version selections.
 
 ```sh
 make build

@@ -105,8 +105,8 @@ func (c Config) Validate() error {
 	return nil
 }
 
-// Configuration mounts supply native HOME files; they cannot shadow runtime,
-// session or storage authority, even by mounting a parent directory.
+// Configuration mounts describe init-only inputs and writable HOME copy
+// destinations. Directory contents receive the same authority check during copy.
 func validateConfigMounts(volumes []corev1.Volume, mounts []corev1.VolumeMount) error {
 	known := map[string]bool{}
 	for _, v := range volumes {
@@ -132,13 +132,8 @@ func validateConfigMounts(volumes []corev1.Volume, mounts []corev1.VolumeMount) 
 	paths := []string{}
 	for _, m := range mounts {
 		_, ok := known[m.Name]
-		if !ok || !m.ReadOnly || m.SubPathExpr != "" || filepath.Clean(m.MountPath) != m.MountPath || !strings.HasPrefix(m.MountPath, wire.Home+"/") || m.SubPath != "" && !filepath.IsLocal(m.SubPath) {
+		if !ok || !m.ReadOnly || m.SubPathExpr != "" || !wire.ConfigHomePath(m.MountPath, true) || m.SubPath != "" && !filepath.IsLocal(m.SubPath) {
 			return errors.New("configuration: unsafe config mount")
-		}
-		for _, protected := range []string{wire.PiSessionsRoot, wire.Home + "/.multica/config.json", wire.Home + "/.codex/skills"} {
-			if overlap(m.MountPath, protected) {
-				return errors.New("configuration: config mount shadows session or daemon authority")
-			}
 		}
 		for _, other := range paths {
 			if overlap(m.MountPath, other) {

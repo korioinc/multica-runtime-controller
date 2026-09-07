@@ -286,7 +286,7 @@ class Verification:
 
     def runtime(self):
         self.step("identity", self.identity_checks,
-                  "Go and Helm agree on bundled, inline Unicode/newline and external script identities")
+                  "Go and Helm agree on explicitly selected example, inline Unicode/newline and external script identities")
         self.step("install-a", lambda: self.install("A"))
         self.step("baseline", lambda: self.drive("baseline"),
                   "installed chart: actual task Pods, isolated Git checkout, continuation/retry and scope isolation")
@@ -311,7 +311,7 @@ class Verification:
         self.step("kubernetes", self.kubernetes_checks,
                   "actual API create-loss, UID replacement, cleanup recovery and fixed-Node scheduling")
         self.step("profiles", self.profile_checks,
-                  "actual bundled, prefix-installed and custom-image profiles with immutable core and worker execution")
+                  "explicitly selected installation examples with immutable core and worker execution")
         self.step("transport-sever", self.transport_checks,
                   "actual remote exec transport loss is rejected without deleting persisted worker files")
 
@@ -372,7 +372,7 @@ class Verification:
         self.export_selection()
 
     def profile_checks(self):
-        self.stage("Verifying bundled, prefix-installed and custom-image environment profiles")
+        self.stage("Verifying explicitly selected environment installation examples")
         self.command(["python3", str(ROOT / "scripts/localverify/profiles.py"), "--chart", str(self.chart),
             "--workdir", str(self.root), "--core-image", self.core, "--core-volume", self.core_volume,
             "--node", self.node, "--arch", self.arch], env=dict(os.environ, LOCALVERIFY_DISPOSABLE_CLUSTER="true"),
