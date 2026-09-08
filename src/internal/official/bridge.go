@@ -61,6 +61,7 @@ func NewBridge(options BridgeOptions) (http.Handler, error) {
 	slog.Info("backend custom runtime profiles are unsupported", "phase", "official", "imageBuildID", options.RuntimeRef.ImageBuildID)
 	b.proxy = &httputil.ReverseProxy{
 		Rewrite: func(request *httputil.ProxyRequest) {
+			slog.Info("backend request started", "phase", "controller")
 			request.SetURL(target)
 			if intercepted(request.In.Method, request.In.URL.Path) {
 				request.Out.Header.Set("Accept-Encoding", "identity")
@@ -68,6 +69,7 @@ func NewBridge(options BridgeOptions) (http.Handler, error) {
 		},
 		ModifyResponse: b.response,
 		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, _ error) {
+			slog.Warn("backend request failed", "phase", "controller", "error_class", "backend_transport_or_protocol")
 			http.Error(w, "official backend protocol validation failed", http.StatusBadGateway)
 		},
 	}
@@ -172,6 +174,7 @@ func (b *bridge) validateRegistration(raw []byte, providerField string) error {
 }
 
 func (b *bridge) response(response *http.Response) error {
+	slog.Info("backend response received", "phase", "controller", "status", response.StatusCode)
 	path := strings.TrimPrefix(response.Request.URL.Path, strings.TrimRight(b.target.Path, "/"))
 	if intercepted(response.Request.Method, path) && response.StatusCode >= 300 && response.StatusCode < 400 {
 		return errors.New("redirect would bypass the official registration or claim boundary")

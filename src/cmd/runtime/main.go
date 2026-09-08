@@ -117,6 +117,9 @@ func configureDiagnostics(args []string) (string, func()) {
 	}
 	providerStream = providerStream || phase == "worker" && len(args) > 2 && args[2] == "execute"
 	if !providerStream {
+		if phase == "controller" || phase == "worker" {
+			slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, nil)))
+		}
 		return phase, func() {}
 	}
 	var output io.Writer = io.Discard

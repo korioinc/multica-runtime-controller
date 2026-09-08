@@ -2,6 +2,7 @@ package official
 
 import (
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
@@ -38,6 +39,7 @@ func (b *bridge) websocket(w http.ResponseWriter, r *http.Request) {
 	dialer := websocket.Dialer{HandshakeTimeout: 15 * time.Second, Subprotocols: websocket.Subprotocols(r)}
 	upstream, response, err := dialer.DialContext(r.Context(), target.String(), headers)
 	if err != nil {
+		slog.Warn("backend websocket connection failed", "phase", "controller", "error_class", "backend_transport")
 		if response != nil {
 			response.Body.Close()
 		}
@@ -54,6 +56,8 @@ func (b *bridge) websocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer downstream.Close()
+	slog.Info("backend websocket connected", "phase", "controller")
+	defer slog.Info("backend websocket disconnected", "phase", "controller")
 	upstream.SetReadLimit(maxProtocolBytes)
 	downstream.SetReadLimit(maxProtocolBytes)
 	relayControl(upstream, downstream)
@@ -70,15 +74,19 @@ func (b *bridge) websocket(w http.ResponseWriter, r *http.Request) {
 			}
 			var message rpcMessage
 			if kind == websocket.TextMessage && json.Unmarshal(raw, &message) == nil && message.Type == "daemon:rpc_request" {
+				claim := message.Payload.Method == "tasks.claim"
 				mutex.Lock()
 				if message.Payload.ID == "" || pending[message.Payload.ID] || len(pending) >= 4096 {
 					mutex.Unlock()
 					return
 				}
-				if message.Payload.Method == "tasks.claim" {
+				if claim {
 					pending[message.Payload.ID] = true
 				}
 				mutex.Unlock()
+				if claim {
+					slog.Info("backend task claim started", "phase", "controller")
+				}
 			}
 			if upstream.WriteMessage(kind, raw) != nil {
 				return
@@ -98,6 +106,9 @@ func (b *bridge) websocket(w http.ResponseWriter, r *http.Request) {
 				claim := pending[message.Payload.ID]
 				delete(pending, message.Payload.ID)
 				mutex.Unlock()
+				if claim {
+					slog.Info("backend task claim response received", "phase", "controller", "status", message.Payload.Status)
+				}
 				if claim && message.Payload.Status == http.StatusOK {
 					transformed, err := b.claim(message.Payload.Body)
 					// Never synthesize an RPC failure after an upstream success. Closing

@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -125,6 +126,8 @@ func ControllerGateway(resources *kubernetes.Client) http.Handler {
 			_, _ = io.WriteString(w, `{"status":"ok"}`)
 			return
 		}
+		logger := slog.Default().With("phase", "controller_gateway", "task", request.TaskID, "attempt", request.AttemptID, "provider", request.Provider)
+		logger.Info("worker checkout request received")
 		target := &url.URL{Scheme: "http", Host: "127.0.0.1:" + strconv.Itoa(request.BrokerPort)}
 		proxy := &httputil.ReverseProxy{Rewrite: func(p *httputil.ProxyRequest) {
 			p.SetURL(target)
@@ -132,7 +135,11 @@ func ControllerGateway(resources *kubernetes.Client) http.Handler {
 			p.Out.Header.Del(wire.TaskHeader)
 			p.Out.Header.Del(wire.TokenHeader)
 			p.Out.Header.Set(wire.CapabilityHeader, request.BrokerToken)
+		}, ModifyResponse: func(response *http.Response) error {
+			logger.Info("worker checkout response received", "status", response.StatusCode)
+			return nil
 		}, ErrorHandler: func(w http.ResponseWriter, _ *http.Request, _ error) {
+			logger.Warn("worker checkout transport failed", "error_class", "transport")
 			http.Error(w, "checkout transport unavailable", 502)
 		}}
 		proxy.ServeHTTP(w, r)
@@ -148,6 +155,7 @@ func WorkerGateway(request wire.Request, origin, secret string) (http.Handler, e
 	if err != nil {
 		return nil, err
 	}
+	logger := slog.Default().With("phase", "worker_gateway", "task", request.TaskID, "attempt", request.AttemptID, "provider", request.Provider)
 	client := &http.Client{Transport: &http.Transport{}, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !taskRoute(r) {
@@ -174,12 +182,15 @@ func WorkerGateway(request wire.Request, origin, secret string) (http.Handler, e
 		upstream.Header.Set(wire.TaskHeader, request.TaskID)
 		upstream.Header.Set(wire.TokenHeader, wire.Value(request.Env, "MULTICA_TOKEN"))
 		upstream.Header.Set("Content-Type", "application/json")
+		logger.Info("checkout request forwarded to controller")
 		response, err := client.Do(upstream)
 		if err != nil {
+			logger.Warn("checkout transport failed", "error_class", "transport")
 			http.Error(w, "checkout transport failed", 502)
 			return
 		}
 		defer response.Body.Close()
+		logger.Info("controller checkout response received", "status", response.StatusCode)
 		if response.StatusCode != http.StatusOK {
 			for k, v := range response.Header {
 				w.Header()[k] = v
@@ -190,14 +201,17 @@ func WorkerGateway(request wire.Request, origin, secret string) (http.Handler, e
 		}
 		branch, err := base64.RawURLEncoding.DecodeString(response.Header.Get(wire.BranchHeader))
 		if err != nil || response.Header.Get("Content-Type") != wire.ArchiveType {
+			logger.Warn("checkout response rejected", "error_class", "checkout_archive")
 			http.Error(w, "invalid checkout archive", 502)
 			return
 		}
 		result, err := publisher.Publish(r.Context(), plan, string(branch), response.Body)
 		if err != nil {
+			logger.Warn("checkout publication failed", "error_class", "checkout_publication")
 			http.Error(w, "checkout publication refused", 409)
 			return
 		}
+		logger.Info("checkout published")
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(result)
 	}), nil
