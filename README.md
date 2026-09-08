@@ -55,6 +55,10 @@ runtime image verify
 
 Helm accepts ConfigMap sources through `operator.configVolumes` and `operator.configMounts`. Terraform retains ownership of original Codex/Pi files. File sources remain ConfigMaps. Environment-variable Secrets, controller tokens and task request Secrets are separate contracts.
 
+The base image registers the `multica` user and group as UID/GID 65532, with `/home/multica/agents` as its home and `/bin/bash` as its shell. This lets interactive shells and tools resolve the runtime user by name.
+
+Each task worker container starts in `/workspace/<workspace>/<task>/workdir`. Every supported task provider starts in this directory, regardless of provider type. It is also the default working directory for `kubectl exec`. HOME remains `/home/multica/agents` for user configuration and credentials.
+
 The `home layout` init runs as UID/GID 65532 and creates private `agents`, `tmp` and `run` children in one emptyDir. Main containers see only those children at `/home/multica/agents`, `/tmp` and `/run/multica`, with private access modes and protected ancestors.
 
 Before copying into HOME, init captures all selected projected files and mappings into one committed bundle. A retry reuses that bundle even if the source ConfigMap changes or disappears. Individual HOME files are published without overwriting existing files; image seeds fill missing destinations. Partial copies can be retried without mixing source generations.
