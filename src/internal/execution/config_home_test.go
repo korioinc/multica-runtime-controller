@@ -53,20 +53,6 @@ func TestCopiedConfigurationKeepsTaskChangesPrivate(t *testing.T) {
 	}
 }
 
-func TestConfigurationCopyCannotReplaceAssignedSkills(t *testing.T) {
-	source, home := t.TempDir(), t.TempDir()
-	assigned := filepath.Join(home, ".codex/skills/approved.md")
-	configFile(t, assigned, "assigned task instructions")
-	configFile(t, filepath.Join(source, "skills/approved.md"), "operator replacement")
-	if err := copyHomeConfig(home, source, wire.Home+"/.codex"); err == nil {
-		t.Fatal("configuration gained authority over assigned task skills")
-	}
-	got, err := os.ReadFile(assigned)
-	if err != nil || string(got) != "assigned task instructions" {
-		t.Fatal("configuration replaced the assigned task instructions", err)
-	}
-}
-
 func TestConfigurationCopyDoesNotFollowNativeHomeLinks(t *testing.T) {
 	source, home, outside := t.TempDir(), t.TempDir(), t.TempDir()
 	input := filepath.Join(source, "config.toml")

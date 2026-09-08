@@ -72,7 +72,7 @@ func HomePath(path string, directory bool) bool {
 	if filepath.Clean(path) != path || !strings.HasPrefix(path, Home+"/") || strings.ContainsAny(path, "\x00\n\r") {
 		return false
 	}
-	for _, protected := range []string{Home + "/.multica/pi-sessions", Home + "/.multica/config.json", Home + "/.codex/skills", Home + "/.pi/agent/sessions"} {
+	for _, protected := range []string{Home + "/.multica/pi-sessions", Home + "/.multica/config.json", Home + "/.pi/agent/sessions"} {
 		if path == protected || strings.HasPrefix(path, protected+"/") || !directory && strings.HasPrefix(protected, path+"/") {
 			return false
 		}

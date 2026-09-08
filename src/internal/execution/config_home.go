@@ -17,6 +17,12 @@ import (
 // copyHomeConfig publishes private, writable files without replacing native
 // state. A retry preserves completed files; this is not a whole-tree transaction.
 func copyHomeConfig(home, source, target string) error {
+	return copyHomeConfigExcept(home, source, target, "")
+}
+
+// Image npm state is published as one directory after ordinary defaults. It
+// must not be partially populated by the per-file configuration copier.
+func copyHomeConfigExcept(home, source, target, excluded string) error {
 	info, err := os.Lstat(source)
 	if err != nil {
 		return err
@@ -83,6 +89,12 @@ func copyHomeConfig(home, source, target string) error {
 		}
 		if !configuration.HomePath(destination, info.IsDir()) {
 			return errors.New("configuration tree shadows native session or daemon authority")
+		}
+		if destination == excluded {
+			if !info.IsDir() {
+				return errors.New("excluded package state must be a directory")
+			}
+			return fs.SkipDir
 		}
 		destination = strings.TrimPrefix(destination, wire.Home+"/")
 		if info.IsDir() {

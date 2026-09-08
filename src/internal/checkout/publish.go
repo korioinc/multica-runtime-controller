@@ -179,7 +179,7 @@ func (p *Publisher) Publish(ctx context.Context, plan wire.Plan, branch string, 
 		return wire.Result{}, err
 	}
 	defer fd.Close()
-	if err := publishDirectory(int(fd.Fd()), stage, name); err != nil {
+	if err := PublishDirectory(int(fd.Fd()), stage, name); err != nil {
 		return wire.Result{}, fmt.Errorf("checkout publication refuses to replace existing work: %w", err)
 	}
 	if err := fd.Sync(); err != nil {
