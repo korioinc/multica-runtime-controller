@@ -13,7 +13,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/korioinc/multica-runtime-controller/internal/checkout"
 	"github.com/korioinc/multica-runtime-controller/internal/configuration"
 	"github.com/korioinc/multica-runtime-controller/internal/core"
 	"github.com/korioinc/multica-runtime-controller/internal/runtimeimage"
@@ -67,12 +66,19 @@ func WorkerServe(ctx context.Context) error {
 	if os.Getpid() != 1 {
 		return errors.New("worker serve must own container PID 1")
 	}
-	request, _, err := readWorkerRequest(os.Getenv("MULTICA_REQUEST_DIGEST"), os.Getenv("POD_UID"))
+	request, manifest, err := readWorkerRequest(os.Getenv("MULTICA_REQUEST_DIGEST"), os.Getenv("POD_UID"))
 	if err != nil {
 		return err
 	}
 	if request.Provider == "codex" {
-		if err := checkout.HydrateSkills(wire.ControlRoot+"/assigned-skills", wire.Home); err != nil {
+		bundle, err := configuration.Read(wire.ControlRoot)
+		if err != nil {
+			return err
+		}
+		if bundle.Digest != request.RuntimeRef.ConfigurationDigest {
+			return errors.New("worker committed configuration differs from request")
+		}
+		if err := hydrateSkills(wire.ControlRoot+"/assigned-skills", wire.Home, manifest.HomeSeed, bundle); err != nil {
 			return err
 		}
 	}

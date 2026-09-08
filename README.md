@@ -63,9 +63,31 @@ The `home layout` init runs as UID/GID 65532 and creates private `agents`, `tmp`
 
 Before copying into HOME, init captures all selected projected files and mappings into one committed bundle. A retry reuses that bundle even if the source ConfigMap changes or disappears. Individual HOME files are published without overwriting existing files; image seeds fill missing destinations. Partial copies can be retried without mixing source generations.
 
+Provider configuration can map complete directories to `.codex` and `.pi`.
+Nested skills, references and other selected files keep their relative paths.
+Operator files take precedence over image defaults in a new HOME.
+
+The image seed may include an installed Pi npm tree at `.pi/agent/npm`.
+Package source directories such as `token` are valid within its `node_modules`;
+ordinary HOME credential and session paths remain prohibited in image seeds.
+Only relative npm `.bin` links confined to that installation are permitted.
+Init prepares the complete npm tree privately and publishes it only when the
+destination is absent. Existing package additions, updates and removals are
+preserved. Providers run directly without an initialization wrapper.
+
 The controller creates immutable ConfigMap snapshots from the bundle. Each snapshot belongs to the controller Pod and is shared by its workers. The controller checks UID, owner, immutable state and payload before task creation and execution. Worker init checks mounted payload and mapping. It never falls back to a mutable source. Task cleanup does not delete shared snapshots; controller owner GC governs their lifetime.
 
-Edits and authentication refreshes in private HOME do not modify source ConfigMaps, image seeds, other task HOMEs or future workers. Controller native config, Pi sessions and assigned Codex skills are protected from overrides. Content-identical snapshots retain logical session compatibility even when Kubernetes object names or UIDs change.
+Edits and authentication refreshes in private HOME do not modify source ConfigMaps, image seeds, other task HOMEs or future workers. Controller native config and Pi sessions are protected from overrides. Content-identical snapshots retain logical session compatibility even when Kubernetes object names or UIDs change.
+
+On Codex worker startup, managed skills are rebuilt from image defaults, the
+committed operator configuration and the current task assignment. An assigned
+top-level skill directory replaces all configured directories with the same
+daemon-normalized name (lowercase words joined by hyphens) as a whole;
+other configured skills remain available. Removing an assignment restores the
+operator version. Global skill links prepared by the daemon are not exported as
+task assignments because the worker already receives their configuration
+snapshot. Manage persistent global skills in provider configuration; direct
+edits to the worker's managed skill tree can be replaced on worker restart.
 
 ## Task authority and recovery
 

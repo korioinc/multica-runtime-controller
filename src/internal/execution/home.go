@@ -136,16 +136,25 @@ func LayoutHome(ctx context.Context, arguments []string) error {
 }
 
 func copyHomeSeed(home, seed string) error {
+	if err := runtimeimage.ValidateSeedContents(seed); err != nil {
+		return err
+	}
 	entries, err := os.ReadDir(seed)
 	if err != nil {
 		return err
 	}
 	for _, entry := range entries {
-		if err = copyHomeConfig(home, filepath.Join(seed, entry.Name()), filepath.Join(wire.Home, entry.Name())); err != nil {
+		if err = copyHomeConfigExcept(home, filepath.Join(seed, entry.Name()), filepath.Join(wire.Home, entry.Name()), filepath.Join(wire.Home, runtimeimage.PiNPMDirectory)); err != nil {
 			return err
 		}
 	}
-	return nil
+	packages := filepath.Join(seed, runtimeimage.PiNPMDirectory)
+	if _, err := os.Lstat(packages); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	return copyNPMSeed(home, packages)
 }
 
 func CopyBundle(home string, bundle configuration.Bundle) error {

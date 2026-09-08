@@ -114,7 +114,7 @@ func (r *Runner) Run(ctx context.Context, request wire.Request, streams kubernet
 		}
 	}
 	workerRoot := filepath.Join(wire.WorkspaceRoot, binding.WorkerSubPath)
-	if err := checkout.SeedContext(root, workerRoot, wire.WorkspaceRoot+"/.multica-runtime/context/"+storageID+".json", request.Provider); err != nil {
+	if err := checkout.SeedContext(root, workerRoot, wire.WorkspaceRoot+"/.multica-runtime/context/"+storageID+".json", request.Provider, wire.Home+"/.codex/skills"); err != nil {
 		return fail(err)
 	}
 	port, token, closeBroker, err := startBroker(request)

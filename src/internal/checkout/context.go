@@ -14,7 +14,7 @@ import (
 // SeedContext refreshes only the official sidecar files owned by this binding.
 // The durable ownership union is published before writes so retry after a crash
 // cannot mistake a partial refresh for user-owned files.
-func SeedContext(source, destination, record, provider string) error {
+func SeedContext(source, destination, record, provider, globalSkills string) error {
 	prepared, err := os.OpenRoot(source)
 	if err != nil {
 		return err
@@ -118,6 +118,12 @@ func SeedContext(source, destination, record, provider string) error {
 				if err != nil || entry.IsDir() {
 					return err
 				}
+				if entry.Type()&os.ModeSymlink != 0 {
+					inherited, err := inheritedCodexSkill(prepared, name, globalSkills)
+					if err != nil || inherited {
+						return err
+					}
+				}
 				data, err := plainRead(prepared, name)
 				if err != nil {
 					return err
@@ -132,6 +138,37 @@ func SeedContext(source, destination, record, provider string) error {
 	}
 	return writeContextRecord(record, current)
 }
+
+// The official daemon links global skills into its per-task home. They are
+// already supplied by the worker's committed configuration, so exporting them
+// as assigned skills would give mutable controller HOME unintended precedence.
+// Only an exact, same-name link to a real canonical global directory is skipped.
+func inheritedCodexSkill(prepared *os.Root, name, globalSkills string) (bool, error) {
+	if filepath.Dir(name) != "codex-home/skills" || !filepath.IsAbs(globalSkills) || filepath.Clean(globalSkills) != globalSkills {
+		return false, nil
+	}
+	target, err := prepared.Readlink(name)
+	if err != nil {
+		return false, err
+	}
+	expected := filepath.Join(globalSkills, filepath.Base(name))
+	if target != expected {
+		return false, nil
+	}
+	info, err := os.Lstat(expected)
+	if err != nil {
+		return false, err
+	}
+	if !info.IsDir() {
+		return false, nil
+	}
+	canonical, err := filepath.EvalSymlinks(expected)
+	if err != nil {
+		return false, err
+	}
+	return canonical == expected, nil
+}
+
 func writeContextRecord(path string, files []string) error {
 	root, err := os.OpenRoot(filepath.Dir(path))
 	if err != nil {
@@ -169,40 +206,4 @@ func mergeBrief(existing, prepared []byte) []byte {
 	result := append([]byte{}, existing...)
 	result = append(result, '\n', '\n')
 	return append(result, prepared...)
-}
-
-// HydrateSkills applies the official task's prepared skill directory to a
-// private HOME. Neither that replacement nor
-// later agent edits flow back to the environment seed or preparation root.
-func HydrateSkills(source, home string) error {
-	prepared, err := os.OpenRoot(source)
-	if err != nil {
-		return err
-	}
-	defer prepared.Close()
-	private, err := os.OpenRoot(home)
-	if err != nil {
-		return err
-	}
-	defer private.Close()
-	if err := private.RemoveAll(".codex/skills"); err != nil {
-		return err
-	}
-	if err := plainDirectories(private, ".codex/skills", 0700); err != nil {
-		return err
-	}
-	return fs.WalkDir(prepared.FS(), ".", func(name string, entry fs.DirEntry, err error) error {
-		if err != nil || name == "." {
-			return err
-		}
-		target := ".codex/skills/" + name
-		if entry.IsDir() {
-			return plainDirectories(private, target, 0700)
-		}
-		data, err := plainRead(prepared, name)
-		if err != nil {
-			return err
-		}
-		return replace(private, target, data, 0600)
-	})
 }
