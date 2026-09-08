@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -108,6 +109,9 @@ func WorkerProxy(ctx context.Context) error {
 	defer os.Remove(wire.ControlRoot + "/ready")
 	stopped := make(chan error, 1)
 	go func() { stopped <- server.Serve(listener) }()
+	logger := slog.Default().With("phase", "worker_gateway", "task", request.TaskID, "attempt", request.AttemptID, "provider", request.Provider)
+	logger.Info("worker gateway started")
+	defer logger.Info("worker gateway stopped")
 	select {
 	case <-ctx.Done():
 		shutdown, cancel := context.WithTimeout(context.Background(), time.Duration(request.TerminationGraceSeconds)*time.Second)

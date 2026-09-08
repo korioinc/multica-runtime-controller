@@ -71,6 +71,17 @@ Same-scope continuation preserves work, branches and Git hooks. Pi sessions addi
 
 Provider streams and exit codes are preserved. Cancellation signals the process group and allows its configured grace period. Durable create intent lets recovery reconcile lost API responses by name, owner, payload and UID. Cleanup refuses replaced resources and preserves user work. An expired controller's snapshot may already be garbage-collected; teardown can still resolve its journaled resources without granting new execution authority.
 
+## Runtime logs
+
+Controller and worker service processes write INFO-level operational logs to stdout. The controller reports backend requests, response statuses, WebSocket connections and task claim exchanges. Worker logs show gateway startup/shutdown and checkout requests to the controller; task and attempt IDs connect the two sides.
+
+```sh
+kubectl -n tools-multica logs -f deployment/multica-runtime-controller -c controller
+kubectl -n tools-multica logs -f "$WORKER_POD" -c worker
+```
+
+Set `WORKER_POD` to the active task worker Pod name. Routine health probes remain quiet. Operational logs omit credentials, headers, request/response bodies, prompts and provider arguments. Provider protocol streams and their separate diagnostic sink are unchanged; the official daemon's private detailed log is not copied into Pod logs.
+
 ## Explicit workspace migration
 
 Normal startup rejects schema 1 data; it never initializes over it or converts it automatically. Use the offline migration command after separately establishing that old writers and task resources are quiescent. It proves filesystem ownership, existing lock availability, empty attempts and source bytes; it cannot prove remote cluster quiescence.
