@@ -1,0 +1,268 @@
+#!/usr/bin/env bash
+# Isolated release-authority checks. Stub executables cannot reach a registry,
+# GitHub, Docker engine, or Git repository, and all mutations stay in this fixture.
+set -euo pipefail
+export LC_ALL=C
+repository=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
+fixture=$(mktemp -d "${TMPDIR:-/tmp}/controller-release-proof.XXXXXX")
+trap 'rm -rf -- "$fixture"' EXIT
+mkdir -p "$fixture/bin" "$fixture/checkout/build" "$fixture/checkout/.github/scripts" "$fixture/registry" "$fixture/records"
+export RELEASE_FIXTURE_ROOT=$fixture
+export GH_REPO=fixture/controller
+export PATH="$fixture/bin:$PATH"
+unset GH_TOKEN GITHUB_TOKEN GITHUB_OUTPUT
+revision=1111111111111111111111111111111111111111
+other=2222222222222222222222222222222222222222
+printf '%s\n' "$revision" >"$fixture/main"
+printf '%s\n' "$revision" >"$fixture/head"
+printf '%s\n' 1.2.3 >"$fixture/checkout/VERSION"
+printf '%s\n' GO_VERSION=1.26.1 >"$fixture/checkout/build/runtime-versions.env"
+cp "$repository/.github/scripts/verify-base.sh" "$fixture/checkout/.github/scripts/verify-base.sh"
+cat >"$fixture/bin/git" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ $# == 4 && $1 == -C && $3 == rev-parse && $4 == HEAD ]]; then cat "$RELEASE_FIXTURE_ROOT/head"; exit; fi
+printf 'unexpected fixture git command\n' >&2
+exit 1
+STUB
+cat >"$fixture/bin/gh" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+root=$RELEASE_FIXTURE_ROOT
+respond() {
+  if [[ -f $1 ]]; then printf 'HTTP/2.0 200 OK\nContent-Type: application/json\n\n'; cat "$1"; else printf 'HTTP/2.0 404 Not Found\nContent-Type: application/json\n\n{}\n'; exit 1; fi
+}
+if [[ $# == 3 && $1 == api && $2 == --include ]]; then
+  case $3 in
+    repos/fixture/controller/git/ref/heads/main)
+      printf 'HTTP/2.0 200 OK\nContent-Type: application/json\n\n'
+      jq -cn --arg sha "$(cat "$root/main")" '{object:{type:"commit",sha:$sha}}' ;;
+    repos/fixture/controller/git/ref/tags/1.2.3) respond "$root/tag.json" ;;
+    repos/fixture/controller/releases/tags/1.2.3) respond "$root/release.json" ;;
+    *) printf 'unexpected fixture GitHub lookup\n' >&2; exit 1 ;;
+  esac
+  exit
+fi
+if [[ ${1:-} == release && ${2:-} == create && ${3:-} == 1.2.3 ]]; then
+  shift 3
+  target=''
+  while [[ $# -gt 0 ]]; do
+    case $1 in --target) target=$2 ;; --notes-file) [[ -f $2 ]] ;; --repo|--title) : ;; *) exit 1 ;; esac
+    shift 2
+  done
+  [[ $target == "$(cat "$root/main")" && ! -f $root/release.json ]]
+  jq -cn --arg sha "$target" '{target_commitish:$sha,draft:false,prerelease:false}' >"$root/release.json"
+  jq -cn --arg sha "$target" '{object:{type:"commit",sha:$sha}}' >"$root/tag.json"
+  if [[ $(cat "$root/fault" 2>/dev/null || :) == after-release ]]; then rm "$root/fault"; exit 1; fi
+  exit
+fi
+printf 'unexpected fixture gh command\n' >&2
+exit 1
+STUB
+cat >"$fixture/bin/docker" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+root=$RELEASE_FIXTURE_ROOT
+revision=$(cat "$root/head")
+platform=${RELEASE_FIXTURE_PLATFORM:-linux/amd64}
+amd=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+arm=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+config_amd=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+config_arm=sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+native_platform() {
+  case $1 in *-amd64|*"@$amd") printf linux/amd64 ;; *-arm64|*"@$arm") printf linux/arm64 ;; *) exit 1 ;; esac
+}
+manifest_file() {
+  case $1 in
+    fixture/runtime:build-1.2.3-"$revision"-amd64) printf '%s/registry/amd64.json' "$root" ;;
+    fixture/runtime:build-1.2.3-"$revision"-arm64) printf '%s/registry/arm64.json' "$root" ;;
+    fixture/runtime:1.2.3) printf '%s/registry/version.json' "$root" ;;
+    fixture/runtime:latest) printf '%s/registry/latest.json' "$root" ;;
+    *) exit 1 ;;
+  esac
+}
+image() {
+  local selected=$1 config pin index kind id media
+  case $selected in linux/amd64) config=$config_amd; pin=$amd; index=sha256:1111111111111111111111111111111111111111111111111111111111111111 ;; linux/arm64) config=$config_arm; pin=$arm; index=sha256:2222222222222222222222222222222222222222222222222222222222222222 ;; *) exit 1 ;; esac
+  kind=${RELEASE_FIXTURE_IMAGE_ID_KIND:-legacy}
+  if [[ -f $root/local-${selected#linux/}-kind ]]; then kind=$(cat "$root/local-${selected#linux/}-kind"); fi
+  case $kind in
+    legacy) id=$config; media='' ;;
+    manifest) id=$pin; media=application/vnd.oci.image.manifest.v1+json ;;
+    index) id=$index; media=application/vnd.oci.image.index.v1+json ;;
+    *) exit 1 ;;
+  esac
+  if [[ ${RELEASE_FIXTURE_DIFFERENT_LOCAL:-false} == true ]]; then id=sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee; fi
+  jq -cn --arg platform "$selected" --arg id "$id" --arg media "$media" --arg revision "$revision" \
+    '{Id:$id,Os:"linux",Architecture:($platform|split("/")[1]),Config:{User:"65532:65532",Env:["PATH=/usr/bin"],Labels:{"org.opencontainers.image.version":"1.2.3","org.opencontainers.image.revision":$revision,"io.multica.controller-abi":"2"}}} | if $media == "" then . else .Descriptor={digest:$id,mediaType:$media} end'
+}
+case ${1:-} in
+  info) printf '%s\n' "${platform#linux/}"; exit ;;
+  image) [[ $2 == inspect ]]; image "$(native_platform "$3")" | jq -cs .; exit ;;
+  run) [[ ${RELEASE_FIXTURE_FAIL_NATIVE:-false} != true ]]; exit ;;
+  pull) exit ;;
+  tag)
+    selected=$(native_platform "$2")
+    printf manifest >"$root/local-${selected#linux/}-kind"
+    exit ;;
+  push)
+    selected=$(native_platform "$2")
+    if [[ $selected == linux/amd64 ]]; then pin=$amd; else pin=$arm; fi
+    if [[ ${RELEASE_FIXTURE_IMAGE_ID_KIND:-legacy} == index ]]; then
+      if [[ $selected == linux/amd64 ]]; then index=sha256:1111111111111111111111111111111111111111111111111111111111111111; else index=sha256:2222222222222222222222222222222222222222222222222222222222222222; fi
+      jq -cn --arg index "$index" --arg digest "$pin" --arg arch "${selected#linux/}" '{digest:$index,mediaType:"application/vnd.oci.image.index.v1+json",manifests:[{digest:$digest,platform:{os:"linux",architecture:$arch}}]}' >"$(manifest_file "$2")"
+    else
+      jq -cn --arg digest "$pin" '{digest:$digest,mediaType:"application/vnd.oci.image.manifest.v1+json"}' >"$(manifest_file "$2")"
+    fi
+    if [[ ${RELEASE_FIXTURE_PUSH_DIFFERENT:-false} == true ]]; then
+      jq '.digest="sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"' "$(manifest_file "$2")" >"$root/different-push"
+      mv "$root/different-push" "$(manifest_file "$2")"
+    fi
+    exit ;;
+  buildx) [[ ${2:-} == imagetools ]] ;;
+  *) printf 'unexpected fixture docker command\n' >&2; exit 1 ;;
+esac
+if [[ $3 == inspect ]]; then
+  ref=$4
+  if [[ $(cat "$root/fault" 2>/dev/null || :) == registry-auth ]]; then printf 'registry access denied\n' >&2; exit 1; fi
+  if [[ ${5:-} == --raw ]]; then
+    selected=$(native_platform "$ref")
+    if [[ $selected == linux/amd64 ]]; then config=$config_amd; else config=$config_arm; fi
+    jq -cn --arg digest "$config" '{config:{digest:$digest}}'
+  elif [[ ${6:-} == '{{json .Image}}' ]]; then
+    image "$(native_platform "$ref")" | jq -c '{os:.Os,architecture:.Architecture,config:.Config}'
+  elif [[ ${6:-} == '{{json .Manifest}}' ]]; then
+    file=$(manifest_file "$ref")
+    if [[ ! -f $file ]]; then printf 'ERROR: %s: not found\n' "$ref" >&2; exit 1; fi
+    cat "$file"
+  else exit 1; fi
+  exit
+fi
+[[ $3 == create ]]
+shift 3
+tag=''
+sources=()
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --tag) tag=$2; shift 2 ;;
+    --annotation) shift 2 ;;
+    fixture/runtime@sha256:*) sources+=("$1"); shift ;;
+    *) exit 1 ;;
+  esac
+done
+file=$(manifest_file "$tag")
+if [[ $tag == fixture/runtime:1.2.3 ]]; then
+  [[ ${#sources[@]} == 2 && ${sources[0]} == "fixture/runtime@$amd" && ${sources[1]} == "fixture/runtime@$arm" && ! -f $file ]]
+  jq -cn --arg amd "$amd" --arg arm "$arm" --arg revision "$revision" \
+    '{digest:"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",annotations:{"org.opencontainers.image.revision":$revision,"org.opencontainers.image.version":"1.2.3"},manifests:[{digest:$amd,platform:{os:"linux",architecture:"amd64"}},{digest:$arm,platform:{os:"linux",architecture:"arm64"}}]}' >"$file"
+  if [[ $(cat "$root/fault" 2>/dev/null || :) == after-version ]]; then rm "$root/fault"; exit 1; fi
+elif [[ $tag == fixture/runtime:latest ]]; then
+  [[ ${#sources[@]} == 1 && ${sources[0]} == "fixture/runtime@$(jq -r .digest "$root/registry/version.json")" ]]
+  cp "$root/registry/version.json" "$file"
+else exit 1; fi
+STUB
+chmod +x "$fixture/bin/git" "$fixture/bin/gh" "$fixture/bin/docker"
+release() {
+  "$repository/.github/scripts/release.sh" --root "$fixture/checkout" --image fixture/runtime --revision "$revision" "$@" >"$fixture/result" 2>"$fixture/error"
+}
+require_success() {
+  if ! release "$@"; then cat "$fixture/error" >&2; printf 'fixture operation unexpectedly failed: %s\n' "$*" >&2; exit 1; fi
+}
+registry_state() {
+  local file
+  for file in "$fixture/registry/"*.json "$fixture/tag.json" "$fixture/release.json"; do
+    [[ -f $file ]] || continue
+    printf '%s\n' "${file#"$fixture/"}"
+    cat "$file"
+  done
+}
+require_rejected_without_writes() {
+  registry_state >"$fixture/before-state"
+  if release "$@"; then printf 'fixture unsafe operation succeeded: %s\n' "$*" >&2; exit 1; fi
+  registry_state >"$fixture/after-state"
+  cmp "$fixture/before-state" "$fixture/after-state"
+}
+
+require_success plan
+require_success record-native --platform linux/amd64 --records "$fixture/records"
+require_rejected_without_writes publish --records "$fixture/records"
+export RELEASE_FIXTURE_PLATFORM=linux/arm64 RELEASE_FIXTURE_FAIL_NATIVE=true
+require_rejected_without_writes record-native --platform linux/arm64 --records "$fixture/records"
+unset RELEASE_FIXTURE_FAIL_NATIVE
+require_success record-native --platform linux/arm64 --records "$fixture/records"
+require_success publish --records "$fixture/records"
+registry_state >"$fixture/committed-state"
+cp "$fixture/registry/latest.json" "$fixture/committed-latest"
+require_success publish --records "$fixture/records"
+registry_state >"$fixture/retried-state"
+cmp "$fixture/retried-state" "$fixture/committed-state"
+cmp "$fixture/registry/latest.json" "$fixture/committed-latest"
+require_success prepare-native --platform linux/arm64
+require_success record-native --platform linux/arm64 --records "$fixture/records"
+registry_state >"$fixture/retried-state"
+cmp "$fixture/retried-state" "$fixture/committed-state"
+export RELEASE_FIXTURE_DIFFERENT_LOCAL=true
+require_rejected_without_writes record-native --platform linux/arm64 --records "$fixture/records"
+unset RELEASE_FIXTURE_DIFFERENT_LOCAL
+
+jq -cn --arg sha "$other" '{object:{type:"commit",sha:$sha}}' >"$fixture/tag.json"
+require_rejected_without_writes plan
+jq -cn --arg sha "$revision" '{object:{type:"commit",sha:$sha}}' >"$fixture/tag.json"
+printf '%s\n' "$other" >"$fixture/main"
+require_rejected_without_writes publish --records "$fixture/records"
+cmp "$fixture/registry/latest.json" "$fixture/committed-latest"
+printf '%s\n' "$revision" >"$fixture/main"
+jq --arg revision "$other" '.annotations["org.opencontainers.image.version"]="9.0.0" | .annotations["org.opencontainers.image.revision"]=$revision | .digest="sha256:9999999999999999999999999999999999999999999999999999999999999999"' "$fixture/committed-latest" >"$fixture/registry/latest.json"
+cp "$fixture/registry/latest.json" "$fixture/newer-latest"
+require_rejected_without_writes publish --records "$fixture/records"
+cmp "$fixture/registry/latest.json" "$fixture/newer-latest"
+
+rm "$fixture/registry/version.json" "$fixture/registry/latest.json" "$fixture/release.json" "$fixture/tag.json"
+printf '%s\n' after-version >"$fixture/fault"
+if release publish --records "$fixture/records"; then printf 'lost version response unexpectedly succeeded\n' >&2; exit 1; fi
+[[ -f $fixture/registry/version.json && ! -f $fixture/registry/latest.json && ! -f $fixture/release.json ]]
+require_success publish --records "$fixture/records"
+cmp "$fixture/registry/latest.json" "$fixture/committed-latest"
+rm "$fixture/registry/latest.json" "$fixture/release.json" "$fixture/tag.json"
+printf '%s\n' after-release >"$fixture/fault"
+if release publish --records "$fixture/records"; then printf 'lost release response unexpectedly succeeded\n' >&2; exit 1; fi
+[[ -f $fixture/release.json && ! -f $fixture/registry/latest.json ]]
+require_success publish --records "$fixture/records"
+registry_state >"$fixture/recovered-state"
+cmp "$fixture/recovered-state" "$fixture/committed-state"
+printf '%s\n' registry-auth >"$fixture/fault"
+require_rejected_without_writes plan
+rm "$fixture/fault"
+jq '.manifests += [.manifests[0]]' "$fixture/registry/version.json" >"$fixture/duplicate-index"
+mv "$fixture/duplicate-index" "$fixture/registry/version.json"
+require_rejected_without_writes plan
+
+# Containerd image stores expose manifest/index Id values; classic stores expose
+# the config Id. Exercise immutable-byte preservation through all actual formats.
+export RELEASE_FIXTURE_PLATFORM=linux/amd64
+for storage in manifest index; do
+  export RELEASE_FIXTURE_IMAGE_ID_KIND=$storage
+  rm -f "$fixture/registry/amd64.json" "$fixture/local-amd64-kind"
+  require_success record-native --platform linux/amd64 --records "$fixture/records"
+  registry_state >"$fixture/recorded-state"
+  require_success record-native --platform linux/amd64 --records "$fixture/records"
+  registry_state >"$fixture/recorded-retry-state"
+  cmp "$fixture/recorded-state" "$fixture/recorded-retry-state"
+  export RELEASE_FIXTURE_DIFFERENT_LOCAL=true
+  require_rejected_without_writes record-native --platform linux/amd64 --records "$fixture/records"
+  unset RELEASE_FIXTURE_DIFFERENT_LOCAL
+  require_success prepare-native --platform linux/amd64
+  require_success record-native --platform linux/amd64 --records "$fixture/records"
+  registry_state >"$fixture/pulled-retry-state"
+  cmp "$fixture/recorded-state" "$fixture/pulled-retry-state"
+  rm -f "$fixture/registry/amd64.json" "$fixture/local-amd64-kind"
+  cp "$fixture/records/amd64.json" "$fixture/retained-proof"
+  export RELEASE_FIXTURE_PUSH_DIFFERENT=true
+  if release record-native --platform linux/amd64 --records "$fixture/records"; then
+    printf 'different bytes after push acquired native verification authority\n' >&2
+    exit 1
+  fi
+  unset RELEASE_FIXTURE_PUSH_DIFFERENT
+  cmp "$fixture/records/amd64.json" "$fixture/retained-proof"
+done
+printf '%s\n' 'PASS: immutable release guards, failed/partial native results, lost-response retries, monotonic latest, and Docker config/manifest/index image identities.'

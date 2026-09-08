@@ -161,7 +161,7 @@ func (f *runtimeBackend) control(w http.ResponseWriter, r *http.Request) {
 			checkpoint := report
 			record.Checkpoint = &checkpoint
 		}
-		f.state.LastEnvironment = report.Environment.EnvironmentID
+		f.state.LastEnvironment = report.RuntimeRef.ImageBuildID
 		if len(report.Request) > 0 {
 			if err := os.WriteFile(filepath.Join(f.evidence, "request.json"), report.Request, 0600); err != nil {
 				f.fail(err)

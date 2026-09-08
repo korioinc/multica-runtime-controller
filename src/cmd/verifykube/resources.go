@@ -107,7 +107,7 @@ func (f *fixture) attempt() (runtimekube.Reference, wire.Request, error) {
 		return runtimekube.Reference{}, request, err
 	}
 	storage := filepath.Base(request.WorkerSubPath)
-	ref := runtimekube.Reference{Namespace: f.selection.Namespace, Owner: f.selection.Controller, TaskID: request.TaskID, StorageID: storage, AttemptID: request.AttemptID, PodName: "task-worker-" + storage, SecretName: "task-request-" + request.AttemptID, RequestDigest: wire.Digest(raw), CoreImage: f.selection.Worker.CoreImage, EnvironmentImage: f.selection.Worker.EnvironmentImage, EnvironmentID: f.selection.Worker.EnvironmentID, FixedNode: f.selection.Worker.SingleNodeName}
+	ref := runtimekube.Reference{Namespace: f.selection.Namespace, Owner: f.selection.Controller, TaskID: request.TaskID, StorageID: storage, AttemptID: request.AttemptID, PodName: "task-worker-" + storage, SecretName: "task-request-" + request.AttemptID, RequestDigest: wire.Digest(raw), RuntimeRef: request.RuntimeRef, Snapshots: request.Snapshots, FixedNode: f.selection.Worker.SingleNodeName}
 	if _, err = f.api.CoreV1().Pods(ref.Namespace).Get(f.ctx, ref.PodName, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
 		if err != nil {
 			return ref, request, err
@@ -198,7 +198,7 @@ func (f *fixture) responseLoss() error {
 		return errors.New("foreign owner adopted committed Pod")
 	}
 	changed = ref
-	changed.EnvironmentImage = "invalid@sha256:" + strings.Repeat("0", 64)
+	changed.RuntimeRef.Image = "invalid@sha256:" + strings.Repeat("0", 64)
 	if _, err = f.client.ResolvePod(f.ctx, changed); err == nil {
 		return errors.New("wrong environment adopted committed Pod")
 	}
@@ -311,7 +311,7 @@ func (f *fixture) secretReplacement() error {
 	return f.deleteSecret(found.Name, found.UID)
 }
 func (f *fixture) simplePod(prefix string) *corev1.Pod {
-	return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{GenerateName: prefix, Namespace: f.selection.Namespace, Labels: map[string]string{"multica.io/verification": "resource-scheduling"}}, Spec: corev1.PodSpec{RestartPolicy: corev1.RestartPolicyNever, AutomountServiceAccountToken: ptr.To(false), TerminationGracePeriodSeconds: ptr.To[int64](0), Containers: []corev1.Container{{Name: "probe", Image: f.selection.Worker.EnvironmentImage, ImagePullPolicy: f.selection.Worker.EnvironmentPullPolicy, Command: []string{"/bin/bash", "-ec", "true"}}}}}
+	return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{GenerateName: prefix, Namespace: f.selection.Namespace, Labels: map[string]string{"multica.io/verification": "resource-scheduling"}}, Spec: corev1.PodSpec{RestartPolicy: corev1.RestartPolicyNever, AutomountServiceAccountToken: ptr.To(false), TerminationGracePeriodSeconds: ptr.To[int64](0), Containers: []corev1.Container{{Name: "probe", Image: f.selection.RuntimeRef.Image, ImagePullPolicy: f.selection.Worker.ImagePullPolicy, Command: []string{"/bin/bash", "-ec", "true"}}}}}
 }
 func (f *fixture) referencedSecret() error {
 	ref, request, err := f.attempt()

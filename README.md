@@ -1,85 +1,93 @@
 # Multica Runtime Controller
 
-Run the unmodified, checksum-verified Multica CLI in your Kubernetes cluster while choosing your own development environment. The runtime observes official task claims and launches each approved provider execution in a separate Pod. The official daemon retains scheduling, prompt construction, checkout policy and completion reporting.
+A Kubernetes controller base for custom Multica runtime images. The base contains the static controller, provider shims and the Go SDK. It **does not contain the official Multica CLI or AI providers**. Install those and your development tools at image build time using [korioinc/multica-runtime](https://github.com/korioinc/multica-runtime).
 
-The runtime core and development environment are separate images. Changing PHP, Rust, Go, provider installations or native libraries does not require rebuilding the core.
+The official daemon owns scheduling, prompts, checkout policy and completion reporting. This controller observes successful claims and runs authorized task providers in isolated Pods. Controller and workers execute the same completed image.
 
-## Install
+## Images and installation
 
-The chart is maintained independently in [korioinc/helm](https://github.com/korioinc/helm). Its README contains the complete values and bootstrap examples.
+Use the independently maintained [Helm chart](https://github.com/korioinc/helm/tree/main/charts/multica-runtime-controller). Its `image` accepts a completed custom image and defaults to `ghcr.io/korioinc/multica-runtime:latest`, with `imagePullPolicy: Always`. The base image alone cannot start a controller.
 
-Supply a **new core artifact digest**, a controller token Secret, the Multica backend URL and suitable storage. The chart intentionally has no old runtime image as a fallback. A release of this rewrite must provide the core digest; an old combined runtime image cannot execute this chart.
-
-```sh
-helm repo add korioinc https://korioinc.github.io/helm
-helm upgrade --install multica-runtime korioinc/multica-runtime-controller \
-  --namespace multica --create-namespace \
-  --values operator-values.yaml \
-  --set-string runtime.image.reference="$CORE_IMAGE_DIGEST"
+```yaml
+image: ghcr.io/korioinc/multica-runtime:latest
+imagePullPolicy: Always
+platform: linux/arm64
+multica:
+  baseURL: https://multica.example.com
+  controllerTokenSecret:
+    name: multica-runtime-controller-token
+    key: token
+workspace:
+  storage:
+    existingClaim: multica-workspace
+    accessMode: ReadWriteMany
 ```
 
-Both `runtime.image.reference` and `environment.image.reference` require an OCI `@sha256:` reference. Chart 0.3.0 leaves the environment image, providers and bootstrap script unconfigured. Supply these explicitly before installation; missing inputs fail chart rendering without installing languages or providers. `linux/amd64` and `linux/arm64` are supported. Select the actual platform in `environment.platform`.
+The chart has one controller replica and a `Recreate` strategy. `ReadWriteOnce` requires `scheduling.singleNodeName`; `ReadWriteMany` permits suitable multi-node storage. Workers receive only their task subPath and selected native session file, without the controller registry or Kubernetes token. There is no Tools PVC or startup installer.
 
-This rewrite uses a new workspace format and a separate tools PVC. Install with fresh PVCs, or reconnect PVCs already initialized by the same installation of this rewrite. There is no legacy reader, migration or fallback to the previous runtime. The stable chart-owned daemon identity must match the stored installation owner.
+At startup, the controller compares its installed descriptor with the init receipt, then validates its actual Pod UID, platform and init/main `imageID` values through Kubernetes. Only a pullable repository digest is accepted. That digest stays in every worker and attempt, including when `latest` moves. The controller never resolves the current registry tag as a fallback. Changing a tag does not restart an existing Pod.
 
-The controller has one replica and uses `Recreate`. Workspace and tools must use different PVCs. `ReadWriteMany` supports multiple nodes with a suitable driver. If either PVC uses `ReadWriteOnce`, set `scheduling.singleNodeName` to the actual Node name. Both controller and workers retain required affinity to that name, including after controller recreation. A missing fixed Node leaves them Pending. `ReadWriteOncePod` is unsupported.
+Both `linux/amd64` and `linux/arm64` are build targets. Local development verification runs on the developer host's single native platform. The GitHub Actions release matrix builds and verifies both platform images before publication; cross-build or QEMU output remains distinct from native execution evidence.
 
-## Choose an environment
+## Installed contracts
 
-The chart supports three paths through the same preparation contract:
-
-- **Explicit installation example:** opt in to `bootstrap.source: bundled` to use the chart's `files/environments/node-providers.sh` example. It installs pinned Node and `pi`, `codex`, `copilot`, `antigravity`; the Antigravity executable alias is `agy`. This example is never selected by the chart defaults.
-- **Operator script:** choose `inline`, or a ConfigMap name/key with an expected SHA-256. The chart includes complete Go/Rust and other installation examples.
-- **Prepared image:** select an existing compatible Linux/glibc image, or build native OS packages into your own image, then supply a bootstrap that registers the installed executables and writes the environment manifest. No package installation is required in that bootstrap when the image already contains the selected tools.
-
-The same environment image and installed generation are used by installer, controller and worker. Core init containers inject the identical core artifact into each Pod. Main containers run explicit runtime commands and do not depend on the image ENTRYPOINT.
-
-Bootstrap runs as UID/GID 65532. It can write its tools prefix and temporary directory. It does not receive workspace data, operator runtime credentials or a Kubernetes API token. Installers must install under the provided prefix; changing the init container's root filesystem does not change another container.
-
-The bootstrap inputs are:
-
-| Input | Meaning |
+| Path | Owner and purpose |
 | --- | --- |
-| `ENV_ROOT` | `/opt/multica/environment`, the final installation prefix |
-| `ENV_PLATFORM` | Selected Linux platform |
-| `ENV_REVISION` | Explicit environment revision |
-| `ENV_INPUTS_FILE` | Snapshot of non-secret JSON inputs |
-| `ENV_MANIFEST_FILE` | Manifest file the script must create |
-| `ENV_PROVIDERS` | JSON array of enabled builtin provider IDs |
+| `/opt/multica/controller/runtime` | Controller executable |
+| `/opt/multica/controller/shims` | Explicit daemon provider entrypoints |
+| `/opt/multica/controller/build.json` | Schema 2 controller build and ABI, independent of the official CLI |
+| `/usr/local/go` | Base-owned Go SDK |
+| `/opt/multica/runtime/image.json` | Completed-image descriptor, installed provider paths and runtime defaults |
+| `/opt/multica/runtime/verification.json` | Successful adapter suite bound to descriptor, controller and official CLI bytes |
 
-`environment.bootstrap.secretEnvFrom` belongs only to installation. `operator.envFrom`, `operator.configVolumes` and `operator.configMounts` supply native runtime configuration separately. Operator environment sources preserve their declared prefix. Explicit operator environment values support literals and `valueFrom`, without Kubernetes `$(NAME)` interpolation.
+The image publisher generates a new platform-specific `imageBuildID` for each build, records it in the descriptor and OCI label, and verifies the prepared image before copying its verification record into the final stage. Publication retry reuses the verified artifact. Reusing an old descriptor or report after changing the installed image is unsupported.
 
-With chart 0.3.0 and core 0.3.39 or later, `configMounts.mountPath` is the destination of a startup copy into private HOME. ConfigMap, Secret and projected inputs are mounted read-only only in the layout init container; controller and task containers receive ordinary writable files. Whole `.codex` and `.pi/agent` directories are supported. The runtime checks each copied entry to protect daemon identity, assigned Codex skills and Pi sessions. Inputs cannot replace those protected subtrees.
+The runtime repository owns official CLI/tool versions, checksums, dependency locks, extensions and installation. This repository owns its Go version in `build/runtime-versions.env`. The initial official adapter baseline is Multica `0.4.40`; another pin must pass the actual matching-source adapter suite. Removing a version-string comparison is not evidence of compatibility.
 
-Operator copies run before `homeSeed`, so operator settings win on a new Pod. Each completed file is published atomically without overwriting an existing file. Init retries preserve completed copies and native changes; the complete tree is not a transaction. A new Pod receives fresh input files, and changes made within an old Pod's HOME are not persisted. Use the paired chart and core release when upgrading from direct read-only config mounts.
+```sh
+runtime version
+runtime image verify
+```
 
-The manifest declares schema version 1, provider entrypoints/versions, relative `binDirs`, optional environment variables, a non-secret `homeSeed`, and optional argv-based checks. Entrypoints must resolve to executable regular files within the tools prefix. A wrapper can invoke a program installed in the environment image.
+`version` validates the base without requiring an official CLI. `image verify` validates the completed descriptor, actual files and matching verification record; neither installs or downloads tools. Installed provider paths must resolve to immutable executable regular files and cannot resolve to controller shims or private writable areas.
 
-Manifest variables support `${ENV_ROOT}`, `${HOME}`, `${TMPDIR}` and `${WORKSPACE}`. They are expanded for the actual consumer; task workspace paths do not inherit the controller's expansion. Precedence is image defaults, manifest, operator configuration, then official task overrides. Runtime identity, credentials and executable selection controls remain reserved. A credential-free init snapshots image defaults before installer credentials are introduced.
+## Operator configuration and private HOME
 
-Provider directories are not added indiscriminately to controller PATH. Every builtin descriptor in the pinned Multica version receives an absolute executable override. Enabled providers use core hardlink shims; disabled providers use nonexistent paths in a read-only core namespace. Backend custom runtime profiles are unsupported and blocked before command discovery, including refresh. Change the enabled environment by starting a new controller/daemon process.
+Helm accepts ConfigMap sources through `operator.configVolumes` and `operator.configMounts`. Terraform retains ownership of original Codex/Pi files. File sources remain ConfigMaps. Environment-variable Secrets, controller tokens and task request Secrets are separate contracts.
 
-## Preparation and persistence
+The `home layout` init runs as UID/GID 65532 and creates private `agents`, `tmp` and `run` children in one emptyDir. Main containers see only those children at `/home/multica/agents`, `/tmp` and `/run/multica`, with private access modes and protected ancestors.
 
-Environment identity is derived from the core image, environment image, platform, exact script hash, revision, enabled providers and non-secret inputs. Secret contents are not part of that identity. Change the revision when you want to prepare new tools.
+Before copying into HOME, init captures all selected projected files and mappings into one committed bundle. A retry reuses that bundle even if the source ConfigMap changes or disappears. Individual HOME files are published without overwriting existing files; image seeds fill missing destinations. Partial copies can be retried without mixing source generations.
 
-Preparation uses a generation lock. The script and all descendants, provider probes and generic checks must finish before the runtime publishes `READY`. Timeouts terminate the process tree. Failed attempts can prepare the incomplete generation again without moving its root. A completed generation is immutable and must pass content, manifest, core and provider fingerprint checks before reuse.
+The controller creates immutable ConfigMap snapshots from the bundle. Each snapshot belongs to the controller Pod and is shared by its workers. The controller checks UID, owner, immutable state and payload before task creation and execution. Worker init checks mounted payload and mapping. It never falls back to a mutable source. Task cleanup does not delete shared snapshots; controller owner GC governs their lifetime.
 
-The installation and consumption path is always `/opt/multica/environment`; generation IDs only appear in PVC subPaths. Python venv shebangs and other absolute-prefix installations therefore retain their paths. The core and tools are mounted read-only for consumers. Each task receives private writable HOME/tmp and only its assigned worker storage. Home seeds never receive changes back from a task and cannot contain credentials, sessions, rollouts or logs.
+Edits and authentication refreshes in private HOME do not modify source ConfigMaps, image seeds, other task HOMEs or future workers. Controller native config, Pi sessions and assigned Codex skills are protected from overrides. Content-identical snapshots retain logical session compatibility even when Kubernetes object names or UIDs change.
 
-Observed successful HTTP or WebSocket claims establish task credentials and repository scope. A shim invocation alone grants no authority. Unobserved tasks, credential/scope changes and explicit local-directory execution are rejected before resource creation. Requests are stored in immutable Secrets; attempt journals contain resource identities and digests rather than prompts, tokens or environment values.
+## Task authority and recovery
 
-Official isolated checkouts are transferred as standalone repository archives. Publication cannot replace an existing user directory. Same-scope continuation/retry preserves edits and branches; unrelated scopes cannot reuse that storage. A Pi session also requires the same environment reference. After an environment change, work remains and the official daemon reports a fresh session; historical session files remain intact. Codex receives its prepared task skill directory in its private HOME, without sharing global rollouts.
+Normal selection, request, registry and attempt records use schema 2. A task ID alone grants no execution authority. The controller requires an observed claim, matching credentials and repository scope, canonical managed workspace paths and exact resource identities. Explicit `local_directory` execution is rejected.
 
-Execution preserves provider streams and exit status. Cancellation signals the process group, allows the configured grace period and cleans remaining children. Transport and cleanup failures remain distinct from an observed provider exit. The controller records durable create intent and resolves uncertain creation by exact name, payload and owner. Execution and deletion are fenced by Pod/Secret UID. Recovery does not delete user work or adopt same-name replacements.
+Same-scope continuation preserves work, branches and Git hooks. Pi sessions additionally require compatible image, platform, controller, CLI, providers and configuration contents. Changed inputs create a new session while retaining authorized work. An attempt ID or snapshot object UID alone does not split a session.
 
-There is no automatic tools-generation GC. Worker storage retirement requires the official preparation roots to be gone, complete Pod/attempt inventory, an available storage lease and the required retention interval. POSIX locking, fsync, executable permissions and appropriate PVC access semantics are storage prerequisites.
+Provider streams and exit codes are preserved. Cancellation signals the process group and allows its configured grace period. Durable create intent lets recovery reconcile lost API responses by name, owner, payload and UID. Cleanup refuses replaced resources and preserves user work. An expired controller's snapshot may already be garbage-collected; teardown can still resolve its journaled resources without granting new execution authority.
 
-## Diagnostics and local verification
+## Explicit workspace migration
 
-Preparation progress appears in init-container logs. Main readiness follows environment validation and the runtime gateway. Failure categories distinguish configuration, core compatibility, preparation/integrity, provider startup, authorization, transport and pending cleanup. Provider protocol streams do not contain runtime diagnostic records for ordinary provider exit codes.
+Normal startup rejects schema 1 data; it never initializes over it or converts it automatically. Use the offline migration command after separately establishing that old writers and task resources are quiescent. It proves filesystem ownership, existing lock availability, empty attempts and source bytes; it cannot prove remote cluster quiescence.
 
-Core artifacts contain only the static runtime, the original Multica CLI **0.4.40**, and hashed contract metadata. The Go compiler exists only in the build stage. Core compiler and CLI pins are in `build/runtime-versions.env`; language/provider installation and versions belong to the operator's environment. The chart's opt-in examples contain their own version selections.
+```sh
+runtime workspace migrate --root /workspace --owner-id "$OWNER_ID" --dry-run
+runtime workspace migrate --root /workspace --owner-id "$OWNER_ID" \
+  --expected-source-sha256 "$SOURCE_SHA256" --commit
+```
+
+Dry-run writes no files or locks. Commit rechecks source bytes under existing locks, durably preserves the original at `.multica-runtime/state/migrations/v1-to-v2/<source-digest>/registry.v1.json`, and atomically replaces the registry. Old claims become unobserved and Pi sessions archived. Work, session files, ownership, permanent denial and lock inodes are preserved. Fresh claims establish new authority.
+
+Unfinished journals or unknown attempt entries require their existing cleanup first. A valid schema 2 registry is never overwritten from backup. There is no automatic rollback after new schema 2 writes. The legacy reader lives only in the migration package and remains necessary while schema 1 workspaces are supported migration sources.
+
+## Local development and verification
+
+All script orchestration is shell (`.sh`). Source-owned Go verifier commands implement protocol and filesystem fixtures; scripts do not delegate orchestration to Python or Go wrappers.
 
 ```sh
 make build
@@ -92,14 +100,25 @@ make verify-core
 make verify
 ```
 
-`make verify` validates this repository independently. Its `verify-core` step requires Docker, Go and Make, builds the current core, and exercises the actual official CLI in a disposable container. It does not read or download a Helm repository. `verify-local` is an alias for `verify-core`.
+`verify-core` builds this checkout's base and checks native execution, Go compilation and official CLI absence. It needs local Docker, Go, Make, Bash and jq, without a chart or completed runtime image.
 
-Release integration is a separate command with an explicit chart target:
+Build a completed runtime with an explicit local base override using the runtime repository's `scripts/build-image.sh`. Then run integration with both inputs:
 
 ```sh
-./scripts/verify-local.sh --chart /absolute/path/to/the/chart
+scripts/verify-local.sh \
+  --chart ../helm/charts/multica-runtime-controller \
+  --runtime-image multica-runtime:local \
+  --keep-on-failure
 ```
 
-This integration command additionally requires Helm and runs a disposable Docker/K3s cluster, local backend and local Git repository. It never reads an ambient kubeconfig. Evidence is saved under a printed temporary directory. Add `--keep-on-failure` to retain only that fixture's resources for diagnosis. Chart linting, schemas and release automation belong to the Helm repository's own checks.
+The harness checks the image against this checkout, builds disposable provider fixtures, and runs an owned local registry, backend, Git origin and K3s node. It exercises actual task Pods, image/config binding, private volumes, checkout, native session reuse, authorization, process interruption, lost creation responses, UID replacement and transport/cleanup failures. Model generation and shared services are excluded.
 
-The local fixtures exercise real official binaries, preparation, Pods, Secrets, exec, checkout, continuation and recovery. Offline provider/version fixtures do not prove live provider authentication or model-service behavior. Local storage checks establish the tested Docker/K3s behavior; they do not certify every RWX driver or production failover configuration.
+Integration additionally requires Helm and the native ORAS CLI. ORAS transfers verified OCI bytes from the host to the owned loopback registry with an empty authentication config, without changing Docker daemon settings. Fixture binaries use the Go SDK version recorded in the inherited controller build contract.
+
+Evidence and owned handles stay in the printed temporary directory. `--resume DIRECTORY` with the same explicit chart and image resumes only a retained, still-running owned fixture after source and image identity checks. It never uses ambient kubeconfig. Fixtures do not certify every storage driver.
+
+## Release code
+
+The main-push workflow builds the controller-only base and GitHub Release from independent `VERSION` and source revision. Both native platforms must pass before a version index or `latest` is promoted. Existing bytes are preserved, retry uses verified candidates, and stale revisions cannot move `latest` backward. The old CLI-version updater is removed.
+
+`.github/scripts/verify-release.sh` uses local persistent GitHub/registry stubs to exercise failure, duplicate revision, partial results, immutable retries and latest protection. Local verification does not publish images, create releases, merge branches or apply a shared cluster.

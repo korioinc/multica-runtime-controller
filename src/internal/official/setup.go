@@ -14,8 +14,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/korioinc/multica-runtime-controller/internal/core"
-	"github.com/korioinc/multica-runtime-controller/internal/environment"
+	"github.com/korioinc/multica-runtime-controller/internal/runtimeimage"
 )
 
 // These descriptors belong to the pinned v0.4.40 adapter, independently of
@@ -23,20 +22,20 @@ import (
 var builtinIDs = strings.Fields("claude codex opencode codearts deveco openclaw hermes pi omp cursor copilot kimi reasonix dsh kiro codebuddy antigravity qoder qoderclicn traecli grok qwen qwenpaw dim mcode zeroclaw")
 
 type DaemonOptions struct {
-	CoreRoot, Home, TokenFile, DaemonID, Name, BackendURL, ProxyURL string
-	Capacity                                                        int
-	PollInterval, HeartbeatInterval                                 time.Duration
-	Providers                                                       []string
-	Environment                                                     environment.Ref
-	Env                                                             []string
-	Stdin                                                           io.Reader
-	Stdout, Stderr                                                  io.Writer
+	CoreRoot, ImageRoot, Home, TokenFile, DaemonID, Name, BackendURL, ProxyURL string
+	Capacity                                                                   int
+	PollInterval, HeartbeatInterval                                            time.Duration
+	Providers                                                                  []string
+	RuntimeRef                                                                 runtimeimage.Ref
+	Env                                                                        []string
+	Stdin                                                                      io.Reader
+	Stdout, Stderr                                                             io.Writer
 }
 
 func providerSet(providers []string) (map[string]bool, error) {
 	enabled := map[string]bool{}
 	for _, id := range providers {
-		if !environment.SupportedProvider(id) || enabled[id] {
+		if !runtimeimage.SupportedProvider(id) || enabled[id] {
 			return nil, errors.New("enabled providers must be unique supported builtin IDs")
 		}
 		enabled[id] = true
@@ -51,29 +50,27 @@ func providerSet(providers []string) (map[string]bool, error) {
 // configuration. The resulting argv always disables binary update and reload.
 func Setup(options DaemonOptions) (DaemonProcess, error) {
 	var process DaemonProcess
-	if err := options.Environment.Validate(); err != nil {
+	if err := options.RuntimeRef.Validate(); err != nil {
 		return process, err
 	}
-	contract, err := core.Check(options.CoreRoot, options.Environment.Platform)
+	if options.ImageRoot == "" {
+		options.ImageRoot = runtimeimage.Root
+	}
+	descriptor, digest, err := runtimeimage.ReadInstalled(options.ImageRoot, options.CoreRoot, options.RuntimeRef.Platform)
 	if err != nil {
 		return process, err
 	}
-	if contract.OfficialVersion != "0.4.40" {
-		return process, errors.New("official adapter requires release 0.4.40")
-	}
-	actual, _ := json.Marshal(contract)
-	expected, _ := json.Marshal(options.Environment.Core)
-	if string(actual) != string(expected) {
-		return process, errors.New("official process core differs from its selected environment")
+	if err := runtimeimage.Match(descriptor, digest, options.RuntimeRef); err != nil {
+		return process, err
 	}
 	enabled, err := providerSet(options.Providers)
 	if err != nil {
 		return process, err
 	}
-	if len(enabled) != len(options.Environment.Providers) {
+	if len(enabled) != len(options.RuntimeRef.Providers) {
 		return process, errors.New("daemon providers differ from the verified environment")
 	}
-	for id := range options.Environment.Providers {
+	for id := range options.RuntimeRef.Providers {
 		if !enabled[id] {
 			return process, errors.New("daemon providers differ from the verified environment")
 		}
@@ -157,7 +154,7 @@ func Setup(options DaemonOptions) (DaemonProcess, error) {
 	for _, id := range builtinIDs {
 		path := filepath.Join(options.CoreRoot, "disabled", id)
 		if enabled[id] {
-			path = filepath.Join(options.CoreRoot, "shims", environment.Alias(id))
+			path = descriptor.Controller.ShimPaths[runtimeimage.Alias(id)]
 		}
 		env["MULTICA_"+strings.ToUpper(id)+"_PATH"] = path
 	}
@@ -167,7 +164,7 @@ func Setup(options DaemonOptions) (DaemonProcess, error) {
 			env["MULTICA_GC_COMPLETED_TASK_TTL"] = "336h"
 		}
 	}
-	process.Path = filepath.Join(options.CoreRoot, "multica")
+	process.Path = descriptor.Daemon.Path
 	process.Args = []string{"daemon", "start", "--foreground", "--no-auto-update", "--no-auto-reload", "--daemon-id", options.DaemonID, "--runtime-name", options.Name, "--max-concurrent-tasks", strconv.Itoa(options.Capacity), "--poll-interval", options.PollInterval.String(), "--heartbeat-interval", options.HeartbeatInterval.String()}
 	for _, key := range slices.Sorted(maps.Keys(env)) {
 		process.Env = append(process.Env, key+"="+env[key])

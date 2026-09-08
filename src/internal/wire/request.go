@@ -5,28 +5,29 @@ package wire
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"path/filepath"
 	"slices"
 	"strings"
 
 	"github.com/google/uuid"
-	"github.com/korioinc/multica-runtime-controller/internal/environment"
+	"github.com/korioinc/multica-runtime-controller/internal/configuration"
+	"github.com/korioinc/multica-runtime-controller/internal/core"
+	"github.com/korioinc/multica-runtime-controller/internal/runtimeimage"
 )
 
 const (
-	CoreRoot         = "/opt/multica/core"
-	EnvironmentRoot  = "/opt/multica/environment"
+	ControllerRoot   = core.Root
+	PrivateRoot      = "/opt/multica/private"
 	WorkspaceRoot    = "/workspace"
-	Home             = "/home/multica/agents"
+	Home             = configuration.Home
 	PiSessionsRoot   = Home + "/.multica/pi-sessions"
 	ControlRoot      = "/run/multica"
-	RequestPath      = ControlRoot + "/request/request.json"
+	RequestPath      = "/etc/multica/task/request.json"
 	RequestKey       = "request.json"
+	MaxRequestBytes  = 1 << 20
 	SelectionPath    = ControlRoot + "/selection.json"
-	InputPath        = "/etc/multica/environment/input.json"
-	WorkerConfigPath = "/etc/multica/environment/worker.json"
+	WorkerConfigPath = "/etc/multica/runtime/worker.json"
 	SecretHeader     = "X-Multica-Request-Secret"
 	TaskHeader       = "X-Multica-Task-ID"
 	TokenHeader      = "X-Multica-Task-Token"
@@ -36,21 +37,21 @@ const (
 )
 
 type Request struct {
-	SchemaVersion           int               `json:"schemaVersion"`
-	TaskID                  string            `json:"taskID"`
-	Provider                string            `json:"provider"`
-	Args                    []string          `json:"args"`
-	Env                     []string          `json:"env"`
-	WorkDir                 string            `json:"workDir"`
-	WorkerSubPath           string            `json:"workerSubPath"`
-	RepositoryURLs          []string          `json:"repositoryURLs"`
-	Environment             environment.Ref   `json:"environment"`
-	EnvironmentInput        environment.Input `json:"environmentInput"`
-	AttemptID               string            `json:"attemptID"`
-	OwnerID                 string            `json:"ownerID"`
-	BrokerPort              int               `json:"brokerPort"`
-	BrokerToken             string            `json:"brokerToken"`
-	TerminationGraceSeconds int               `json:"terminationGraceSeconds"`
+	SchemaVersion           int                         `json:"schemaVersion"`
+	TaskID                  string                      `json:"taskID"`
+	Provider                string                      `json:"provider"`
+	Args                    []string                    `json:"args"`
+	Env                     []string                    `json:"env"`
+	WorkDir                 string                      `json:"workDir"`
+	WorkerSubPath           string                      `json:"workerSubPath"`
+	RepositoryURLs          []string                    `json:"repositoryURLs"`
+	RuntimeRef              runtimeimage.Ref            `json:"runtimeRef"`
+	Snapshots               []configuration.SnapshotRef `json:"snapshots"`
+	AttemptID               string                      `json:"attemptID"`
+	OwnerID                 string                      `json:"ownerID"`
+	BrokerPort              int                         `json:"brokerPort"`
+	BrokerToken             string                      `json:"brokerToken"`
+	TerminationGraceSeconds int                         `json:"terminationGraceSeconds"`
 }
 
 // Plan and Result preserve the official checkout protocol. The assigned URL is
@@ -191,11 +192,26 @@ func PiSession(request Request) (string, error) {
 }
 func Decode(raw []byte) (Request, error) {
 	var request Request
-	if err := json.Unmarshal(raw, &request); err != nil {
+	if len(raw) > MaxRequestBytes {
+		return request, errors.New("task request exceeds Secret payload limit")
+	}
+	if err := runtimeimage.Decode(raw, &request); err != nil {
 		return request, errors.New("invalid task request")
 	}
-	if request.SchemaVersion != 1 || !UUID(request.TaskID) || !UUID(request.AttemptID) || !UUID(request.OwnerID) || Alias(request.Provider) == "" || request.TaskID != Value(request.Env, "MULTICA_TASK_ID") || request.BrokerPort < 1 || request.BrokerPort > 65535 || len(request.BrokerToken) < 32 || request.TerminationGraceSeconds < 1 {
+	if request.SchemaVersion != 2 || !UUID(request.TaskID) || !UUID(request.AttemptID) || !UUID(request.OwnerID) || Alias(request.Provider) == "" || request.TaskID != Value(request.Env, "MULTICA_TASK_ID") || request.BrokerPort < 1 || request.BrokerPort > 65535 || len(request.BrokerToken) < 32 || request.TerminationGraceSeconds < 1 {
 		return request, errors.New("invalid task authority or request contract")
+	}
+	if err := request.RuntimeRef.Validate(); err != nil {
+		return request, err
+	}
+	if _, enabled := request.RuntimeRef.Providers[request.Provider]; !enabled {
+		return request, errors.New("task provider is not enabled in the selected runtime")
+	}
+	if err := configuration.ValidateRefs(request.Snapshots); err != nil {
+		return request, err
+	}
+	if configuration.DigestRefs(request.Snapshots) != request.RuntimeRef.ConfigurationDigest {
+		return request, errors.New("task snapshot reference differs from runtime configuration")
 	}
 	if _, err := StorageRoot(request); err != nil {
 		return request, err

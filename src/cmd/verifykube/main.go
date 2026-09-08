@@ -40,14 +40,16 @@ type evidence struct {
 	Error         string    `json:"error,omitempty"`
 }
 type fixture struct {
-	ctx       context.Context
-	api       *clientset.Clientset
-	config    *rest.Config
-	client    *runtimekube.Client
-	selection execution.Selection
-	request   wire.Request
-	evidence  evidence
-	cleanup   []func()
+	ctx           context.Context
+	api           *clientset.Clientset
+	config        *rest.Config
+	client        *runtimekube.Client
+	selection     execution.Selection
+	request       wire.Request
+	indexImage    string
+	indexManifest string
+	evidence      evidence
+	cleanup       []func()
 }
 
 func main() {
@@ -57,13 +59,15 @@ func main() {
 	requestPath := flag.String("request", "", "dummy-credential request fixture")
 	evidencePath := flag.String("evidence", "", "JSON verification result")
 	selectedCase := flag.String("case", "", "run one bounded case; empty runs the complete suite")
+	indexImage := flag.String("index-image", "", "actual published local OCI index for the installed build")
+	indexManifest := flag.String("index-manifest", "", "raw registry OCI index bytes")
 	flag.Parse()
-	if err := run(*kubeconfig, *namespace, *selectionPath, *requestPath, *evidencePath, *selectedCase); err != nil {
+	if err := run(*kubeconfig, *namespace, *selectionPath, *requestPath, *evidencePath, *selectedCase, *indexImage, *indexManifest); err != nil {
 		fmt.Fprintln(os.Stderr, "verifykube:", err)
 		os.Exit(1)
 	}
 }
-func run(kubeconfig, namespace, selectionPath, requestPath, evidencePath, selectedCase string) (result error) {
+func run(kubeconfig, namespace, selectionPath, requestPath, evidencePath, selectedCase, indexImage, indexManifest string) (result error) {
 	if os.Getenv("LOCALVERIFY_DISPOSABLE_CLUSTER") != "true" || kubeconfig != "/etc/rancher/k3s/k3s.yaml" || namespace != "runtime-verify" {
 		return errors.New("explicit disposable K3s guard, local kubeconfig and runtime-verify namespace required")
 	}
@@ -110,12 +114,23 @@ func run(kubeconfig, namespace, selectionPath, requestPath, evidencePath, select
 	if err != nil {
 		return err
 	}
-	if request.OwnerID != selection.OwnerID || !request.Environment.Equal(selection.Environment) {
+	if request.OwnerID != selection.OwnerID || !request.RuntimeRef.Equal(selection.RuntimeRef) {
 		return errors.New("request does not belong to selected fixture environment")
 	}
+	// A new controller owns new snapshot objects even when the stable runtime
+	// contents remain compatible. Match Runner's new-attempt selection behavior.
+	request.Snapshots = selection.Snapshots
 	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Minute)
 	defer cancel()
 	f := &fixture{ctx: ctx, api: api, config: cfg, client: &runtimekube.Client{API: api, Transport: cfg, Namespace: namespace}, selection: selection, request: request, evidence: evidence{SchemaVersion: 1, Started: time.Now().UTC(), Namespace: namespace}}
+	if indexImage != "" {
+		if indexManifest != "/verification-evidence/index-manifest.json" {
+			return errors.New("index image requires its raw local registry manifest evidence")
+		}
+		f.indexImage, f.indexManifest = indexImage, indexManifest
+	} else if indexManifest != "" {
+		return errors.New("index manifest requires its explicit image")
+	}
 	defer func() {
 		for i := len(f.cleanup) - 1; i >= 0; i-- {
 			f.cleanup[i]()
@@ -148,8 +163,17 @@ func run(kubeconfig, namespace, selectionPath, requestPath, evidencePath, select
 		{"secret-uid-replacement", f.secretReplacement},
 		{"referenced-secret", f.referencedSecret},
 		{"cleanup-recovery-preserves-files", f.cleanupRecovery},
-		{"rwo-fixed-node-scheduling", f.scheduling},
 	}
+	if indexImage != "" {
+		steps = append(steps, struct {
+			name string
+			run  func() error
+		}{"oci-index-worker-execution", f.indexWorker})
+	}
+	steps = append(steps, struct {
+		name string
+		run  func() error
+	}{"rwo-fixed-node-scheduling", f.scheduling})
 	found := selectedCase == ""
 	for _, step := range steps {
 		if step.name == selectedCase {

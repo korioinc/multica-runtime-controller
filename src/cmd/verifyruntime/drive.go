@@ -130,7 +130,7 @@ func drive(ctx context.Context, origin, phase string) error {
 		if err != nil {
 			return err
 		}
-		if !done.Provider.Environment.Equal(started.Environment) {
+		if !done.Provider.RuntimeRef.Equal(started.RuntimeRef) {
 			return errors.New("running worker changed its environment after another generation was prepared")
 		}
 		fmt.Println("held task completed with its original environment")
@@ -192,7 +192,7 @@ func drive(ctx context.Context, origin, phase string) error {
 			return err
 		}
 		report := retried.Provider
-		if report.Storage != checkpoint.Storage || report.Branch != checkpoint.Branch || !report.PriorWork || report.PriorWorkDigest != checkpoint.ModifiedDigest || !report.Environment.Equal(checkpoint.Environment) {
+		if report.Storage != checkpoint.Storage || report.Branch != checkpoint.Branch || !report.PriorWork || report.PriorWorkDigest != checkpoint.ModifiedDigest || !report.RuntimeRef.Equal(checkpoint.RuntimeRef) {
 			return errors.New("controller interruption recovery lost worker files, branch or pinned environment")
 		}
 		fmt.Println("controller interruption recovery preserved the actual held worker's files and branch")
@@ -282,7 +282,7 @@ func (c fixtureClient) wait(ctx context.Context, queued taskRecord, startedOnly 
 			}
 			if record.Completion != nil && record.Provider != nil && record.Provider.Stage == "completed" {
 				report := record.Provider
-				if !report.ROChecked || !report.WritableChecked || !report.IsolationChecked || !report.RepeatCheckoutChecked || !report.ScopeChecked || !report.CacheChecked || report.CoreHash != report.Environment.Core.Files["runtime"] {
+				if !report.ROChecked || !report.WritableChecked || !report.IsolationChecked || !report.RepeatCheckoutChecked || !report.ScopeChecked || !report.CacheChecked || report.CoreHash != report.RuntimeRef.Controller.RuntimeSHA256 {
 					return *record, errors.New("provider did not establish its required execution/storage checks")
 				}
 				if report.TaskID != record.Input.TaskID || record.Completion["work_dir"] != report.WorkDir || record.Completion["session_id"] != report.Session {
@@ -303,10 +303,10 @@ func sameWorkspace(prior, next taskRecord, changed bool) error {
 		return errors.New("authorized continuation lost its worker files, branch or storage")
 	}
 	if changed {
-		if a.Environment.Equal(b.Environment) || a.Session == b.Session || b.PriorSession || !b.ContinuityNotice {
+		if a.RuntimeRef.Equal(b.RuntimeRef) || a.Session == b.Session || b.PriorSession || !b.ContinuityNotice {
 			return errors.New("environment change did not start an honest new provider session")
 		}
-	} else if !a.Environment.Equal(b.Environment) || a.Session != b.Session || !b.PriorSession {
+	} else if !a.RuntimeRef.Equal(b.RuntimeRef) || a.Session != b.Session || !b.PriorSession {
 		return errors.New("same-environment continuation lost its authorized session")
 	}
 	return nil

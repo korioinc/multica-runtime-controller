@@ -144,7 +144,7 @@ jobs:
         id: args
         run: |
           set -euo pipefail
-          python3 scripts/runtime_versions.py --root "$GITHUB_WORKSPACE" build-args \
+          scripts/runtime-versions.sh --root "$GITHUB_WORKSPACE" build-args \
             --revision "${{ needs.context.outputs.head_sha }}" --version ci \
             | jq -r 'to_entries[] | "\(.key)=\(.value)"' >"$RUNNER_TEMP/build-args"
           {
@@ -207,7 +207,7 @@ jobs:
           git fetch --no-tags origin \
             '+refs/heads/main:refs/remotes/origin/main'
           git merge --no-edit origin/main
-          result=$(python3 scripts/runtime_versions.py \
+          result=$(scripts/runtime-versions.sh \
             --root "$GITHUB_WORKSPACE" prepare-release --base-ref origin/main)
           printf '%s\n' "$result"
           if ! git diff --quiet -- VERSION; then
