@@ -130,7 +130,12 @@ if [[ $3 == inspect ]]; then
     if [[ $selected == linux/amd64 ]]; then config=$config_amd; else config=$config_arm; fi
     jq -cn --arg digest "$config" '{config:{digest:$digest}}'
   elif [[ ${6:-} == '{{json .Image}}' ]]; then
-    image "$(native_platform "$ref")" | jq -c '{os:.Os,architecture:.Architecture,config:.Config}'
+    selected=$(native_platform "$ref")
+    if [[ -f $root/remote-${selected#linux/}.json ]]; then
+      cat "$root/remote-${selected#linux/}.json"
+    else
+      image "$selected" | jq -c '{os:.Os,architecture:.Architecture,config:.Config}'
+    fi
   elif [[ ${6:-} == '{{json .Manifest}}' ]]; then
     file=$(manifest_file "$ref")
     if [[ ! -f $file ]]; then printf 'ERROR: %s: not found\n' "$ref" >&2; exit 1; fi
@@ -153,8 +158,12 @@ done
 file=$(manifest_file "$tag")
 if [[ $tag == fixture/runtime:1.2.3 ]]; then
   [[ ${#sources[@]} == 2 && ${sources[0]} == "fixture/runtime@$amd" && ${sources[1]} == "fixture/runtime@$arm" && ! -f $file ]]
-  jq -cn --arg amd "$amd" --arg arm "$arm" --arg revision "$revision" \
-    '{digest:"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",annotations:{"org.opencontainers.image.revision":$revision,"org.opencontainers.image.version":"1.2.3"},manifests:[{digest:$amd,platform:{os:"linux",architecture:"amd64"}},{digest:$arm,platform:{os:"linux",architecture:"arm64"}}]}' >"$file"
+  # Buildx drops --annotation for Docker lists; only OCI indexes retain them.
+  jq -cn --arg amd "$amd" --arg arm "$arm" --arg revision "$revision" --arg format "${RELEASE_FIXTURE_INDEX_FORMAT:-oci}" '
+    (if $format == "docker" then "application/vnd.docker.distribution.manifest.list.v2+json" else "application/vnd.oci.image.index.v1+json" end) as $media |
+    {schemaVersion:2,mediaType:$media,digest:"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+     manifests:[{digest:$amd,platform:{os:"linux",architecture:"amd64"}},{digest:$arm,platform:{os:"linux",architecture:"arm64"}}]} |
+    if $format == "docker" then . else .annotations={"org.opencontainers.image.revision":$revision,"org.opencontainers.image.version":"1.2.3"} end' >"$file"
   if [[ $(cat "$root/fault" 2>/dev/null || :) == after-version ]]; then rm "$root/fault"; exit 1; fi
 elif [[ $tag == fixture/runtime:latest ]]; then
   [[ ${#sources[@]} == 1 && ${sources[0]} == "fixture/runtime@$(jq -r .digest "$root/registry/version.json")" ]]
@@ -265,4 +274,57 @@ for storage in manifest index; do
   unset RELEASE_FIXTURE_PUSH_DIFFERENT
   cmp "$fixture/records/amd64.json" "$fixture/retained-proof"
 done
-printf '%s\n' 'PASS: immutable release guards, failed/partial native results, lost-response retries, monotonic latest, and Docker config/manifest/index image identities.'
+
+# A successful native pair can be published in either registry format. A lost
+# publish response must not require overwriting the already accepted version.
+unset RELEASE_FIXTURE_IMAGE_ID_KIND
+for format in oci docker; do
+  export RELEASE_FIXTURE_INDEX_FORMAT=$format
+  rm -f "$fixture/registry/"*.json "$fixture/records/"*.json "$fixture/tag.json" "$fixture/release.json" "$fixture/local-"*-kind
+  export RELEASE_FIXTURE_PLATFORM=linux/amd64
+  require_success record-native --platform linux/amd64 --records "$fixture/records"
+  require_rejected_without_writes publish --records "$fixture/records"
+  export RELEASE_FIXTURE_PLATFORM=linux/arm64 RELEASE_FIXTURE_FAIL_NATIVE=true
+  require_rejected_without_writes record-native --platform linux/arm64 --records "$fixture/records"
+  unset RELEASE_FIXTURE_FAIL_NATIVE
+  require_success record-native --platform linux/arm64 --records "$fixture/records"
+  printf '%s\n' after-version >"$fixture/fault"
+  if release publish --records "$fixture/records"; then printf 'lost version response unexpectedly succeeded\n' >&2; exit 1; fi
+  [[ -f $fixture/registry/version.json && ! -f $fixture/registry/latest.json && ! -f $fixture/release.json ]]
+  cp "$fixture/registry/version.json" "$fixture/format-version"
+  require_success publish --records "$fixture/records"
+  cmp "$fixture/format-version" "$fixture/registry/version.json"
+  cmp "$fixture/format-version" "$fixture/registry/latest.json"
+  registry_state >"$fixture/format-committed"
+  require_success publish --records "$fixture/records"
+  registry_state >"$fixture/format-retried"
+  cmp "$fixture/format-committed" "$fixture/format-retried"
+
+  # Metadata conflicts and changed children cannot gain promotion authority,
+  # including when the Docker root has no version/revision annotations.
+  for change in \
+    '.annotations["org.opencontainers.image.version"]="9.0.0"' \
+    '.annotations["org.opencontainers.image.revision"]="2222222222222222222222222222222222222222"' \
+    '.manifests += [.manifests[0]]' \
+    '.manifests[1].digest=.manifests[0].digest'; do
+    jq "$change" "$fixture/format-version" >"$fixture/registry/version.json"
+    require_rejected_without_writes publish --records "$fixture/records"
+  done
+  if [[ $format == oci ]]; then
+    jq 'del(.annotations)' "$fixture/format-version" >"$fixture/registry/version.json"
+    require_rejected_without_writes publish --records "$fixture/records"
+  fi
+  cp "$fixture/format-version" "$fixture/registry/version.json"
+  docker buildx imagetools inspect fixture/runtime@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb --format '{{json .Image}}' >"$fixture/format-arm64"
+  for change in \
+    '.config.Labels["org.opencontainers.image.version"]="9.0.0"' \
+    '.config.Labels["org.opencontainers.image.revision"]="2222222222222222222222222222222222222222"' \
+    '.config.Labels["io.multica.controller-abi"]="1"' \
+    '.architecture="amd64"'; do
+    jq "$change" "$fixture/format-arm64" >"$fixture/remote-arm64.json"
+    require_rejected_without_writes publish --records "$fixture/records"
+  done
+  rm "$fixture/remote-arm64.json"
+  require_success plan
+done
+printf '%s\n' 'PASS: immutable release guards, failed/partial native results, lost-response retries, monotonic latest, Docker/OCI metadata authority, and Docker config/manifest/index image identities.'

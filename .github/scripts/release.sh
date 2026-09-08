@@ -157,9 +157,18 @@ published() {
   local manifest entries native_platform pin
   manifest=$(inspect "$image:$version" Manifest true) || return 1
   if [[ $manifest == null ]]; then printf 'null\n'; return; fi
+  # Buildx only retains index annotations for OCI. Docker schema-2 lists rely
+  # on both native image labels below; any supplied root metadata must agree.
   jq -e --arg revision "$revision" --arg version "$version" '
-    .annotations["org.opencontainers.image.revision"] == $revision and
-    .annotations["org.opencontainers.image.version"] == $version
+    (if has("annotations") then .annotations else {} end) as $annotations |
+    .schemaVersion == 2 and ($annotations | type == "object") and
+    if .mediaType == "application/vnd.docker.distribution.manifest.list.v2+json" then
+      (($annotations | has("org.opencontainers.image.revision") | not) or $annotations["org.opencontainers.image.revision"] == $revision) and
+      (($annotations | has("org.opencontainers.image.version") | not) or $annotations["org.opencontainers.image.version"] == $version)
+    elif .mediaType == "application/vnd.oci.image.index.v1+json" then
+      $annotations["org.opencontainers.image.revision"] == $revision and
+      $annotations["org.opencontainers.image.version"] == $version
+    else false end
   ' <<<"$manifest" >/dev/null || fail 'published version belongs to another build'
   entries=$(index_entries "$manifest") || return 1
   for native_platform in linux/amd64 linux/arm64; do
