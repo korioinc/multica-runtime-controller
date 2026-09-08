@@ -107,7 +107,10 @@ jobs:
       - name: Verify repository
         id: run
         continue-on-error: true
-        run: make verify
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends ripgrep
+          make verify
       - name: Finish the bot PR verify check
         if: always() && github.event_name == 'repository_dispatch'
         env:

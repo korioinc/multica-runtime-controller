@@ -100,7 +100,7 @@ make verify-core
 make verify
 ```
 
-`verify-core` builds this checkout's base and checks native execution, Go compilation and official CLI absence. It needs local Docker, Go, Make, Bash and jq, without a chart or completed runtime image.
+`verify-core` builds this checkout's base and checks native execution, Go compilation and official CLI absence. It needs local Docker, Go, Make, Bash, jq, Git and ripgrep, without a chart or completed runtime image.
 
 Build a completed runtime with an explicit local base override using the runtime repository's `scripts/build-image.sh`. Then run integration with both inputs:
 
