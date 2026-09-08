@@ -17,7 +17,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/korioinc/multica-runtime-controller/internal/core"
-	"github.com/korioinc/multica-runtime-controller/internal/environment"
+	"github.com/korioinc/multica-runtime-controller/internal/runtimeimage"
 	"github.com/korioinc/multica-runtime-controller/internal/wire"
 )
 
@@ -64,7 +64,7 @@ func runProvider(ctx context.Context, args []string) (returnErr error) {
 	if request.TaskID != os.Getenv("MULTICA_TASK_ID") || cwd != request.WorkDir {
 		return errors.New("provider received another task identity or directory")
 	}
-	report := providerResult{TaskID: request.TaskID, Case: os.Getenv("VERIFYRUNTIME_CASE"), Stage: "started", WorkDir: cwd, Session: session, Storage: request.WorkerSubPath, Environment: request.Environment, Request: raw}
+	report := providerResult{TaskID: request.TaskID, Case: os.Getenv("VERIFYRUNTIME_CASE"), Stage: "started", WorkDir: cwd, Session: session, Storage: request.WorkerSubPath, RuntimeRef: request.RuntimeRef, Request: raw}
 	defer func() {
 		if returnErr != nil {
 			report.Error = returnErr.Error()
@@ -110,12 +110,12 @@ func runProvider(ctx context.Context, args []string) (returnErr error) {
 		return err
 	}
 	report.CachePath, report.CacheChecked = cache, true
-	actualHash, err := core.HashFile(wire.CoreRoot + "/runtime")
+	actualHash, err := core.HashFile(wire.ControllerRoot + "/runtime")
 	if err != nil {
 		return err
 	}
 	report.CoreHash = actualHash
-	if actualHash != request.Environment.Core.Files["runtime"] {
+	if actualHash != request.RuntimeRef.Controller.RuntimeSHA256 {
 		return errors.New("worker core differs from its immutable request")
 	}
 	priorSession, err := os.ReadFile(session)
@@ -135,7 +135,7 @@ func runProvider(ctx context.Context, args []string) (returnErr error) {
 		return errors.New("fixture expected its single assigned local repository")
 	}
 	assigned := request.RepositoryURLs[0]
-	if _, err := command(ctx, cwd, wire.CoreRoot+"/multica", "repo", "checkout", assigned); err != nil {
+	if _, err := command(ctx, cwd, request.RuntimeRef.Daemon.Path, "repo", "checkout", assigned); err != nil {
 		return err
 	}
 	repository, err := findRepository(cwd)
@@ -169,7 +169,7 @@ func runProvider(ctx context.Context, args []string) (returnErr error) {
 	if err := os.WriteFile(hook, userHook, 0700); err != nil {
 		return err
 	}
-	if _, err := command(ctx, cwd, wire.CoreRoot+"/multica", "repo", "checkout", assigned); err != nil {
+	if _, err := command(ctx, cwd, request.RuntimeRef.Daemon.Path, "repo", "checkout", assigned); err != nil {
 		return err
 	}
 	after, err := os.ReadFile(filepath.Join(repository, "tracked.txt"))
@@ -185,11 +185,13 @@ func runProvider(ctx context.Context, args []string) (returnErr error) {
 		return errors.New("repeated checkout replaced a user Git hook")
 	}
 	report.RepeatCheckoutChecked = true
-	if _, err := command(ctx, cwd, wire.CoreRoot+"/multica", "repo", "checkout", backend+"/git/forbidden.git"); err == nil {
+	if _, err := command(ctx, cwd, request.RuntimeRef.Daemon.Path, "repo", "checkout", backend+"/git/forbidden.git"); err == nil {
 		return errors.New("worker checked out a repository outside its observed scope")
 	}
 	report.ScopeChecked = true
-	if _, _, err := environment.Check(wire.EnvironmentRoot, wire.CoreRoot, request.EnvironmentInput, &request.Environment); err != nil {
+	if descriptor, digest, err := runtimeimage.Check(ctx, runtimeimage.Root, wire.ControllerRoot, request.RuntimeRef.Platform); err != nil {
+		return err
+	} else if err := runtimeimage.Match(descriptor, digest, request.RuntimeRef); err != nil {
 		return err
 	}
 	if err := writeSession(session, cwd, len(priorSession) == 0); err != nil {
@@ -257,7 +259,7 @@ func command(ctx context.Context, dir, executable string, args ...string) ([]byt
 }
 
 func verifyMounts(cwd string) error {
-	for _, root := range []string{wire.CoreRoot, wire.EnvironmentRoot} {
+	for _, root := range []string{wire.ControllerRoot, runtimeimage.Root} {
 		file, err := os.CreateTemp(root, "fixture-write-probe-")
 		if err == nil {
 			file.Close()

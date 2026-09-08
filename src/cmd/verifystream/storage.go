@@ -60,7 +60,7 @@ func lockStorage(ctx context.Context, api clientset.Interface, selection executi
 			Denied        bool   `json:"denied"`
 		} `json:"claims"`
 	}
-	if json.Unmarshal(raw, &registry) != nil || registry.SchemaVersion != 1 || registry.OwnerID != selection.OwnerID {
+	if json.Unmarshal(raw, &registry) != nil || registry.SchemaVersion != 2 || registry.OwnerID != selection.OwnerID {
 		return "", nil, errors.New("fixture workspace owner registry mismatch")
 	}
 	claim, ok := registry.Claims[request.TaskID]

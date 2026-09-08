@@ -9,41 +9,52 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/korioinc/multica-runtime-controller/internal/configuration"
 	"github.com/korioinc/multica-runtime-controller/internal/core"
-	"github.com/korioinc/multica-runtime-controller/internal/environment"
 	"github.com/korioinc/multica-runtime-controller/internal/kubernetes"
+	"github.com/korioinc/multica-runtime-controller/internal/runtimeimage"
 	"github.com/korioinc/multica-runtime-controller/internal/wire"
 	"github.com/korioinc/multica-runtime-controller/internal/workspace"
 )
 
 type Selection struct {
-	SchemaVersion int               `json:"schemaVersion"`
-	OwnerID       string            `json:"ownerID"`
-	Controller    kubernetes.Owner  `json:"controller"`
-	Namespace     string            `json:"namespace"`
-	Gateway       string            `json:"gateway"`
-	Backend       string            `json:"backend"`
-	Input         environment.Input `json:"input"`
-	Environment   environment.Ref   `json:"environment"`
-	Worker        kubernetes.Config `json:"worker"`
-	OperatorKeys  []string          `json:"operatorKeys"`
+	SchemaVersion int                         `json:"schemaVersion"`
+	OwnerID       string                      `json:"ownerID"`
+	Controller    kubernetes.Owner            `json:"controller"`
+	Namespace     string                      `json:"namespace"`
+	Gateway       string                      `json:"gateway"`
+	Backend       string                      `json:"backend"`
+	RuntimeRef    runtimeimage.Ref            `json:"runtimeRef"`
+	Snapshots     []configuration.SnapshotRef `json:"snapshots"`
+	Worker        kubernetes.Config           `json:"worker"`
+	OperatorKeys  []string                    `json:"operatorKeys"`
 }
 
 func (s Selection) Validate() error {
-	if s.SchemaVersion != 1 || !wire.UUID(s.OwnerID) || s.Namespace == "" || s.Controller.Name == "" || s.Controller.UID == "" || s.Input.Platform != core.HostPlatform() {
-		return errors.New("invalid runtime selection")
+	if s.SchemaVersion != 2 || !wire.UUID(s.OwnerID) || s.Namespace == "" || s.Controller.Name == "" || s.Controller.UID == "" || s.RuntimeRef.Platform != core.HostPlatform() {
+		return errors.New("invalid runtime selection; schema 2 required")
 	}
 	if err := s.Worker.Validate(); err != nil {
 		return err
 	}
-	id, err := environment.Identity(s.Input)
-	if err != nil {
+	if s.Worker.Platform != s.RuntimeRef.Platform {
+		return errors.New("runtime selection platform mismatch")
+	}
+	if err := s.RuntimeRef.Validate(); err != nil {
 		return err
 	}
-	if id != s.Worker.EnvironmentID || id != s.Environment.EnvironmentID || s.Input.CoreImage != s.Worker.CoreImage || s.Input.EnvironmentImage != s.Worker.EnvironmentImage || s.Input.Platform != s.Worker.Platform {
-		return errors.New("environment selection mismatch")
+	if err := configuration.ValidateRefs(s.Snapshots); err != nil {
+		return err
 	}
-	return s.Environment.Validate()
+	for _, ref := range s.Snapshots {
+		if ref.Namespace != s.Namespace {
+			return errors.New("snapshot belongs to a different namespace")
+		}
+	}
+	if configuration.DigestRefs(s.Snapshots) != s.RuntimeRef.ConfigurationDigest {
+		return errors.New("runtime configuration selection mismatch")
+	}
+	return nil
 }
 func SaveSelection(s Selection) error {
 	if err := s.Validate(); err != nil {
@@ -56,6 +67,9 @@ func SaveSelection(s Selection) error {
 	if err != nil {
 		return err
 	}
+	if len(raw) > wire.MaxRequestBytes {
+		return errors.New("runtime selection exceeds supported configuration metadata size")
+	}
 	return durableWrite(wire.SelectionPath, raw)
 }
 func LoadSelection() (Selection, error) {
@@ -64,14 +78,14 @@ func LoadSelection() (Selection, error) {
 	if err != nil {
 		return s, err
 	}
-	if !st.Mode().IsRegular() || st.Size() > 1<<20 {
+	if !st.Mode().IsRegular() || st.Size() > wire.MaxRequestBytes {
 		return s, errors.New("invalid selection file")
 	}
 	raw, err := os.ReadFile(wire.SelectionPath)
 	if err != nil {
 		return s, err
 	}
-	if err := json.Unmarshal(raw, &s); err != nil {
+	if err := runtimeimage.Decode(raw, &s); err != nil {
 		return s, err
 	}
 	return s, s.Validate()
@@ -107,7 +121,7 @@ func OperatorNames(env []string) []string {
 
 // SelectedEnvironment reads operator provenance from the actual Pod environment,
 // rather than rereading mutable Secret/ConfigMap objects after Pod startup.
-func SelectedEnvironment(manifest environment.Manifest, base []string, locations environment.Locations) ([]string, error) {
+func SelectedEnvironment(manifest runtimeimage.Descriptor, base []string, locations runtimeimage.Locations) ([]string, error) {
 	image := []string{}
 	operator := map[string]string{}
 	for _, entry := range base {
@@ -117,7 +131,7 @@ func SelectedEnvironment(manifest environment.Manifest, base []string, locations
 		}
 		if strings.HasPrefix(key, OperatorPrefix) {
 			key = strings.TrimPrefix(key, OperatorPrefix)
-			if environment.Reserved(key) || strings.HasPrefix(key, "POD_") {
+			if runtimeimage.Reserved(key) || strings.HasPrefix(key, "POD_") {
 				return nil, errors.New("operator overrides reserved environment key")
 			}
 			operator[key] = val
@@ -125,7 +139,7 @@ func SelectedEnvironment(manifest environment.Manifest, base []string, locations
 			image = append(image, entry)
 		}
 	}
-	vars, err := environment.Vars(manifest, image, locations)
+	vars, err := runtimeimage.Vars(manifest, image, locations)
 	if err != nil {
 		return nil, err
 	}
@@ -139,6 +153,6 @@ func SelectedEnvironment(manifest environment.Manifest, base []string, locations
 	for key, value := range operator {
 		values[key] = value
 	}
-	values["PATH"] = wire.CoreRoot + ":" + values["PATH"]
+	values["PATH"] = wire.ControllerRoot + ":" + values["PATH"]
 	return wire.Environment(values), nil
 }

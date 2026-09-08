@@ -22,27 +22,32 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	configurationbundle "github.com/korioinc/multica-runtime-controller/internal/configuration"
 	"github.com/korioinc/multica-runtime-controller/internal/core"
-	"github.com/korioinc/multica-runtime-controller/internal/environment"
 	"github.com/korioinc/multica-runtime-controller/internal/execution"
-	"github.com/korioinc/multica-runtime-controller/internal/kubernetes"
 	"github.com/korioinc/multica-runtime-controller/internal/official"
+	"github.com/korioinc/multica-runtime-controller/internal/runtimeimage"
 	"github.com/korioinc/multica-runtime-controller/internal/wire"
 	"github.com/korioinc/multica-runtime-controller/internal/workspace"
-	corev1 "k8s.io/api/core/v1"
 )
 
-type configuration struct{ runtime, official, evidence string }
+type configuration struct {
+	image                                  bool
+	official, evidence, verificationOutput string
+}
 type verifier struct {
 	configuration
-	store          *workspace.Store
-	selection      execution.Selection
-	helper         string
-	backend        *backend
-	server         *httptest.Server
-	redirectServer *httptest.Server
-	events         []providerEvent
-	results        []string
+	store            *workspace.Store
+	selection        execution.Selection
+	descriptor       runtimeimage.Descriptor
+	descriptorDigest string
+	fixtureRef       runtimeimage.Ref
+	helper           string
+	backend          *backend
+	server           *httptest.Server
+	redirectServer   *httptest.Server
+	events           []providerEvent
+	results          []string
 }
 type health struct {
 	Status     string            `json:"status"`
@@ -62,9 +67,20 @@ func main() {
 	if len(os.Args) > 1 && (os.Args[1] == "provider" || os.Args[1] == "forbidden") {
 		os.Exit(providerHelper(os.Args[1], os.Args[2:]))
 	}
+	if len(os.Args) > 1 && os.Args[1] == "shim" {
+		helper, err := os.Executable()
+		if err != nil {
+			os.Exit(1)
+		}
+		result := execution.RunProcess(context.Background(), helper, append([]string{"provider"}, os.Args[2:]...), os.Environ(), "/tmp", time.Second, execution.ProcessStreams{Stdin: os.Stdin, Stdout: os.Stdout, Stderr: os.Stderr})
+		if result.Exited {
+			os.Exit(result.Code)
+		}
+		os.Exit(1)
+	}
 	cfg := configuration{}
-	flag.StringVar(&cfg.runtime, "runtime", wire.CoreRoot+"/runtime", "materialized runtime executable")
-	flag.StringVar(&cfg.official, "official", wire.CoreRoot+"/multica", "verified official release executable")
+	flag.BoolVar(&cfg.image, "image", false, "verify the prepared image and its installed official adapter")
+	flag.StringVar(&cfg.verificationOutput, "verification-output", "", "write bound verification record after all adapter probes pass")
 	flag.StringVar(&cfg.evidence, "evidence", "/evidence/official", "local evidence directory")
 	flag.Parse()
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
@@ -80,8 +96,11 @@ func verify(ctx context.Context, cfg configuration) error {
 	if runtime.GOOS != "linux" || os.Getenv("LOCALVERIFY_DISPOSABLE_CONTAINER") != "true" {
 		return errors.New("requires an explicitly disposable Linux container")
 	}
-	if cfg.runtime != wire.CoreRoot+"/runtime" || cfg.official != wire.CoreRoot+"/multica" {
-		return errors.New("fixture uses the same fixed materialization paths as production")
+	if !cfg.image || flag.NArg() != 0 {
+		return errors.New("--image is required; only installed image verification is supported")
+	}
+	if cfg.verificationOutput != "" && (!filepath.IsAbs(cfg.verificationOutput) || filepath.Clean(cfg.verificationOutput) != cfg.verificationOutput) {
+		return errors.New("verification output must be absolute and canonical")
 	}
 	helper, err := os.Executable()
 	if err != nil {
@@ -214,76 +233,85 @@ func verify(ctx context.Context, cfg configuration) error {
 	if err := v.redirects(ctx); err != nil {
 		return err
 	}
-	if _, err := core.Check(wire.CoreRoot, core.HostPlatform()); err != nil {
+	if err := v.nativeCatalog(ctx); err != nil {
+		return err
+	}
+	if _, err := core.Check(wire.ControllerRoot, core.HostPlatform()); err != nil {
 		return err
 	}
 	raw, _ := json.MarshalIndent(struct {
 		Proofs []string      `json:"proofs"`
 		Core   core.Contract `json:"core"`
-	}{v.results, v.selection.Environment.Core}, "", "  ")
-	return os.WriteFile(filepath.Join(cfg.evidence, "result.json"), append(raw, '\n'), 0600)
+	}{v.results, v.descriptor.Controller}, "", "  ")
+	if err := os.WriteFile(filepath.Join(cfg.evidence, "result.json"), append(raw, '\n'), 0600); err != nil {
+		return err
+	}
+	if cfg.verificationOutput == "" {
+		return nil
+	}
+	d, digest, err := runtimeimage.CheckInstalled(ctx, runtimeimage.Root, core.Root, core.HostPlatform())
+	if err != nil {
+		return err
+	}
+	if digest != v.descriptorDigest {
+		return errors.New("prepared image changed during adapter verification")
+	}
+	record := runtimeimage.Verification{SchemaVersion: 1, ImageBuildID: d.ImageBuildID, DescriptorDigest: digest, ControllerBuildID: d.Controller.BuildID, ControllerSHA256: d.Controller.RuntimeSHA256, DaemonSHA256: d.Daemon.SHA256, AdapterContract: d.Daemon.AdapterContract, Suite: runtimeimage.VerificationSuite, Passed: true}
+	raw, err = json.Marshal(record)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(cfg.verificationOutput, raw, 0444)
 }
 
 func (v *verifier) prepare(ctx context.Context) error {
-	for _, path := range []string{wire.WorkspaceRoot, wire.Home, wire.ControlRoot, wire.EnvironmentRoot} {
+	for _, path := range []string{wire.WorkspaceRoot, wire.Home, wire.ControlRoot} {
 		if err := os.MkdirAll(path, 0700); err != nil {
 			return err
 		}
 	}
-	contract, err := core.Check(wire.CoreRoot, core.HostPlatform())
+	d, digest, err := runtimeimage.CheckInstalled(ctx, runtimeimage.Root, core.Root, core.HostPlatform())
 	if err != nil {
 		return err
 	}
-	if contract.OfficialVersion != "0.4.40" {
-		return errors.New("fixture requires official release 0.4.40")
+	v.descriptor, v.descriptorDigest, v.official = d, digest, d.Daemon.Path
+	if _, ok := d.Providers["pi"]; !ok {
+		return errors.New("adapter fixture requires installed Pi")
 	}
-	version, err := exec.CommandContext(ctx, v.official, "--version").Output()
-	if err != nil || !bytes.Contains(version, []byte("0.4.40")) {
-		return errors.New("release executable version does not match its contract")
+	ref, err := d.Reference("fixture-runtime@sha256:"+core.Digest([]byte(d.ImageBuildID)), digest, configurationbundle.Digest([]configurationbundle.Group{}))
+	if err != nil {
+		return err
 	}
+	v.fixtureRef = ref
+	v.fixtureRef.Providers = map[string]runtimeimage.Executable{"pi": d.Providers["pi"]}
 	owner := uuid.NewString()
-	store, err := workspace.Open(workspace.Options{Directory: workspace.DefaultDirectory, WorkspaceRoot: wire.WorkspaceRoot, SessionRoot: wire.PiSessionsRoot, OwnerID: owner})
+	v.store, err = workspace.Open(workspace.Options{Directory: workspace.DefaultDirectory, WorkspaceRoot: wire.WorkspaceRoot, SessionRoot: wire.PiSessionsRoot, OwnerID: owner})
 	if err != nil {
 		return err
 	}
-	v.store = store
-	if err := os.MkdirAll(wire.PiSessionsRoot, 0700); err != nil {
+	if err = os.MkdirAll(wire.PiSessionsRoot, 0700); err != nil {
 		return err
 	}
-	script := "#!/bin/bash\nset -euo pipefail\nmkdir -p \"$ENV_ROOT/providers/pi\"\ncat > \"$ENV_ROOT/providers/pi/run\" <<'PROVIDER'\n#!/bin/bash\nexec " + shellQuote(v.helper) + " provider \"$@\"\nPROVIDER\nchmod 0555 \"$ENV_ROOT/providers/pi/run\"\ncat > \"$ENV_MANIFEST_FILE\" <<'MANIFEST'\n{\"schemaVersion\":1,\"providers\":{\"pi\":{\"entrypoint\":\"providers/pi/run\",\"version\":\"0.85.0\"}},\"binDirs\":[],\"env\":{}}\nMANIFEST\n"
-	path := filepath.Join(wire.ControlRoot, "verifyofficial-bootstrap.sh")
-	if err := os.WriteFile(path, []byte(script), 0500); err != nil {
+	v.selection = execution.Selection{OwnerID: owner, RuntimeRef: ref}
+	if err = os.WriteFile(filepath.Join(wire.ControlRoot, "verifyofficial-token"), []byte("mul_disposable_official_fixture"), 0600); err != nil {
 		return err
 	}
-	input := environment.Input{SchemaVersion: 1, CoreImage: "fixture-core@sha256:" + core.Digest([]byte(contract.BuildID)), EnvironmentImage: "fixture-environment@sha256:" + core.Digest([]byte("official-fixture")), Platform: core.HostPlatform(), ScriptSHA256: core.Digest([]byte(script)), Revision: "official-fixture", Providers: []string{"pi"}, Inputs: map[string]string{}}
-	id, err := environment.Identity(input)
-	if err != nil {
-		return err
-	}
-	ref, err := environment.Prepare(ctx, environment.Options{Root: wire.EnvironmentRoot, CoreRoot: wire.CoreRoot, Input: input, ExpectedID: id, ScriptPath: path, Timeout: time.Minute, Output: os.Stderr})
-	if err != nil {
-		return err
-	}
-	v.selection = execution.Selection{SchemaVersion: 1, OwnerID: owner, Controller: kubernetes.Owner{Name: "official-fixture", UID: uuid.NewString()}, Namespace: "official-fixture", Gateway: "http://127.0.0.1:19515", Backend: v.server.URL, Input: input, Environment: ref, Worker: kubernetes.Config{CoreImage: input.CoreImage, EnvironmentImage: input.EnvironmentImage, CorePullPolicy: corev1.PullNever, EnvironmentPullPolicy: corev1.PullNever, Platform: input.Platform, EnvironmentID: id, ToolsClaim: "tools-fixture", WorkspaceClaim: "workspace-fixture", ToolsAccessMode: corev1.ReadWriteMany, WorkspaceAccessMode: corev1.ReadWriteMany, ServiceAccount: "worker", TaskDeadlineSeconds: 60, TerminationGraceSeconds: 1}}
-	if err := execution.SaveSelection(v.selection); err != nil {
-		return err
-	}
-	if err := os.WriteFile(filepath.Join(wire.ControlRoot, "verifyofficial-token"), []byte("mul_disposable_official_fixture"), 0600); err != nil {
+	if err = os.WriteFile(fixtureShim, []byte("#!/bin/sh\nexec "+shellQuote(v.helper)+" shim \"$@\"\n"), 0500); err != nil {
 		return err
 	}
 	decoys := "/tmp/verifyofficial-path"
-	if err := os.MkdirAll(decoys, 0700); err != nil {
+	if err = os.MkdirAll(decoys, 0700); err != nil {
 		return err
 	}
 	for _, name := range []string{"claude", "codex", "copilot", "agy", "omp", "fixture-custom"} {
-		if err := os.WriteFile(filepath.Join(decoys, name), []byte("#!/bin/bash\nexec "+shellQuote(v.helper)+" forbidden "+shellQuote(name)+" \"$@\"\n"), 0500); err != nil {
+		if err = os.WriteFile(filepath.Join(decoys, name), []byte("#!/bin/sh\nexec "+shellQuote(v.helper)+" forbidden "+shellQuote(name)+" \"$@\"\n"), 0500); err != nil {
 			return err
 		}
 	}
-	// The login-shell fallback resolves the same hostile PATH. The actual
-	// discovery command below proves the configured absolute overrides win.
 	return os.WriteFile(filepath.Join(wire.Home, ".bash_profile"), []byte("export PATH="+shellQuote(decoys+":/usr/local/bin:/usr/bin:/bin")+"\n"), 0600)
 }
+
+const fixtureShim = "/tmp/verifyofficial-provider"
 
 func (v *verifier) stage(ctx context.Context, name string, versionFail, inject bool, action func(context.Context, official.DaemonProcess, *running) error) error {
 	ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
@@ -315,7 +343,7 @@ func (v *verifier) stage(ctx context.Context, name string, versionFail, inject b
 	} else {
 		_ = os.Remove(failVersionFile)
 	}
-	bridge, err := official.NewBridge(official.BridgeOptions{BackendURL: v.server.URL, Store: v.store, Environment: v.selection.Environment, Providers: []string{"pi"}})
+	bridge, err := official.NewBridge(official.BridgeOptions{BackendURL: v.server.URL, Store: v.store, RuntimeRef: v.fixtureRef, Providers: []string{"pi"}})
 	if err != nil {
 		return err
 	}
@@ -339,9 +367,20 @@ func (v *verifier) stage(ctx context.Context, name string, versionFail, inject b
 	}
 	defer listener.Close()
 	env := []string{"HOME=" + wire.Home, "PATH=/tmp/verifyofficial-path:/usr/local/bin:/usr/bin:/bin", "SHELL=/bin/bash", "TMPDIR=/tmp", "MULTICA_GC_ENABLED=false", "MULTICA_DAEMON_WS_CLAIM_POLL_INTERVAL=1s", "MULTICA_CODEX_PATH=/tmp/verifyofficial-path/codex"}
-	process, err := official.Setup(official.DaemonOptions{CoreRoot: wire.CoreRoot, Home: wire.Home, TokenFile: filepath.Join(wire.ControlRoot, "verifyofficial-token"), DaemonID: v.selection.OwnerID, Name: "Official fixture", BackendURL: v.server.URL, ProxyURL: "http://" + listener.Addr().String(), Capacity: 1, PollInterval: time.Second, HeartbeatInterval: time.Second, Providers: []string{"pi"}, Environment: v.selection.Environment, Env: env})
+	process, err := official.Setup(official.DaemonOptions{CoreRoot: wire.ControllerRoot, Home: wire.Home, TokenFile: filepath.Join(wire.ControlRoot, "verifyofficial-token"), DaemonID: v.selection.OwnerID, Name: "Official fixture", BackendURL: v.server.URL, ProxyURL: "http://" + listener.Addr().String(), Capacity: 1, PollInterval: time.Second, HeartbeatInterval: time.Second, Providers: enabledProviders(v.descriptor), RuntimeRef: v.selection.RuntimeRef, Env: env})
 	if err != nil {
 		return err
+	}
+	// The prepared image has no production verification record yet. Test-owned
+	// entrypoints exercise the actual daemon adapter; final-image integration
+	// separately exercises the production controller shims.
+	for i, entry := range process.Env {
+		key, _, _ := strings.Cut(entry, "=")
+		if key == "MULTICA_PI_PATH" {
+			process.Env[i] = key + "=" + fixtureShim
+		} else if strings.HasPrefix(key, "MULTICA_") && strings.HasSuffix(key, "_PATH") {
+			process.Env[i] = key + "=" + core.Root + "/disabled/fixture"
+		}
 	}
 	if err := injectLocalProfileOverride(); err != nil {
 		return err
@@ -441,7 +480,7 @@ func (v *verifier) noTask(ctx context.Context, env []string) error {
 	}
 	args := []string{"--echo-protocol", "argument with spaces", "literal-$()-value"}
 	input := []byte{0, 1, 'h', 'e', 'l', 'l', 'o', '\n'}
-	command := exec.CommandContext(ctx, wire.CoreRoot+"/shims/pi", args...)
+	command := exec.CommandContext(ctx, fixtureShim, args...)
 	command.Env = env
 	command.Dir = "/tmp"
 	command.Stdin = bytes.NewReader(input)
@@ -697,4 +736,13 @@ func (v *verifier) registrationRequests(ctx context.Context, origin string) erro
 	}
 	v.results = append(v.results, "registration-request-boundary")
 	return nil
+}
+
+func enabledProviders(d runtimeimage.Descriptor) []string {
+	ids := []string{}
+	for id := range d.Providers {
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+	return ids
 }

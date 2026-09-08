@@ -5,21 +5,20 @@ include $(RUNTIME_VERSIONS_FILE)
 
 GO_MODULE_DIR := src
 
-RUNTIME_VERSION_ARGS := GO_VERSION MULTICA_CLI_VERSION
+RUNTIME_VERSION_ARGS := GO_VERSION
 RUNTIME_BUILD_ARGS := $(foreach name,$(RUNTIME_VERSION_ARGS),--build-arg $(name)=$($(name)))
 
 HOST_ARCH := $(shell uname -m | sed -e 's/^x86_64$$/amd64/' -e 's/^aarch64$$/arm64/')
 IMAGE ?= multica-runtime-controller:dev
 PLATFORM ?= linux/$(HOST_ARCH)
 PLATFORMS ?= linux/amd64,linux/arm64
-VERSION ?= dev
-COMMIT ?= $(shell git rev-parse --short=12 HEAD)
+VERSION ?= $(shell cat VERSION)
+COMMIT ?= $(shell git rev-parse HEAD)
 
 ACTIONLINT_VERSION := v1.7.12
 ACTIONLINT_WORKFLOWS := \
 	../.github/workflows/create-develop-to-main-pr.yml \
-	../.github/workflows/release.yml \
-	../.github/workflows/runtime-version-update.yml
+	../.github/workflows/release.yml
 
 build:
 	mkdir -p bin
@@ -44,14 +43,15 @@ image-push:
 		.
 
 runtime-version-test:
-	python3 -m unittest -v scripts.tests.test_runtime_versions
+	for script in scripts/*.sh scripts/lib/*.sh .github/scripts/*.sh; do bash -n "$$script" || exit 1; done
+	shellcheck -x scripts/*.sh scripts/lib/*.sh .github/scripts/*.sh
+	.github/scripts/verify-release.sh
 
 repository-validate:
-	python3 scripts/runtime_versions.py --root "$(CURDIR)" validate
+	./scripts/runtime-versions.sh --root "$(CURDIR)" validate
 
 workflow-validate:
 	go -C $(GO_MODULE_DIR) run github.com/rhysd/actionlint/cmd/actionlint@$(ACTIONLINT_VERSION) $(ACTIONLINT_WORKFLOWS)
-	python3 scripts/runtime_versions.py --root "$(CURDIR)" validate-actions .github/workflows
 
 test:
 	go -C $(GO_MODULE_DIR) test ./...

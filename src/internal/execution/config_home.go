@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/korioinc/multica-runtime-controller/internal/configuration"
 	"github.com/korioinc/multica-runtime-controller/internal/wire"
 )
 
@@ -23,7 +24,7 @@ func copyHomeConfig(home, source, target string) error {
 	if !info.IsDir() && !info.Mode().IsRegular() {
 		return errors.New("configuration input must be a regular file or directory")
 	}
-	if !wire.ConfigHomePath(target, info.IsDir()) {
+	if !configuration.HomePath(target, info.IsDir()) {
 		return errors.New("configuration copy shadows native session or daemon authority")
 	}
 	homeInfo, err := os.Lstat(home)
@@ -80,7 +81,7 @@ func copyHomeConfig(home, source, target string) error {
 		if err != nil {
 			return err
 		}
-		if !wire.ConfigHomePath(destination, info.IsDir()) {
+		if !configuration.HomePath(destination, info.IsDir()) {
 			return errors.New("configuration tree shadows native session or daemon authority")
 		}
 		destination = strings.TrimPrefix(destination, wire.Home+"/")
@@ -113,6 +114,15 @@ func homeDirectories(root *os.Root, relative string) error {
 }
 
 func copyHomeFile(root *os.Root, source, destination string, mode fs.FileMode) error {
+	in, err := os.Open(source)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	return copyHomeContents(root, in, destination, mode)
+}
+
+func copyHomeContents(root *os.Root, in io.Reader, destination string, mode fs.FileMode) error {
 	parent := filepath.Dir(destination)
 	if err := homeDirectories(root, parent); err != nil {
 		return err
@@ -125,11 +135,6 @@ func copyHomeFile(root *os.Root, source, destination string, mode fs.FileMode) e
 	} else if !os.IsNotExist(err) {
 		return err
 	}
-	in, err := os.Open(source)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
 	// A unique sibling plus a no-overwrite link avoids publishing partial files
 	// if init is interrupted, and preserves files from an earlier successful copy.
 	temporary := filepath.Join(parent, ".config-copy-"+uuid.NewString())

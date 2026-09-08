@@ -16,46 +16,61 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/korioinc/multica-runtime-controller/internal/environment"
+	"github.com/korioinc/multica-runtime-controller/internal/diagnostics"
+	"github.com/korioinc/multica-runtime-controller/internal/runtimeimage"
 	"golang.org/x/sys/unix"
 )
 
 const DefaultDirectory = "/workspace/.multica-runtime/state"
+const DefaultSessionRoot = "/home/multica/agents/.multica/pi-sessions"
+const SchemaVersion = 2
 const StoragePrefix = ".multica-runtime/workers"
 const rootMarker = ".multica-runtime-binding"
+
+var ErrMigrationRequired = errors.New("workspace schema 1 requires explicit migration")
 
 type Options struct{ Directory, WorkspaceRoot, SessionRoot, OwnerID string }
 type Store struct{ options Options }
 
 type Claim struct {
-	ID             string          `json:"id"`
-	WorkspaceID    string          `json:"workspaceID"`
-	AgentID        string          `json:"agentID"`
-	IssueID        string          `json:"issueID,omitempty"`
-	ChatID         string          `json:"chatID,omitempty"`
-	ProjectID      string          `json:"projectID,omitempty"`
-	Grant          string          `json:"scope"`
-	TokenHash      string          `json:"credentialFingerprint"`
-	PriorWorkDir   string          `json:"priorWorkDir,omitempty"`
-	PriorSession   string          `json:"priorSession,omitempty"`
-	BoundRoot      string          `json:"boundRoot,omitempty"`
-	WorkerSubPath  string          `json:"workerSubPath,omitempty"`
-	RepositoryURLs []string        `json:"repositoryURLs"`
-	TaskEnvKeys    []string        `json:"taskEnvKeys"`
-	Environment    environment.Ref `json:"environment"`
-	Denied         bool            `json:"denied,omitempty"`
-	ObservedAt     time.Time       `json:"observedAt"`
+	ID             string            `json:"id"`
+	WorkspaceID    string            `json:"workspaceID"`
+	AgentID        string            `json:"agentID"`
+	IssueID        string            `json:"issueID,omitempty"`
+	ChatID         string            `json:"chatID,omitempty"`
+	ProjectID      string            `json:"projectID,omitempty"`
+	Grant          string            `json:"scope"`
+	TokenHash      string            `json:"credentialFingerprint"`
+	PriorWorkDir   string            `json:"priorWorkDir,omitempty"`
+	PriorSession   string            `json:"priorSession,omitempty"`
+	BoundRoot      string            `json:"boundRoot,omitempty"`
+	WorkerSubPath  string            `json:"workerSubPath,omitempty"`
+	RepositoryURLs []string          `json:"repositoryURLs"`
+	TaskEnvKeys    []string          `json:"taskEnvKeys"`
+	ExecutionState string            `json:"executionState"`
+	RuntimeRef     *runtimeimage.Ref `json:"runtimeRef"`
+	Denied         bool              `json:"denied,omitempty"`
+	ObservedAt     time.Time         `json:"observedAt"`
+}
+
+type SessionRecord struct {
+	State      string            `json:"state"`
+	RuntimeRef *runtimeimage.Ref `json:"runtimeRef"`
+}
+
+func (s SessionRecord) Equal(other SessionRecord) bool {
+	return s.State == other.State && ((s.RuntimeRef == nil && other.RuntimeRef == nil) || (s.RuntimeRef != nil && other.RuntimeRef != nil && s.RuntimeRef.Equal(*other.RuntimeRef)))
 }
 
 type Binding struct {
-	Root          string                     `json:"root"`
-	Identity      string                     `json:"identity"`
-	Grant         string                     `json:"scope"`
-	WorkerSubPath string                     `json:"workerSubPath"`
-	Sessions      map[string]environment.Ref `json:"sessions"`
+	Root          string                   `json:"root"`
+	Identity      string                   `json:"identity"`
+	Grant         string                   `json:"scope"`
+	WorkerSubPath string                   `json:"workerSubPath"`
+	Sessions      map[string]SessionRecord `json:"sessions"`
 }
 
-type registry struct {
+type Registry struct {
 	SchemaVersion int                `json:"schemaVersion"`
 	OwnerID       string             `json:"ownerID"`
 	WorkspaceRoot string             `json:"workspaceRoot"`
@@ -97,7 +112,7 @@ func Open(options Options) (*Store, error) {
 			if err := emptyInstallation(options.WorkspaceRoot); err != nil {
 				return err
 			}
-			initial := registry{SchemaVersion: 1, OwnerID: options.OwnerID, WorkspaceRoot: options.WorkspaceRoot, Claims: map[string]Claim{}, Bindings: map[string]Binding{}, Retired: map[string]string{}}
+			initial := Registry{SchemaVersion: SchemaVersion, OwnerID: options.OwnerID, WorkspaceRoot: options.WorkspaceRoot, Claims: map[string]Claim{}, Bindings: map[string]Binding{}, Retired: map[string]string{}}
 			return store.write(initial)
 		} else if err != nil {
 			return err
@@ -151,69 +166,82 @@ func (s *Store) locked(fn func() error) error {
 	return fn()
 }
 
-func (s *Store) read() (registry, error) {
-	var state registry
+func (s *Store) read() (Registry, error) {
+	var state Registry
 	if err := readJSON(filepath.Join(s.options.Directory, "registry.json"), &state); err != nil {
 		return state, err
 	}
-	if state.SchemaVersion != 1 || state.OwnerID != s.options.OwnerID || state.WorkspaceRoot != s.options.WorkspaceRoot || state.Claims == nil || state.Bindings == nil || state.Retired == nil {
-		return state, errors.New("unsupported or foreign workspace owner store")
+	return state, ValidateRegistry(s.options, state)
+}
+
+// ValidateRegistry checks persistent authority without touching the filesystem.
+// Migration uses this same schema-2 validator before publishing a candidate.
+func ValidateRegistry(options Options, state Registry) error {
+	if !absolute(options.Directory) || !absolute(options.WorkspaceRoot) || !absolute(options.SessionRoot) || !canonicalUUID(options.OwnerID) || options.Directory != filepath.Join(options.WorkspaceRoot, ".multica-runtime/state") {
+		return errors.New("invalid workspace validation options")
+	}
+	s := &Store{options: options}
+	if state.SchemaVersion != SchemaVersion || state.OwnerID != options.OwnerID || state.WorkspaceRoot != options.WorkspaceRoot || state.Claims == nil || state.Bindings == nil || state.Retired == nil {
+		return errors.New("unsupported or foreign workspace owner store; schema 1 requires explicit migration")
 	}
 	for key, c := range state.Claims {
-		if key != c.ID || !canonicalUUID(c.ID) || c.WorkspaceID == "" || c.AgentID == "" || !fingerprint(c.Grant) || c.ObservedAt.IsZero() || c.RepositoryURLs == nil || !validRef(c.Environment) || (!c.Denied && !fingerprint(c.TokenHash)) || (c.Denied && c.TokenHash != "") {
-			return state, errors.New("corrupt workspace claim authority")
+		if key != c.ID || !canonicalUUID(c.ID) || c.WorkspaceID == "" || c.AgentID == "" || !fingerprint(c.Grant) || c.ObservedAt.IsZero() || c.RepositoryURLs == nil || !validClaimRuntime(c) || (!c.Denied && !fingerprint(c.TokenHash)) || (c.Denied && c.TokenHash != "") {
+			return errors.New("corrupt workspace claim authority")
 		}
 		if (c.BoundRoot == "") != (c.WorkerSubPath == "") || (c.BoundRoot != "" && (!s.preparationRoot(c.BoundRoot) || !workerSubPath(c.WorkerSubPath))) {
-			return state, errors.New("corrupt workspace storage authority")
+			return errors.New("corrupt workspace storage authority")
 		}
 		if c.Grant != scopeDigest(c.WorkspaceID, c.AgentID, c.IssueID, c.ChatID, c.ProjectID, c.RepositoryURLs) {
-			return state, errors.New("claim scope fingerprint differs from persisted authority")
+			return errors.New("claim scope fingerprint differs from persisted authority")
 		}
 		for i, u := range c.RepositoryURLs {
 			if u == "" || strings.TrimSpace(u) != u || (i > 0 && c.RepositoryURLs[i-1] >= u) {
-				return state, errors.New("corrupt repository scope")
+				return errors.New("corrupt repository scope")
 			}
 		}
 	}
 	for _, c := range state.Claims {
+		if (c.PriorWorkDir != "" && (!s.preparationRoot(filepath.Dir(c.PriorWorkDir)) || filepath.Base(c.PriorWorkDir) != "workdir")) || (c.PriorSession != "" && (c.PriorWorkDir == "" || !s.sessionPath(c.PriorSession))) {
+			return errors.New("corrupt prior workspace or session path")
+		}
 		if c.TaskEnvKeys == nil {
-			return state, errors.New("claim has no task environment provenance")
+			return errors.New("claim has no task environment provenance")
 		}
 		for i, key := range c.TaskEnvKeys {
 			if !envName(key) || (i > 0 && c.TaskEnvKeys[i-1] >= key) {
-				return state, errors.New("corrupt task environment provenance")
+				return errors.New("corrupt task environment provenance")
 			}
 		}
 	}
 	for key, b := range state.Bindings {
 		if key != b.Root || !s.preparationRoot(b.Root) || !canonicalUUID(b.Identity) || !fingerprint(b.Grant) || !workerSubPath(b.WorkerSubPath) || b.Sessions == nil {
-			return state, errors.New("corrupt workspace binding")
+			return errors.New("corrupt workspace binding")
 		}
 		for session, ref := range b.Sessions {
-			if !s.sessionPath(session) || !validRef(ref) {
-				return state, errors.New("corrupt session authority")
+			if !s.sessionPath(session) || !validSessionRuntime(ref) {
+				return errors.New("corrupt session authority")
 			}
 		}
 	}
 	for storage, tombstone := range state.Retired {
 		if !workerSubPath(storage) || !canonicalUUID(tombstone) {
-			return state, errors.New("corrupt storage retirement")
+			return errors.New("corrupt storage retirement")
 		}
 	}
 	storageScopes := map[string]string{}
 	type sessionAuthority struct {
 		storage   string
-		reference environment.Ref
+		reference SessionRecord
 	}
 	sessions := map[string]sessionAuthority{}
 	for _, binding := range state.Bindings {
 		if grant, known := storageScopes[binding.WorkerSubPath]; known && grant != binding.Grant {
-			return state, errors.New("worker storage is bound to conflicting repository scopes")
+			return errors.New("worker storage is bound to conflicting repository scopes")
 		}
 		storageScopes[binding.WorkerSubPath] = binding.Grant
 		for session, ref := range binding.Sessions {
 			if prior, known := sessions[session]; known && (prior.storage != binding.WorkerSubPath || !prior.reference.Equal(ref)) {
-				return state, errors.New("session has conflicting storage or environment authority")
+				return errors.New("session has conflicting storage or runtime authority")
 			}
 			sessions[session] = sessionAuthority{binding.WorkerSubPath, ref}
 		}
@@ -225,21 +253,42 @@ func (s *Store) read() (registry, error) {
 		}
 		binding, ok := state.Bindings[claim.BoundRoot]
 		if !ok || claim.Grant != binding.Grant || claim.WorkerSubPath != binding.WorkerSubPath {
-			return state, errors.New("claim and storage binding authority disagree")
+			return errors.New("claim and storage binding authority disagree")
 		}
 		claimedStorage[claim.WorkerSubPath] = true
 	}
 	for storage := range storageScopes {
 		if !claimedStorage[storage] {
-			return state, errors.New("storage binding has no observed claim authority")
+			return errors.New("storage binding has no observed claim authority")
 		}
 	}
 	for storage := range state.Retired {
 		if !claimedStorage[storage] {
-			return state, errors.New("retirement has no observed storage authority")
+			return errors.New("retirement has no observed storage authority")
 		}
 	}
-	return state, nil
+	return nil
+}
+
+func validClaimRuntime(c Claim) bool {
+	switch c.ExecutionState {
+	case "observed":
+		return c.RuntimeRef != nil && c.RuntimeRef.Validate() == nil
+	case "unobserved":
+		return c.RuntimeRef == nil
+	default:
+		return false
+	}
+}
+func validSessionRuntime(s SessionRecord) bool {
+	switch s.State {
+	case "active":
+		return s.RuntimeRef != nil && s.RuntimeRef.Validate() == nil
+	case "archived":
+		return s.RuntimeRef == nil
+	default:
+		return false
+	}
 }
 
 func scopeDigest(workspaceID, agentID, issueID, chatID, projectID string, urls []string) string {
@@ -247,7 +296,10 @@ func scopeDigest(workspaceID, agentID, issueID, chatID, projectID string, urls [
 	return digest(string(raw))
 }
 
-func (s *Store) write(state registry) error {
+func (s *Store) write(state Registry) error {
+	if err := ValidateRegistry(s.options, state); err != nil {
+		return err
+	}
 	raw, err := json.Marshal(state)
 	if err != nil {
 		return err
@@ -266,6 +318,15 @@ func readJSON(path string, value any) error {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return err
+	}
+	var header struct {
+		SchemaVersion int `json:"schemaVersion"`
+	}
+	if err := json.Unmarshal(raw, &header); err != nil {
+		return err
+	}
+	if header.SchemaVersion == 1 {
+		return diagnostics.AtPath("workspace_migration_required", path, ErrMigrationRequired)
 	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
@@ -349,9 +410,5 @@ func (s *Store) preparationRoot(root string) bool {
 func (s *Store) sessionPath(path string) bool {
 	return absolute(path) && filepath.Dir(path) == s.options.SessionRoot && strings.HasSuffix(filepath.Base(path), ".jsonl")
 }
-func validRef(ref environment.Ref) bool { return ref.Validate() == nil }
-func sameRef(a, b environment.Ref) bool {
-	left, _ := json.Marshal(a)
-	right, _ := json.Marshal(b)
-	return bytes.Equal(left, right)
-}
+func validRef(ref runtimeimage.Ref) bool { return ref.Validate() == nil }
+func sameRef(a, b runtimeimage.Ref) bool { return a.Equal(b) }

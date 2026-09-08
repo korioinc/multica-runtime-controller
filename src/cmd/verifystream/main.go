@@ -142,9 +142,10 @@ func run(kubeconfig, namespace, selectionPath, requestPath, evidencePath string)
 	if err != nil {
 		return err
 	}
-	if sample.OwnerID != selection.OwnerID || !sample.Environment.Equal(selection.Environment) || sample.Provider != "pi" {
+	if sample.OwnerID != selection.OwnerID || !sample.RuntimeRef.Equal(selection.RuntimeRef) || sample.Provider != "pi" {
 		return errors.New("sample request does not belong to the current Pi fixture environment")
 	}
+	sample.Snapshots = selection.Snapshots
 	session, err := wire.PiSession(sample)
 	if err != nil {
 		return err
@@ -206,7 +207,7 @@ func (f *streamFixture) severCase(ctx context.Context, target, session, mode str
 	if _, err := wire.Decode(raw); err != nil {
 		return proof, err
 	}
-	ref := runtimekube.Reference{Namespace: f.selection.Namespace, Owner: f.selection.Controller, TaskID: request.TaskID, StorageID: filepath.Base(request.WorkerSubPath), AttemptID: request.AttemptID, PodName: "task-worker-" + filepath.Base(request.WorkerSubPath), SecretName: "task-request-" + request.AttemptID, RequestDigest: wire.Digest(raw), CoreImage: request.Environment.CoreImage, EnvironmentImage: request.Environment.EnvironmentImage, EnvironmentID: request.Environment.EnvironmentID, FixedNode: f.selection.Worker.SingleNodeName}
+	ref := runtimekube.Reference{Namespace: f.selection.Namespace, Owner: f.selection.Controller, TaskID: request.TaskID, StorageID: filepath.Base(request.WorkerSubPath), AttemptID: request.AttemptID, PodName: "task-worker-" + filepath.Base(request.WorkerSubPath), SecretName: "task-request-" + request.AttemptID, RequestDigest: wire.Digest(raw), RuntimeRef: request.RuntimeRef, Snapshots: request.Snapshots, FixedNode: f.selection.Worker.SingleNodeName}
 	ref.PodDigest, err = runtimekube.PodFingerprint(f.selection.Worker, ref, request, f.selection.Gateway)
 	if err != nil {
 		return proof, err
@@ -339,7 +340,7 @@ func (f *streamFixture) awaitReady(ctx context.Context, ref runtimekube.Referenc
 	})
 }
 func (f *streamFixture) sdkExecute(ctx context.Context, config *rest.Config, ref runtimekube.Reference, input io.Reader, output, stderr io.Writer) error {
-	options := &corev1.PodExecOptions{Container: "worker", Command: []string{wire.CoreRoot + "/runtime", "worker", "execute", "--request-digest=" + ref.RequestDigest, "--pod-uid=" + ref.PodUID, "--stdin=true", "--stdout=true", "--stderr=true"}, Stdin: true, Stdout: true, Stderr: true}
+	options := &corev1.PodExecOptions{Container: "worker", Command: []string{wire.ControllerRoot + "/runtime", "worker", "execute", "--request-digest=" + ref.RequestDigest, "--pod-uid=" + ref.PodUID, "--stdin=true", "--stdout=true", "--stderr=true"}, Stdin: true, Stdout: true, Stderr: true}
 	target := f.api.CoreV1().RESTClient().Post().Namespace(ref.Namespace).Resource("pods").Name(ref.PodName).SubResource("exec").VersionedParams(options, scheme.ParameterCodec).URL()
 	executor, err := remotecommand.NewSPDYExecutor(config, http.MethodPost, target)
 	if err != nil {

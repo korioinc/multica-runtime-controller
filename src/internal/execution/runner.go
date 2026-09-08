@@ -12,8 +12,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/korioinc/multica-runtime-controller/internal/checkout"
-	"github.com/korioinc/multica-runtime-controller/internal/environment"
 	"github.com/korioinc/multica-runtime-controller/internal/kubernetes"
+	"github.com/korioinc/multica-runtime-controller/internal/runtimeimage"
 	"github.com/korioinc/multica-runtime-controller/internal/wire"
 	"github.com/korioinc/multica-runtime-controller/internal/workspace"
 )
@@ -23,7 +23,7 @@ type Runner struct {
 	resources *kubernetes.Client
 	store     *workspace.Store
 	journal   *journal
-	manifest  environment.Manifest
+	manifest  runtimeimage.Descriptor
 }
 type Result struct {
 	Code                         int
@@ -32,14 +32,14 @@ type Result struct {
 }
 
 type AttemptError struct {
-	TaskID, AttemptID, EnvironmentID string
-	Cause                            error
+	TaskID, AttemptID, ImageBuildID string
+	Cause                           error
 }
 
 func (e *AttemptError) Error() string { return "task execution failed" }
 func (e *AttemptError) Unwrap() error { return e.Cause }
 
-func NewRunner(s Selection, resources *kubernetes.Client, store *workspace.Store, manifest environment.Manifest) (*Runner, error) {
+func NewRunner(s Selection, resources *kubernetes.Client, store *workspace.Store, manifest runtimeimage.Descriptor) (*Runner, error) {
 	if err := s.Validate(); err != nil {
 		return nil, err
 	}
@@ -58,7 +58,7 @@ func (r *Runner) Run(ctx context.Context, request wire.Request, streams kubernet
 	generatedAttempt := ""
 	defer func() {
 		if result.ExecutionError != nil {
-			result.ExecutionError = &AttemptError{TaskID: request.TaskID, AttemptID: generatedAttempt, EnvironmentID: r.selection.Environment.EnvironmentID, Cause: result.ExecutionError}
+			result.ExecutionError = &AttemptError{TaskID: request.TaskID, AttemptID: generatedAttempt, ImageBuildID: r.selection.RuntimeRef.ImageBuildID, Cause: result.ExecutionError}
 		}
 	}()
 	fail := func(err error) Result { return Result{Code: 1, ExecutionError: err} }
@@ -74,8 +74,8 @@ func (r *Runner) Run(ctx context.Context, request wire.Request, streams kubernet
 	if err != nil {
 		return fail(err)
 	}
-	if !claim.Environment.Equal(r.selection.Environment) {
-		return fail(errors.New("task_authorization: claim environment changed"))
+	if claim.RuntimeRef == nil || !claim.RuntimeRef.Equal(r.selection.RuntimeRef) {
+		return fail(errors.New("task_authorization: claim runtime changed"))
 	}
 	request.Env = slices.DeleteFunc(request.Env, func(entry string) bool {
 		key, _, _ := strings.Cut(entry, "=")
@@ -86,7 +86,7 @@ func (r *Runner) Run(ctx context.Context, request wire.Request, streams kubernet
 	if err != nil {
 		return fail(err)
 	}
-	binding, err := r.store.Bind(claim, root, session, r.selection.Environment)
+	binding, err := r.store.Bind(claim, root, session, r.selection.RuntimeRef)
 	if err != nil {
 		return fail(err)
 	}
@@ -101,9 +101,9 @@ func (r *Runner) Run(ctx context.Context, request wire.Request, streams kubernet
 		return fail(err)
 	}
 	request.RepositoryURLs = claim.RepositoryURLs
-	request.SchemaVersion = 1
-	request.Environment = r.selection.Environment
-	request.EnvironmentInput = r.selection.Input
+	request.SchemaVersion = 2
+	request.RuntimeRef = r.selection.RuntimeRef
+	request.Snapshots = r.selection.Snapshots
 	request.OwnerID = r.selection.OwnerID
 	request.AttemptID = uuid.NewString()
 	generatedAttempt = request.AttemptID
@@ -130,7 +130,7 @@ func (r *Runner) Run(ctx context.Context, request wire.Request, streams kubernet
 	if _, err := wire.Decode(raw); err != nil {
 		return fail(err)
 	}
-	a := &attempt{SchemaVersion: 1, OwnerID: r.selection.OwnerID, Created: time.Now().UTC(), Ref: kubernetes.Reference{Namespace: r.selection.Namespace, Owner: r.selection.Controller, TaskID: request.TaskID, StorageID: storageID, AttemptID: request.AttemptID, PodName: "task-worker-" + storageID, SecretName: "task-request-" + request.AttemptID, RequestDigest: wire.Digest(raw), CoreImage: request.Environment.CoreImage, EnvironmentImage: request.Environment.EnvironmentImage, EnvironmentID: request.Environment.EnvironmentID}}
+	a := &attempt{SchemaVersion: 2, OwnerID: r.selection.OwnerID, Created: time.Now().UTC(), Ref: kubernetes.Reference{Namespace: r.selection.Namespace, Owner: r.selection.Controller, TaskID: request.TaskID, StorageID: storageID, AttemptID: request.AttemptID, PodName: "task-worker-" + storageID, SecretName: "task-request-" + request.AttemptID, RequestDigest: wire.Digest(raw), RuntimeRef: request.RuntimeRef, Snapshots: request.Snapshots}}
 	a.Ref.FixedNode = r.selection.Worker.SingleNodeName
 	a.Ref.PodDigest, err = kubernetes.PodFingerprint(r.selection.Worker, a.Ref, request, r.selection.Gateway)
 	if err != nil {
@@ -144,7 +144,7 @@ func (r *Runner) Run(ctx context.Context, request wire.Request, streams kubernet
 		defer cancel()
 		result.CleanupError = r.cleanup(cleanup, a)
 		if result.CleanupError != nil {
-			slog.Warn("task resources await recovery", "phase", "cleanup", "error_class", "cleanup_pending", "environmentID", r.selection.Environment.EnvironmentID, "task", request.TaskID, "attempt", request.AttemptID)
+			slog.Warn("task resources await recovery", "phase", "cleanup", "error_class", "cleanup_pending", "imageBuildID", r.selection.RuntimeRef.ImageBuildID, "task", request.TaskID, "attempt", request.AttemptID)
 		}
 	}()
 	a.SecretStarted = true
@@ -190,11 +190,14 @@ func Launch(ctx context.Context, provider string, args, env []string, directory 
 	if err != nil {
 		return err
 	}
-	_, manifest, err := environment.Check(wire.EnvironmentRoot, wire.CoreRoot, s.Input, &s.Environment)
+	manifest, digest, err := runtimeimage.Check(ctx, runtimeimage.Root, wire.ControllerRoot, s.RuntimeRef.Platform)
 	if err != nil {
 		return err
 	}
-	path, err := environment.ProviderPath(wire.EnvironmentRoot, manifest, provider)
+	if err := runtimeimage.Match(manifest, digest, s.RuntimeRef); err != nil {
+		return err
+	}
+	path, err := runtimeimage.ProviderPath(manifest, provider)
 	if err != nil {
 		return err
 	}

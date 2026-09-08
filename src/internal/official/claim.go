@@ -50,7 +50,7 @@ func (b *bridge) claim(raw []byte) ([]byte, error) {
 		if json.Unmarshal(rawTask, &task) != nil || json.Unmarshal(rawTask, &fields[i]) != nil || fields[i] == nil {
 			return nil, errors.New("invalid official task")
 		}
-		observation := workspace.Observation{ID: task.ID, WorkspaceID: task.WorkspaceID, AgentID: task.AgentID, IssueID: task.IssueID, ChatID: task.ChatID, ProjectID: task.ProjectID, AuthToken: task.AuthToken, PriorWorkDir: task.PriorWorkDir, PriorSession: task.PriorSession, ExecutionMode: task.ExecutionMode, Environment: b.environment}
+		observation := workspace.Observation{ID: task.ID, WorkspaceID: task.WorkspaceID, AgentID: task.AgentID, IssueID: task.IssueID, ChatID: task.ChatID, ProjectID: task.ProjectID, AuthToken: task.AuthToken, PriorWorkDir: task.PriorWorkDir, PriorSession: task.PriorSession, ExecutionMode: task.ExecutionMode, RuntimeRef: b.runtimeRef}
 		if task.Agent != nil {
 			for key := range task.Agent.CustomEnv {
 				observation.TaskEnvKeys = append(observation.TaskEnvKeys, key)

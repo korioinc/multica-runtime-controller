@@ -5,26 +5,30 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
-	"fmt"
 	"github.com/go-logr/logr"
 	"io"
 	"k8s.io/klog/v2"
 	"log/slog"
+	"maps"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"syscall"
 	"time"
 
+	"github.com/korioinc/multica-runtime-controller/internal/configuration"
 	"github.com/korioinc/multica-runtime-controller/internal/core"
-	"github.com/korioinc/multica-runtime-controller/internal/environment"
+	"github.com/korioinc/multica-runtime-controller/internal/diagnostics"
 	"github.com/korioinc/multica-runtime-controller/internal/execution"
 	"github.com/korioinc/multica-runtime-controller/internal/kubernetes"
+	"github.com/korioinc/multica-runtime-controller/internal/migration"
 	"github.com/korioinc/multica-runtime-controller/internal/official"
+	"github.com/korioinc/multica-runtime-controller/internal/runtimeimage"
 	"github.com/korioinc/multica-runtime-controller/internal/wire"
 )
 
@@ -34,19 +38,22 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 	err := dispatch(ctx, os.Args)
+	if errors.Is(err, flag.ErrHelp) {
+		return
+	}
 	if err != nil {
 		var providerExit *execution.ExitError
 		if errors.As(err, &providerExit) {
 			os.Exit(providerExit.Code)
 		}
 		logger := slog.Default()
-		id := os.Getenv("MULTICA_ENVIRONMENT_ID")
+		id := os.Getenv("MULTICA_RUNTIME_IMAGE_BUILD_ID")
 		task, attempt := os.Getenv("MULTICA_TASK_ID"), os.Getenv("MULTICA_ATTEMPT_ID")
 		var attemptFailure *execution.AttemptError
 		if errors.As(err, &attemptFailure) {
-			id, task, attempt = attemptFailure.EnvironmentID, attemptFailure.TaskID, attemptFailure.AttemptID
+			id, task, attempt = attemptFailure.ImageBuildID, attemptFailure.TaskID, attemptFailure.AttemptID
 		}
-		if !core.ValidSHA(id) {
+		if !wire.UUID(id) {
 			id = ""
 		}
 		reason := "operation_failed"
@@ -61,14 +68,26 @@ func main() {
 		switch {
 		case errors.Is(err, core.ErrCompatibility):
 			class = "core_compatibility"
-		case errors.Is(err, environment.ErrIntegrity):
-			class = "environment_integrity"
+		case errors.Is(err, runtimeimage.ErrCompatibility):
+			class = "runtime_image_compatibility"
 		case errors.Is(err, execution.ErrTransport) || errors.Is(err, kubernetes.ErrTransport):
 			class = "transport"
 		case errors.Is(err, execution.ErrProviderStart):
 			class = "provider_start"
 		}
-		attributes := []any{"phase", phase, "error_class", class, "reason", reason, "environmentID", id}
+		var diagnostic *diagnostics.Error
+		if errors.As(err, &diagnostic) {
+			reason = diagnostic.Reason
+		}
+		attributes := []any{"phase", phase, "error_class", class, "reason", reason, "imageBuildID", id}
+		if diagnostic != nil {
+			if diagnostic.Path != "" {
+				attributes = append(attributes, "path", diagnostic.Path)
+			}
+			if diagnostic.SourceGroup != "" {
+				attributes = append(attributes, "sourceGroup", diagnostic.SourceGroup)
+			}
+		}
 		if wire.UUID(task) {
 			attributes = append(attributes, "task", task)
 		}
@@ -92,7 +111,7 @@ func configureDiagnostics(args []string) (string, func()) {
 		phase = "provider"
 	} else if len(args) > 1 {
 		switch args[1] {
-		case "materialize", "environment", "workspace", "controller", "worker", "home":
+		case "version", "image", "workspace", "controller", "worker", "home":
 			phase = args[1]
 		}
 	}
@@ -118,27 +137,6 @@ func value(key, fallback string) string {
 	}
 	return fallback
 }
-func input() (environment.Input, error) {
-	return environment.ReadInput(value("MULTICA_ENVIRONMENT_INPUT_FILE", wire.InputPath))
-}
-func checkedInput() (environment.Input, error) {
-	in, err := input()
-	if err != nil {
-		return in, err
-	}
-	if in.Platform != core.HostPlatform() {
-		return in, fmt.Errorf("%w: selected platform differs from running process", core.ErrCompatibility)
-	}
-	id, err := environment.Identity(in)
-	if err != nil {
-		return in, err
-	}
-	if configured := os.Getenv("MULTICA_ENVIRONMENT_ID"); configured != "" && configured != id {
-		return in, errors.New("environment_integrity: configured identity mismatch")
-	}
-	return in, nil
-}
-
 func dispatch(ctx context.Context, args []string) error {
 	if provider := wire.Provider(filepath.Base(args[0])); provider != "" {
 		cwd, err := os.Getwd()
@@ -151,99 +149,31 @@ func dispatch(ctx context.Context, args []string) error {
 		return errors.New("runtime role required")
 	}
 	switch args[1] {
-	case "materialize":
-		platform := value("MULTICA_PLATFORM", core.HostPlatform())
-		if platform != core.HostPlatform() {
-			return errors.New("core platform mismatch")
+	case "version":
+		if len(args) != 2 {
+			return errors.New("usage: runtime version")
 		}
-		if _, err := core.Materialize(value("MULTICA_CORE_SOURCE", "/artifact"), value("MULTICA_CORE_ROOT", wire.CoreRoot), platform); err != nil {
-			return err
-		}
-		if os.Getenv("MULTICA_TOOLS_STORE") != "" {
-			in, err := checkedInput()
-			if err != nil {
-				return err
-			}
-			id, err := environment.Identity(in)
-			if err != nil {
-				return err
-			}
-			return environment.Layout(os.Getenv("MULTICA_TOOLS_STORE"), value("MULTICA_OWNER_ID", os.Getenv("MULTICA_DAEMON_ID")), id)
-		}
-		return nil
-	case "environment":
-		if len(args) < 3 {
-			return errors.New("environment operation required")
-		}
-		if args[2] == "capture" {
-			raw, err := json.Marshal(os.Environ())
-			if err != nil {
-				return err
-			}
-			if err := os.WriteFile(value("MULTICA_ENVIRONMENT_BASE_ENV_FILE", wire.ControlRoot+"/image-env.json"), raw, 0600); err != nil {
-				return err
-			}
-			// The following init mounts the external lock over this file while
-			// the containing control volume is read-only.
-			file, err := os.OpenFile(wire.ControlRoot+"/prepare.lock", os.O_CREATE|os.O_WRONLY, 0600)
-			if err != nil {
-				return err
-			}
-			return file.Close()
-		}
-		if args[2] == "identity" {
-			in, err := input()
-			if err != nil {
-				return err
-			}
-			id, err := environment.Identity(in)
-			if err != nil {
-				return err
-			}
-			_, err = fmt.Fprintln(os.Stdout, id)
-			return err
-		}
-		in, err := checkedInput()
+		contract, err := core.Check(core.Root, core.HostPlatform())
 		if err != nil {
 			return err
 		}
-		id, err := environment.Identity(in)
-		if err != nil {
-			return err
+		return json.NewEncoder(os.Stdout).Encode(contract)
+	case "image":
+		if len(args) != 3 || args[2] != "verify" {
+			return errors.New("usage: runtime image verify")
 		}
-		switch args[2] {
-		case "layout":
-			return environment.Layout(value("MULTICA_TOOLS_STORE", "/tools-store"), value("MULTICA_OWNER_ID", os.Getenv("MULTICA_DAEMON_ID")), id)
-		case "prepare":
-			timeout, err := strconv.Atoi(value("MULTICA_ENVIRONMENT_TIMEOUT_SECONDS", "1200"))
-			if err != nil || timeout < 1 {
-				return errors.New("invalid prepare timeout")
-			}
-			var baseEnv []string
-			raw, err := os.ReadFile(value("MULTICA_ENVIRONMENT_BASE_ENV_FILE", wire.ControlRoot+"/image-env.json"))
-			if err != nil {
-				return err
-			}
-			if err := json.Unmarshal(raw, &baseEnv); err != nil {
-				return err
-			}
-			_, err = environment.Prepare(ctx, environment.Options{Root: value("MULTICA_ENVIRONMENT_ROOT", wire.EnvironmentRoot), CoreRoot: value("MULTICA_CORE_ROOT", wire.CoreRoot), Input: in, ExpectedID: id, ScriptPath: value("MULTICA_ENVIRONMENT_SCRIPT_FILE", "/etc/multica/bootstrap/script.sh"), LockPath: os.Getenv("MULTICA_ENVIRONMENT_LOCK_FILE"), InstallEnv: os.Environ(), BaseEnv: baseEnv, Timeout: time.Duration(timeout) * time.Second, Output: os.Stdout})
-			return err
-		case "check":
-			_, _, err := environment.Check(value("MULTICA_ENVIRONMENT_ROOT", wire.EnvironmentRoot), value("MULTICA_CORE_ROOT", wire.CoreRoot), in, nil)
-			return err
-		}
+		_, _, err := runtimeimage.Check(ctx, runtimeimage.Root, core.Root, core.HostPlatform())
+		return err
 	case "workspace":
-		if len(args) >= 3 && args[2] == "layout" {
-			if err := execution.LayoutWorkspace(value("MULTICA_OWNER_ID", os.Getenv("MULTICA_DAEMON_ID"))); err != nil {
-				return err
-			}
-			return execution.LayoutHome(args[3:])
+		if len(args) >= 3 && args[2] == "migrate" {
+			return migrateWorkspace(args[3:])
 		}
+		return errors.New("usage: runtime workspace migrate --root PATH --owner-id UUID (--dry-run | --expected-source-sha256 DIGEST --commit)")
 	case "home":
 		if len(args) >= 3 && args[2] == "layout" {
-			return execution.LayoutHome(args[3:])
+			return execution.LayoutHome(ctx, args[3:])
 		}
+		return errors.New("usage: runtime home layout --private-root PATH [--config-copy JSON ...]")
 	case "controller":
 		return controller(ctx)
 	case "worker":
@@ -285,47 +215,76 @@ func dispatch(ctx context.Context, args []string) error {
 }
 
 func controller(ctx context.Context) error {
-	in, err := checkedInput()
+	descriptor, descriptorDigest, err := runtimeimage.Check(ctx, runtimeimage.Root, core.Root, core.HostPlatform())
 	if err != nil {
 		return err
 	}
-	ref, manifest, err := environment.Check(wire.EnvironmentRoot, wire.CoreRoot, in, nil)
+	// Receipt validation precedes the API read: a restarted B rootfs must never
+	// accept the old A status left briefly visible by the kubelet.
+	if err = runtimeimage.CheckReceipt(wire.ControlRoot, descriptor, descriptorDigest); err != nil {
+		return err
+	}
+	bundle, err := configuration.Read(wire.ControlRoot)
 	if err != nil {
+		return err
+	}
+	if err = execution.CheckPrivate(); err != nil {
 		return err
 	}
 	cfg, err := kubernetes.LoadConfig(value("MULTICA_WORKER_CONFIG_FILE", wire.WorkerConfigPath))
 	if err != nil {
 		return err
 	}
+	if cfg.Platform != descriptor.Platform {
+		return errors.New("worker policy differs from installed runtime platform")
+	}
 	ownerID := value("MULTICA_OWNER_ID", os.Getenv("MULTICA_DAEMON_ID"))
-	if ownerID != os.Getenv("MULTICA_DAEMON_ID") {
+	if ownerID != os.Getenv("MULTICA_DAEMON_ID") || !wire.UUID(ownerID) {
 		return errors.New("installation owner differs from daemon identity")
 	}
 	if cfg.SingleNodeName != "" && os.Getenv("POD_NODE_NAME") != cfg.SingleNodeName {
 		return errors.New("controller fixed Node mismatch")
 	}
-	if err := execution.LayoutWorkspace(ownerID); err != nil {
-		return err
-	}
-	store, err := execution.OpenWorkspace(ownerID)
-	if err != nil {
-		return err
-	}
-	if err := environment.CopySeed(wire.EnvironmentRoot, manifest, wire.Home); err != nil {
-		return err
-	}
-	if err := environment.CheckWritable(environment.Locations{Home: wire.Home, TmpDir: "/tmp", Workspace: wire.WorkspaceRoot}); err != nil {
-		return err
+	startupTimeout, err := time.ParseDuration(value("MULTICA_STARTUP_TIMEOUT", "120s"))
+	if err != nil || startupTimeout <= 0 {
+		return errors.New("startup timeout must be a positive duration")
 	}
 	resources, err := kubernetes.InCluster(os.Getenv("POD_NAMESPACE"))
 	if err != nil {
 		return err
 	}
-	owner, err := resources.Controller(ctx, os.Getenv("POD_NAME"), os.Getenv("POD_UID"), cfg.SingleNodeName)
+	startup, stopStartup := context.WithTimeout(ctx, startupTimeout)
+	defer stopStartup()
+	binding, err := resources.BindImage(startup, os.Getenv("POD_NAME"), os.Getenv("POD_UID"), value("POD_CONTAINER_NAME", "controller"), os.Getenv("POD_NODE_NAME"), descriptor.Platform)
 	if err != nil {
 		return err
 	}
-	vars, err := execution.SelectedEnvironment(manifest, os.Environ(), environment.Locations{Root: wire.EnvironmentRoot, Home: wire.Home, TmpDir: "/tmp", Workspace: wire.WorkspaceRoot})
+	ref, err := descriptor.Reference(binding.Image, descriptorDigest, bundle.Digest)
+	if err != nil {
+		return err
+	}
+	var snapshots []configuration.SnapshotRef
+	if _, err = os.Lstat(wire.SelectionPath); err == nil {
+		previous, err := execution.LoadSelection()
+		if err != nil {
+			return err
+		}
+		if previous.Controller != binding.Owner || previous.Namespace != resources.Namespace || previous.OwnerID != ownerID || !previous.RuntimeRef.Equal(ref) {
+			return errors.New("restarted controller differs from its persisted execution selection")
+		}
+		if err = resources.ValidateSnapshots(startup, binding.Owner, previous.Snapshots, ref.ConfigurationDigest); err != nil {
+			return err
+		}
+		snapshots = previous.Snapshots
+	} else if os.IsNotExist(err) {
+		snapshots, err = resources.EnsureSnapshots(startup, binding.Owner, bundle)
+		if err != nil {
+			return err
+		}
+	} else {
+		return err
+	}
+	vars, err := execution.SelectedEnvironment(descriptor, os.Environ(), runtimeimage.Locations{Home: wire.Home, TmpDir: "/tmp", Workspace: wire.WorkspaceRoot})
 	if err != nil {
 		return err
 	}
@@ -333,15 +292,29 @@ func controller(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	selection := execution.Selection{SchemaVersion: 1, OwnerID: ownerID, Controller: owner, Namespace: resources.Namespace, Gateway: os.Getenv("MULTICA_DAEMON_PROXY_URL"), Backend: backend, Input: in, Environment: ref, Worker: cfg, OperatorKeys: execution.OperatorNames(os.Environ())}
+	selection := execution.Selection{SchemaVersion: 2, OwnerID: ownerID, Controller: binding.Owner, Namespace: resources.Namespace, Gateway: os.Getenv("MULTICA_DAEMON_PROXY_URL"), Backend: backend, RuntimeRef: ref, Snapshots: snapshots, Worker: cfg, OperatorKeys: execution.OperatorNames(os.Environ())}
 	if err := execution.SaveSelection(selection); err != nil {
 		return err
 	}
-	runner, err := execution.NewRunner(selection, resources, store, manifest)
+	slog.Info("runtime image bound", "phase", "controller", "image", ref.Image, "platform", ref.Platform, "controllerBuild", ref.Controller.BuildID, "imageBuildID", ref.ImageBuildID)
+	// Application workspace mutations are admitted only after image and config
+	// identity have been tied to this controller Pod.
+	if err := execution.LayoutWorkspace(ownerID); err != nil {
+		return err
+	}
+	if err := execution.BindControllerSessions(); err != nil {
+		return err
+	}
+	store, err := execution.OpenWorkspace(ownerID)
 	if err != nil {
 		return err
 	}
-	bridge, err := official.NewBridge(official.BridgeOptions{BackendURL: backend, Store: store, Environment: ref, Providers: in.Providers})
+	runner, err := execution.NewRunner(selection, resources, store, descriptor)
+	if err != nil {
+		return err
+	}
+	providers := slices.Sorted(maps.Keys(descriptor.Providers))
+	bridge, err := official.NewBridge(official.BridgeOptions{BackendURL: backend, Store: store, RuntimeRef: ref, Providers: providers})
 	if err != nil {
 		return err
 	}
@@ -362,7 +335,7 @@ func controller(ctx context.Context) error {
 	if err != nil || heartbeat <= 0 {
 		return errors.New("invalid heartbeat interval")
 	}
-	process, err := official.Setup(official.DaemonOptions{CoreRoot: wire.CoreRoot, Home: wire.Home, TokenFile: os.Getenv("MULTICA_CONTROLLER_TOKEN_FILE"), DaemonID: ownerID, Capacity: capacity, PollInterval: poll, HeartbeatInterval: heartbeat, Name: value("MULTICA_RUNTIME_NAME", "runtime-controller"), BackendURL: backend, ProxyURL: "http://" + listener.Addr().String(), Providers: in.Providers, Environment: ref, Env: vars, Stdout: os.Stdout, Stderr: os.Stderr})
+	process, err := official.Setup(official.DaemonOptions{CoreRoot: wire.ControllerRoot, Home: wire.Home, TokenFile: os.Getenv("MULTICA_CONTROLLER_TOKEN_FILE"), DaemonID: ownerID, Capacity: capacity, PollInterval: poll, HeartbeatInterval: heartbeat, Name: value("MULTICA_RUNTIME_NAME", "runtime-controller"), BackendURL: backend, ProxyURL: "http://" + listener.Addr().String(), Providers: providers, RuntimeRef: ref, Env: vars, Stdout: os.Stdout, Stderr: os.Stderr})
 	if err != nil {
 		return err
 	}
@@ -385,10 +358,10 @@ func controller(ctx context.Context) error {
 }
 func errorClass(phase string) string {
 	switch phase {
-	case "materialize":
+	case "version":
 		return "core_compatibility"
-	case "environment":
-		return "environment_prepare"
+	case "image":
+		return "runtime_image_compatibility"
 	case "controller", "workspace", "home", "configuration":
 		return "configuration"
 	case "worker":
@@ -396,4 +369,25 @@ func errorClass(phase string) string {
 	default:
 		return "task_authorization"
 	}
+}
+
+func migrateWorkspace(args []string) error {
+	parser := flag.NewFlagSet("workspace migrate", flag.ContinueOnError)
+	root := parser.String("root", "", "existing workspace root")
+	owner := parser.String("owner-id", "", "existing installation UUID")
+	dryRun := parser.Bool("dry-run", false, "validate without writing")
+	commit := parser.Bool("commit", false, "commit the validated conversion")
+	expected := parser.String("expected-source-sha256", "", "source digest from dry-run")
+	if err := parser.Parse(args); err != nil {
+		return err
+	}
+	if parser.NArg() != 0 || *dryRun == *commit {
+		parser.Usage()
+		return diagnostics.Wrap("migration_mode_invalid", errors.New("workspace migrate requires exactly one of --dry-run or --commit"))
+	}
+	result, err := migration.Migrate(migration.Options{Root: *root, OwnerID: *owner, Commit: *commit, ExpectedSourceSHA256: *expected})
+	if err != nil {
+		return err
+	}
+	return json.NewEncoder(os.Stdout).Encode(result)
 }

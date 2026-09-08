@@ -15,7 +15,7 @@ func (r *Runner) cleanup(ctx context.Context, a *attempt) error {
 	recordErr := r.journal.save(a)
 	unresolved := false
 	if a.SecretStarted && a.Ref.SecretUID == "" {
-		uid, err := r.resources.ResolveSecret(ctx, a.Ref)
+		uid, err := r.resources.ResolveCleanupSecret(ctx, a.Ref)
 		if err != nil {
 			return errors.Join(recordErr, err)
 		}
@@ -29,7 +29,7 @@ func (r *Runner) cleanup(ctx context.Context, a *attempt) error {
 		}
 	}
 	if a.PodStarted && a.Ref.PodUID == "" {
-		uid, err := r.resources.ResolvePod(ctx, a.Ref)
+		uid, err := r.resources.ResolveCleanupPod(ctx, a.Ref)
 		if err != nil {
 			return errors.Join(recordErr, err)
 		}

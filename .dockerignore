@@ -7,5 +7,5 @@
 !src/internal/
 !src/internal/**
 !scripts/
-!scripts/core_contract.py
+!scripts/core-contract.sh
 **/*_test.go

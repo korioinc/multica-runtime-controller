@@ -14,7 +14,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/korioinc/multica-runtime-controller/internal/environment"
+	"github.com/korioinc/multica-runtime-controller/internal/runtimeimage"
 	"github.com/korioinc/multica-runtime-controller/internal/workspace"
 )
 
@@ -23,17 +23,17 @@ const claimRoute = "/api/daemon/tasks/claim"
 const registerRoute = "/api/daemon/register"
 
 type BridgeOptions struct {
-	BackendURL  string
-	Store       *workspace.Store
-	Environment environment.Ref
-	Providers   []string
+	BackendURL string
+	Store      *workspace.Store
+	RuntimeRef runtimeimage.Ref
+	Providers  []string
 }
 type bridge struct {
-	target      *url.URL
-	store       *workspace.Store
-	environment environment.Ref
-	providers   map[string]bool
-	proxy       *httputil.ReverseProxy
+	target     *url.URL
+	store      *workspace.Store
+	runtimeRef runtimeimage.Ref
+	providers  map[string]bool
+	proxy      *httputil.ReverseProxy
 }
 
 func NewBridge(options BridgeOptions) (http.Handler, error) {
@@ -42,23 +42,23 @@ func NewBridge(options BridgeOptions) (http.Handler, error) {
 		return nil, err
 	}
 	target, _ := url.Parse(origin)
-	if options.Store == nil || options.Environment.Validate() != nil {
+	if options.Store == nil || options.RuntimeRef.Validate() != nil {
 		return nil, errors.New("official bridge requires a verified environment and workspace store")
 	}
 	enabled, err := providerSet(options.Providers)
 	if err != nil {
 		return nil, err
 	}
-	if len(enabled) != len(options.Environment.Providers) {
+	if len(enabled) != len(options.RuntimeRef.Providers) {
 		return nil, errors.New("bridge provider set differs from verified environment")
 	}
-	for id := range options.Environment.Providers {
+	for id := range options.RuntimeRef.Providers {
 		if !enabled[id] {
 			return nil, errors.New("bridge provider set differs from verified environment")
 		}
 	}
-	b := &bridge{target: target, store: options.Store, environment: options.Environment, providers: enabled}
-	slog.Info("backend custom runtime profiles are unsupported", "phase", "official", "environmentID", options.Environment.EnvironmentID)
+	b := &bridge{target: target, store: options.Store, runtimeRef: options.RuntimeRef, providers: enabled}
+	slog.Info("backend custom runtime profiles are unsupported", "phase", "official", "imageBuildID", options.RuntimeRef.ImageBuildID)
 	b.proxy = &httputil.ReverseProxy{
 		Rewrite: func(request *httputil.ProxyRequest) {
 			request.SetURL(target)

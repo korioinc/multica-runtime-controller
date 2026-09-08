@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/korioinc/multica-runtime-controller/internal/environment"
+	"github.com/korioinc/multica-runtime-controller/internal/runtimeimage"
 )
 
 type Observation struct {
@@ -18,7 +18,7 @@ type Observation struct {
 	LocalDirectory, ExecutionMode                                                               string
 	RepositoryURLs                                                                              []string
 	TaskEnvKeys                                                                                 []string
-	Environment                                                                                 environment.Ref
+	RuntimeRef                                                                                  runtimeimage.Ref
 }
 type ReuseDecision struct{ ResetWorkDir, ResetSession bool }
 
@@ -37,8 +37,8 @@ func (s *Store) ObserveBatch(tasks []Observation) ([]ReuseDecision, error) {
 	decisions := make([]ReuseDecision, len(tasks))
 	seen := map[string]bool{}
 	for i, task := range tasks {
-		if !canonicalUUID(task.ID) || task.WorkspaceID == "" || task.AgentID == "" || !strings.HasPrefix(task.AuthToken, "mat_") || !validRef(task.Environment) || task.LocalDirectory != "" || (task.ExecutionMode != "" && task.ExecutionMode != "isolated") || seen[task.ID] {
-			return nil, errors.New("claim requires canonical managed task identity, credential and environment")
+		if !canonicalUUID(task.ID) || task.WorkspaceID == "" || task.AgentID == "" || !strings.HasPrefix(task.AuthToken, "mat_") || !validRef(task.RuntimeRef) || task.LocalDirectory != "" || (task.ExecutionMode != "" && task.ExecutionMode != "isolated") || seen[task.ID] {
+			return nil, errors.New("claim requires canonical managed task identity, credential and runtime")
 		}
 		seen[task.ID] = true
 		urls := slices.Clone(task.RepositoryURLs)
@@ -64,7 +64,7 @@ func (s *Store) ObserveBatch(tasks []Observation) ([]ReuseDecision, error) {
 		}
 		slices.Sort(keys)
 		keys = slices.Compact(keys)
-		claims[i] = Claim{ID: task.ID, WorkspaceID: task.WorkspaceID, AgentID: task.AgentID, IssueID: task.IssueID, ChatID: task.ChatID, ProjectID: task.ProjectID, Grant: scopeDigest(task.WorkspaceID, task.AgentID, task.IssueID, task.ChatID, task.ProjectID, urls), TokenHash: digest(task.AuthToken), RepositoryURLs: urls, TaskEnvKeys: keys, PriorWorkDir: task.PriorWorkDir, PriorSession: task.PriorSession, Environment: task.Environment, ObservedAt: time.Now().UTC()}
+		claims[i] = Claim{ID: task.ID, WorkspaceID: task.WorkspaceID, AgentID: task.AgentID, IssueID: task.IssueID, ChatID: task.ChatID, ProjectID: task.ProjectID, Grant: scopeDigest(task.WorkspaceID, task.AgentID, task.IssueID, task.ChatID, task.ProjectID, urls), TokenHash: digest(task.AuthToken), RepositoryURLs: urls, TaskEnvKeys: keys, PriorWorkDir: task.PriorWorkDir, PriorSession: task.PriorSession, ExecutionState: "observed", RuntimeRef: new(task.RuntimeRef), ObservedAt: time.Now().UTC()}
 	}
 	err := s.locked(func() error {
 		state, err := s.read()
@@ -98,7 +98,7 @@ func (s *Store) ObserveBatch(tasks []Observation) ([]ReuseDecision, error) {
 					decisions[i] = ReuseDecision{true, true}
 				} else {
 					ref, known := binding.Sessions[claim.PriorSession]
-					if claim.PriorSession != "" && (!known || !sameRef(ref, claim.Environment)) {
+					if claim.PriorSession != "" && (!known || ref.State != "active" || ref.RuntimeRef == nil || !sameRef(*ref.RuntimeRef, *claim.RuntimeRef)) {
 						claim.PriorSession = ""
 						decisions[i].ResetSession = true
 					}
@@ -122,7 +122,7 @@ func (s *Store) Lookup(taskID, token, workspaceID, agentID string) (Claim, error
 			return err
 		}
 		value, ok := state.Claims[taskID]
-		if !ok || value.Denied || token == "" || value.TokenHash != digest(token) || value.WorkspaceID != workspaceID || value.AgentID != agentID {
+		if !ok || value.Denied || value.ExecutionState != "observed" || value.RuntimeRef == nil || token == "" || value.TokenHash != digest(token) || value.WorkspaceID != workspaceID || value.AgentID != agentID {
 			return errors.New("provider does not match an observed task claim")
 		}
 		claim = value
@@ -133,10 +133,10 @@ func (s *Store) Lookup(taskID, token, workspaceID, agentID string) (Claim, error
 
 // Bind connects a freshly validated official root to independent worker data.
 // Root preparation and session files remain owned by the official daemon.
-func (s *Store) Bind(claim Claim, root, piSession string, ref environment.Ref) (Binding, error) {
+func (s *Store) Bind(claim Claim, root, piSession string, ref runtimeimage.Ref) (Binding, error) {
 	var result Binding
 	if !s.preparationRoot(root) || !validRef(ref) {
-		return result, errors.New("invalid official preparation root or environment")
+		return result, errors.New("invalid official preparation root or runtime")
 	}
 	if err := realDirectory(root); err != nil {
 		return result, err
@@ -150,7 +150,7 @@ func (s *Store) Bind(claim Claim, root, piSession string, ref environment.Ref) (
 			return err
 		}
 		current, ok := state.Claims[claim.ID]
-		if !ok || current.Denied || current.Grant != claim.Grant || current.TokenHash == "" || current.TokenHash != claim.TokenHash || !sameRef(current.Environment, ref) {
+		if !ok || current.Denied || current.ExecutionState != "observed" || current.RuntimeRef == nil || current.Grant != claim.Grant || current.TokenHash == "" || current.TokenHash != claim.TokenHash || !sameRef(*current.RuntimeRef, ref) {
 			return errors.New("claim changed before storage binding")
 		}
 		claim = current
@@ -181,7 +181,7 @@ func (s *Store) Bind(claim Claim, root, piSession string, ref environment.Ref) (
 			if owner.TaskID != claim.ID {
 				return errors.New("prior root lost its durable storage binding")
 			}
-			binding = Binding{Root: root, Identity: uuid.NewString(), Grant: claim.Grant, WorkerSubPath: filepath.Join(StoragePrefix, uuid.NewString()), Sessions: map[string]environment.Ref{}}
+			binding = Binding{Root: root, Identity: uuid.NewString(), Grant: claim.Grant, WorkerSubPath: filepath.Join(StoragePrefix, uuid.NewString()), Sessions: map[string]SessionRecord{}}
 			if claim.WorkerSubPath != "" {
 				previous, ok := state.Bindings[claim.BoundRoot]
 				if !ok || previous.Grant != claim.Grant || previous.WorkerSubPath != claim.WorkerSubPath || state.Retired[claim.WorkerSubPath] != "" {
@@ -198,18 +198,15 @@ func (s *Store) Bind(claim Claim, root, piSession string, ref environment.Ref) (
 			if !s.sessionPath(piSession) {
 				return errors.New("Pi session must be in the daemon session directory")
 			}
-			canonical, err := filepath.EvalSymlinks(piSession)
-			if err != nil || canonical != piSession {
-				return errors.New("Pi session must be a canonical regular file")
+			info, err := s.sessionFile(piSession)
+			if err != nil {
+				return err
 			}
-			info, err := os.Lstat(piSession)
-			if err != nil || !info.Mode().IsRegular() {
-				return errors.New("Pi session is not a regular file")
-			}
+
 			knownRef, known := binding.Sessions[piSession]
 			if known {
-				if !sameRef(knownRef, ref) {
-					return errors.New("Pi session belongs to another execution environment")
+				if knownRef.State != "active" || knownRef.RuntimeRef == nil || !sameRef(*knownRef.RuntimeRef, ref) {
+					return errors.New("Pi session is archived or belongs to another runtime")
 				}
 			} else {
 				for _, other := range state.Bindings {
@@ -220,7 +217,7 @@ func (s *Store) Bind(claim Claim, root, piSession string, ref environment.Ref) (
 				if info.Size() != 0 {
 					return errors.New("unapproved nonempty Pi session")
 				}
-				binding.Sessions[piSession] = ref
+				binding.Sessions[piSession] = SessionRecord{State: "active", RuntimeRef: new(ref)}
 			}
 		}
 		workerPath := filepath.Join(s.options.WorkspaceRoot, binding.WorkerSubPath)

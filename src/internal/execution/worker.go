@@ -13,14 +13,15 @@ import (
 	"time"
 
 	"github.com/korioinc/multica-runtime-controller/internal/checkout"
+	"github.com/korioinc/multica-runtime-controller/internal/configuration"
 	"github.com/korioinc/multica-runtime-controller/internal/core"
-	"github.com/korioinc/multica-runtime-controller/internal/environment"
+	"github.com/korioinc/multica-runtime-controller/internal/runtimeimage"
 	"github.com/korioinc/multica-runtime-controller/internal/wire"
 	"golang.org/x/sys/unix"
 )
 
-func readWorkerRequest(digest, uid string) (wire.Request, environment.Manifest, error) {
-	var empty environment.Manifest
+func readWorkerRequest(digest, uid string) (wire.Request, runtimeimage.Descriptor, error) {
+	var empty runtimeimage.Descriptor
 	if !core.ValidSHA(digest) || uid == "" || uid != os.Getenv("POD_UID") {
 		return wire.Request{}, empty, errors.New("worker Pod UID or request digest mismatch")
 	}
@@ -35,22 +36,38 @@ func readWorkerRequest(digest, uid string) (wire.Request, environment.Manifest, 
 	if err != nil {
 		return request, empty, err
 	}
-	if request.TaskID != os.Getenv("MULTICA_TASK_ID") || request.Environment.Platform != core.HostPlatform() {
+	if request.TaskID != os.Getenv("MULTICA_TASK_ID") || request.RuntimeRef.Platform != core.HostPlatform() {
 		return request, empty, errors.New("worker task or platform mismatch")
 	}
-	_, manifest, err := environment.Check(wire.EnvironmentRoot, wire.CoreRoot, request.EnvironmentInput, &request.Environment)
-	return request, manifest, err
+	manifest, imageDigest, err := runtimeimage.Check(context.Background(), runtimeimage.Root, wire.ControllerRoot, core.HostPlatform())
+	if err != nil {
+		return request, empty, err
+	}
+	if err := runtimeimage.Match(manifest, imageDigest, request.RuntimeRef); err != nil {
+		return request, empty, err
+	}
+	if err := runtimeimage.CheckReceipt(wire.ControlRoot, manifest, imageDigest); err != nil {
+		return request, empty, err
+	}
+	bundle, err := configuration.Read(wire.ControlRoot)
+	if err != nil {
+		return request, empty, err
+	}
+	if bundle.Digest != request.RuntimeRef.ConfigurationDigest {
+		return request, empty, errors.New("worker committed configuration differs from request")
+	}
+	if err := CheckPrivate(); err != nil {
+		return request, empty, err
+	}
+	return request, manifest, nil
 }
 
 func WorkerServe(ctx context.Context) error {
 	if os.Getpid() != 1 {
 		return errors.New("worker serve must own container PID 1")
 	}
-	request, manifest, err := readWorkerRequest(os.Getenv("MULTICA_REQUEST_DIGEST"), os.Getenv("POD_UID"))
+	request, _, err := readWorkerRequest(os.Getenv("MULTICA_REQUEST_DIGEST"), os.Getenv("POD_UID"))
 	if err != nil {
-		return err
-	}
-	if err := environment.CopySeed(wire.EnvironmentRoot, manifest, wire.Home); err != nil {
 		return err
 	}
 	if request.Provider == "codex" {
@@ -62,9 +79,6 @@ func WorkerServe(ctx context.Context) error {
 		if err := os.MkdirAll(dir, 0700); err != nil {
 			return err
 		}
-	}
-	if err := environment.CheckWritable(environment.Locations{Root: wire.EnvironmentRoot, Home: wire.Home, TmpDir: "/tmp", Workspace: request.WorkDir}); err != nil {
-		return err
 	}
 	return superviseWorker(ctx, time.Duration(request.TerminationGraceSeconds)*time.Second)
 }
@@ -152,7 +166,7 @@ func WorkerExecute(ctx context.Context, digest, uid string, streams ProcessStrea
 	if err := f.Close(); err != nil {
 		return err
 	}
-	vars, err := SelectedEnvironment(manifest, os.Environ(), environment.Locations{Root: wire.EnvironmentRoot, Home: wire.Home, TmpDir: "/tmp", Workspace: request.WorkDir})
+	vars, err := SelectedEnvironment(manifest, os.Environ(), runtimeimage.Locations{Home: wire.Home, TmpDir: "/tmp", Workspace: request.WorkDir})
 	if err != nil {
 		return err
 	}
@@ -170,7 +184,7 @@ func WorkerExecute(ctx context.Context, digest, uid string, streams ProcessStrea
 		return err
 	}
 	for id := range manifest.Providers {
-		path, err := environment.ProviderPath(wire.EnvironmentRoot, manifest, id)
+		path, err := runtimeimage.ProviderPath(manifest, id)
 		if err != nil {
 			return err
 		}
@@ -180,9 +194,9 @@ func WorkerExecute(ctx context.Context, digest, uid string, streams ProcessStrea
 		}
 	}
 	basePath := wire.Value(vars, "PATH")
-	parts := []string{bin, wire.CoreRoot}
+	parts := []string{bin, wire.ControllerRoot}
 	for _, part := range strings.Split(basePath, ":") {
-		if part != "" && !strings.HasPrefix(part, wire.CoreRoot) {
+		if part != "" && !strings.HasPrefix(part, wire.ControllerRoot) {
 			parts = append(parts, part)
 		}
 	}
@@ -197,7 +211,7 @@ func WorkerExecute(ctx context.Context, digest, uid string, streams ProcessStrea
 	if request.Provider == "codex" {
 		values["CODEX_HOME"] = wire.Home + "/.codex"
 	}
-	path, err := environment.ProviderPath(wire.EnvironmentRoot, manifest, request.Provider)
+	path, err := runtimeimage.ProviderPath(manifest, request.Provider)
 	if err != nil {
 		return err
 	}

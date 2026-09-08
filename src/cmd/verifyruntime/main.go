@@ -16,7 +16,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/korioinc/multica-runtime-controller/internal/environment"
+	"github.com/korioinc/multica-runtime-controller/internal/runtimeimage"
 )
 
 type runRequest struct {
@@ -31,31 +31,31 @@ type runRequest struct {
 }
 
 type providerResult struct {
-	TaskID                string          `json:"taskID"`
-	Case                  string          `json:"case"`
-	Stage                 string          `json:"stage"`
-	WorkDir               string          `json:"workDir"`
-	Repository            string          `json:"repository"`
-	Branch                string          `json:"branch"`
-	Session               string          `json:"session"`
-	Storage               string          `json:"storage"`
-	Environment           environment.Ref `json:"environment"`
-	PriorWork             bool            `json:"priorWork"`
-	PriorWorkDigest       string          `json:"priorWorkDigest"`
-	PriorSession          bool            `json:"priorSession"`
-	ContinuityNotice      bool            `json:"continuityNotice"`
-	ROChecked             bool            `json:"readOnlyChecked"`
-	WritableChecked       bool            `json:"writableChecked"`
-	IsolationChecked      bool            `json:"isolationChecked"`
-	RepeatCheckoutChecked bool            `json:"repeatCheckoutChecked"`
-	ScopeChecked          bool            `json:"scopeChecked"`
-	CachePath             string          `json:"cachePath"`
-	CacheChecked          bool            `json:"cacheChecked"`
-	CoreHash              string          `json:"coreHash"`
-	SessionDigest         string          `json:"sessionDigest"`
-	ModifiedDigest        string          `json:"modifiedDigest"`
-	Request               json.RawMessage `json:"request,omitempty"`
-	Error                 string          `json:"error,omitempty"`
+	TaskID                string           `json:"taskID"`
+	Case                  string           `json:"case"`
+	Stage                 string           `json:"stage"`
+	WorkDir               string           `json:"workDir"`
+	Repository            string           `json:"repository"`
+	Branch                string           `json:"branch"`
+	Session               string           `json:"session"`
+	Storage               string           `json:"storage"`
+	RuntimeRef            runtimeimage.Ref `json:"runtimeRef"`
+	PriorWork             bool             `json:"priorWork"`
+	PriorWorkDigest       string           `json:"priorWorkDigest"`
+	PriorSession          bool             `json:"priorSession"`
+	ContinuityNotice      bool             `json:"continuityNotice"`
+	ROChecked             bool             `json:"readOnlyChecked"`
+	WritableChecked       bool             `json:"writableChecked"`
+	IsolationChecked      bool             `json:"isolationChecked"`
+	RepeatCheckoutChecked bool             `json:"repeatCheckoutChecked"`
+	ScopeChecked          bool             `json:"scopeChecked"`
+	CachePath             string           `json:"cachePath"`
+	CacheChecked          bool             `json:"cacheChecked"`
+	CoreHash              string           `json:"coreHash"`
+	SessionDigest         string           `json:"sessionDigest"`
+	ModifiedDigest        string           `json:"modifiedDigest"`
+	Request               json.RawMessage  `json:"request,omitempty"`
+	Error                 string           `json:"error,omitempty"`
 }
 
 type taskRecord struct {

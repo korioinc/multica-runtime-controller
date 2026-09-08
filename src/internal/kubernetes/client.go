@@ -81,28 +81,31 @@ func metadataMatches(m metav1.ObjectMeta, r Reference, name, uid string) bool {
 	if m.Name != name || m.Namespace != r.Namespace || m.UID == "" || uid != "" && string(m.UID) != uid || m.Labels[managedLabel] != managedValue || m.Labels[taskLabel] != r.TaskID || m.Labels[storageLabel] != r.StorageID || m.Labels[attemptLabel] != r.AttemptID || m.Annotations[digestAnnotation] != r.RequestDigest {
 		return false
 	}
-	for _, o := range m.OwnerReferences {
-		if o.Kind == "Pod" && o.APIVersion == "v1" && o.Name == r.Owner.Name && string(o.UID) == r.Owner.UID && o.Controller != nil && *o.Controller {
-			return true
-		}
+	if len(m.OwnerReferences) != 1 {
+		return false
 	}
-	return false
+	o := m.OwnerReferences[0]
+	return o.Kind == "Pod" && o.APIVersion == "v1" && o.Name == r.Owner.Name && string(o.UID) == r.Owner.UID && o.Controller != nil && *o.Controller && o.BlockOwnerDeletion != nil && *o.BlockOwnerDeletion
 }
 func secretMatches(s *corev1.Secret, r Reference) bool {
 	return s != nil && metadataMatches(s.ObjectMeta, r, r.SecretName, r.SecretUID) && s.Immutable != nil && *s.Immutable && len(s.Data) == 1 && wire.Digest(s.Data[wire.RequestKey]) == r.RequestDigest
 }
 func podMatches(p *corev1.Pod, r Reference) bool {
-	if p == nil || !sha256String.MatchString(r.PodDigest) || specFingerprint(p.Spec) != r.PodDigest || r.FixedNode != "" && p.Spec.NodeName != "" && p.Spec.NodeName != r.FixedNode {
+	if p == nil || r.RuntimeRef.Validate() != nil || !sha256String.MatchString(r.PodDigest) || specFingerprint(p.Spec) != r.PodDigest || r.FixedNode != "" && p.Spec.NodeName != "" && p.Spec.NodeName != r.FixedNode {
 		return false
 	}
-	if p == nil || !metadataMatches(p.ObjectMeta, r, r.PodName, r.PodUID) || len(p.Spec.Containers) != 1 || len(p.Spec.InitContainers) < 1 || p.Spec.AutomountServiceAccountToken == nil || *p.Spec.AutomountServiceAccountToken {
+	if !metadataMatches(p.ObjectMeta, r, r.PodName, r.PodUID) || len(p.Spec.Containers) != 1 || len(p.Spec.InitContainers) != 1 || p.Spec.AutomountServiceAccountToken == nil || *p.Spec.AutomountServiceAccountToken {
 		return false
 	}
 	worker, init := p.Spec.Containers[0], p.Spec.InitContainers[0]
-	if worker.Name != "worker" || worker.Image != r.EnvironmentImage || init.Image != r.CoreImage || !slices.Equal(worker.Command, []string{wire.CoreRoot + "/runtime", "worker", "serve"}) || !slices.Equal(init.Command, []string{"/artifact/runtime", "materialize"}) {
+	if worker.Name != "worker" || worker.Image != r.RuntimeRef.Image || init.Name != "home-layout" || init.Image != r.RuntimeRef.Image || !slices.Equal(worker.Command, []string{wire.ControllerRoot + "/runtime", "worker", "serve"}) || !slices.Equal(init.Command, []string{wire.ControllerRoot + "/runtime", "home", "layout", "--private-root=" + wire.PrivateRoot, "--request=" + wire.RequestPath}) {
 		return false
 	}
-	secretVolume, tools, storage, core := false, false, false, false
+	if p.Spec.NodeSelector["kubernetes.io/os"] != "linux" || p.Spec.NodeSelector["kubernetes.io/arch"] != strings.TrimPrefix(r.RuntimeRef.Platform, "linux/") {
+		return false
+	}
+	secretVolume, storage := false, false
+	private := map[string]bool{}
 	for _, v := range p.Spec.Volumes {
 		if v.Name == "runtime-request" && v.Secret != nil && v.Secret.SecretName == r.SecretName {
 			secretVolume = true
@@ -110,14 +113,21 @@ func podMatches(p *corev1.Pod, r Reference) bool {
 	}
 	for _, m := range worker.VolumeMounts {
 		switch m.Name {
-		case "runtime-tools":
-			tools = m.MountPath == wire.EnvironmentRoot && m.SubPath == "generations/"+r.EnvironmentID && m.ReadOnly
 		case "runtime-workspace":
-			if m.SubPath == ".multica-runtime/workers/"+r.StorageID && !m.ReadOnly {
+			if m.SubPath == ".multica-runtime/workers/"+r.StorageID && m.SubPathExpr == "" && !m.ReadOnly {
 				storage = true
 			}
-		case "runtime-core":
-			core = m.MountPath == wire.CoreRoot && m.ReadOnly
+		case "runtime-private":
+			if !m.ReadOnly && m.SubPathExpr == "" {
+				switch m.MountPath {
+				case wire.Home:
+					private["agents"] = m.SubPath == "agents"
+				case "/tmp":
+					private["tmp"] = m.SubPath == "tmp"
+				case wire.ControlRoot:
+					private["run"] = m.SubPath == "run"
+				}
+			}
 		}
 	}
 	digest, task := "", ""
@@ -129,9 +139,22 @@ func podMatches(p *corev1.Pod, r Reference) bool {
 			task = v.Value
 		}
 	}
-	return secretVolume && tools && storage && core && digest == r.RequestDigest && task == r.TaskID
+	return secretVolume && storage && private["agents"] && private["tmp"] && private["run"] && digest == r.RequestDigest && task == r.TaskID
+}
+
+func (c *Client) validateReferenceSnapshots(ctx context.Context, r Reference) error {
+	if c.Namespace != r.Namespace {
+		return errors.New("task reference namespace mismatch")
+	}
+	if err := r.RuntimeRef.Validate(); err != nil {
+		return err
+	}
+	return c.ValidateSnapshots(ctx, r.Owner, r.Snapshots, r.RuntimeRef.ConfigurationDigest)
 }
 func (c *Client) CreateSecret(ctx context.Context, r Reference, request wire.Request) (string, error) {
+	if err := c.validateReferenceSnapshots(ctx, r); err != nil {
+		return "", err
+	}
 	want, err := secretObject(r, request)
 	if err != nil {
 		return "", err
@@ -146,6 +169,9 @@ func (c *Client) CreateSecret(ctx context.Context, r Reference, request wire.Req
 	return string(s.UID), nil
 }
 func (c *Client) CreatePod(ctx context.Context, cfg Config, r Reference, request wire.Request, gateway string) (string, error) {
+	if err := c.validateReferenceSnapshots(ctx, r); err != nil {
+		return "", err
+	}
 	want, err := podObject(cfg, r, request, gateway)
 	if err != nil {
 		return "", err
@@ -160,6 +186,18 @@ func (c *Client) CreatePod(ctx context.Context, cfg Config, r Reference, request
 	return string(p.UID), nil
 }
 func (c *Client) ResolveSecret(ctx context.Context, r Reference) (string, error) {
+	if err := c.validateReferenceSnapshots(ctx, r); err != nil {
+		return "", err
+	}
+	return c.ResolveCleanupSecret(ctx, r)
+}
+
+// ResolveCleanupSecret identifies a journaled resource for deletion only.
+// Owner GC may already have removed its shared configuration snapshots.
+func (c *Client) ResolveCleanupSecret(ctx context.Context, r Reference) (string, error) {
+	if c.Namespace != r.Namespace {
+		return "", errors.New("cleanup reference namespace mismatch")
+	}
 	s, err := c.secret(ctx, r.SecretName)
 	if err != nil || s == nil {
 		return "", err
@@ -170,6 +208,18 @@ func (c *Client) ResolveSecret(ctx context.Context, r Reference) (string, error)
 	return string(s.UID), nil
 }
 func (c *Client) ResolvePod(ctx context.Context, r Reference) (string, error) {
+	if err := c.validateReferenceSnapshots(ctx, r); err != nil {
+		return "", err
+	}
+	return c.ResolveCleanupPod(ctx, r)
+}
+
+// ResolveCleanupPod cannot grant execution authority; reuse and execution keep
+// the live snapshot checks in ResolvePod and Execute.
+func (c *Client) ResolveCleanupPod(ctx context.Context, r Reference) (string, error) {
+	if c.Namespace != r.Namespace {
+		return "", errors.New("cleanup reference namespace mismatch")
+	}
 	p, err := c.pod(ctx, r.PodName)
 	if err != nil || p == nil {
 		return "", err
@@ -400,7 +450,17 @@ func (c *Client) Execute(ctx context.Context, r Reference, deadline time.Duratio
 	}); err != nil {
 		return err
 	}
-	u := c.API.CoreV1().RESTClient().Post().Resource("pods").Namespace(c.Namespace).Name(r.PodName).SubResource("exec").VersionedParams(&corev1.PodExecOptions{Container: "worker", Command: []string{wire.CoreRoot + "/runtime", "worker", "execute", "--request-digest=" + r.RequestDigest, "--pod-uid=" + r.PodUID, fmt.Sprintf("--stdin=%t", streams.Stdin != nil), fmt.Sprintf("--stdout=%t", streams.Stdout != nil), fmt.Sprintf("--stderr=%t", streams.Stderr != nil)}, Stdin: streams.Stdin != nil, Stdout: streams.Stdout != nil, Stderr: streams.Stderr != nil}, scheme.ParameterCodec).URL()
+	if err := c.validateReferenceSnapshots(ctx, r); err != nil {
+		return err
+	}
+	secret, err := c.secret(ctx, r.SecretName)
+	if err != nil {
+		return err
+	}
+	if !secretMatches(secret, r) || secret.DeletionTimestamp != nil {
+		return errors.New("execution request Secret identity changed")
+	}
+	u := c.API.CoreV1().RESTClient().Post().Resource("pods").Namespace(c.Namespace).Name(r.PodName).SubResource("exec").VersionedParams(&corev1.PodExecOptions{Container: "worker", Command: []string{wire.ControllerRoot + "/runtime", "worker", "execute", "--request-digest=" + r.RequestDigest, "--pod-uid=" + r.PodUID, fmt.Sprintf("--stdin=%t", streams.Stdin != nil), fmt.Sprintf("--stdout=%t", streams.Stdout != nil), fmt.Sprintf("--stderr=%t", streams.Stderr != nil)}, Stdin: streams.Stdin != nil, Stdout: streams.Stdout != nil, Stderr: streams.Stderr != nil}, scheme.ParameterCodec).URL()
 	transport, upgrader, err := spdy.RoundTripperFor(c.Transport)
 	if err != nil {
 		return fmt.Errorf("%w: configure exec upgrade: %w", ErrTransport, err)
