@@ -15,8 +15,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"time"
-
-	"github.com/korioinc/multica-runtime-controller/internal/wire"
 )
 
 func streamBytes(label string) []byte {
@@ -85,7 +83,7 @@ type streamEvidence struct {
 func (v *verifier) streams(parent context.Context, env []string) error {
 	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
 	defer cancel()
-	command := exec.CommandContext(ctx, wire.CoreRoot+"/shims/pi", "--duplex-stream")
+	command := exec.CommandContext(ctx, fixtureShim, "--duplex-stream")
 	command.Env = env
 	command.Dir = "/tmp"
 	stdin, err := command.StdinPipe()
@@ -166,7 +164,7 @@ func (v *verifier) streams(parent context.Context, env []string) error {
 	expectedOut := append(append([]byte(firstReply), streamBytes("stdout")...), []byte(lastReply)...)
 	expectedErr := streamBytes("stderr")
 	if out.Len() <= 1<<20 || diagnostics.Len() <= 1<<20 || streamDigest(out.Bytes()) != streamDigest(expectedOut) || streamDigest(diagnostics.Bytes()) != streamDigest(expectedErr) {
-		return errors.New("large stdout/stderr bytes changed in the actual runtime shim")
+		return errors.New("large stdout/stderr bytes changed in the adapter process relay")
 	}
 	closedCode, err := closedOutput(parent, env, first, firstReply)
 	if err != nil {
@@ -184,7 +182,7 @@ func (v *verifier) streams(parent context.Context, env []string) error {
 func closedOutput(parent context.Context, env []string, first []byte, expected string) (int, error) {
 	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
 	defer cancel()
-	command := exec.CommandContext(ctx, wire.CoreRoot+"/shims/pi", "--duplex-stream")
+	command := exec.CommandContext(ctx, fixtureShim, "--duplex-stream")
 	command.Env = env
 	command.Dir = "/tmp"
 	command.Stderr = io.Discard

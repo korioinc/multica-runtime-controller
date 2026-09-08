@@ -64,7 +64,7 @@ func verifyAccess(ctx context.Context, path string) error {
 		}
 	}
 	invoke := func(env map[string]string, directory string) ([]byte, error) {
-		command := exec.CommandContext(ctx, wire.CoreRoot+"/shims/pi", "--version", "--session", session)
+		command := exec.CommandContext(ctx, wire.ControllerRoot+"/shims/pi", "--version", "--session", session)
 		command.Env = wire.Environment(env)
 		command.Dir = directory
 		command.Stdin = strings.NewReader("")

@@ -10,7 +10,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/korioinc/multica-runtime-controller/internal/core"
-	"github.com/korioinc/multica-runtime-controller/internal/environment"
+	"github.com/korioinc/multica-runtime-controller/internal/runtimeimage"
 )
 
 func TestEnvironmentChangePreservesWorkButCannotResumeOldSession(t *testing.T) {
@@ -172,7 +172,7 @@ func TestLeaseAndActiveAttemptProtectRetirement(t *testing.T) {
 	task := testObservation(testEnvironment("a"))
 	claim := approve(t, store, task)
 	root := prepareRoot(t, options.WorkspaceRoot, task)
-	binding, err := store.Bind(claim, root, "", task.Environment)
+	binding, err := store.Bind(claim, root, "", task.RuntimeRef)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -246,13 +246,18 @@ func testStore(t *testing.T) (*Store, Options) {
 	}
 	return store, options
 }
-func testEnvironment(name string) environment.Ref {
+func testEnvironment(name string) runtimeimage.Ref {
 	sha := core.Digest([]byte(name))
-	return environment.Ref{SchemaVersion: 1, EnvironmentID: sha, ContentDigest: sha, ManifestDigest: sha, CoreImage: "core@sha256:" + sha, EnvironmentImage: "environment@sha256:" + sha, Platform: "linux/amd64", Core: core.Contract{ContractVersion: 1, BuildID: name, Platform: "linux/amd64", OfficialVersion: "0.4.40", OfficialSHA256: sha, Files: map[string]string{"runtime": sha, "multica": sha}}, Providers: map[string]environment.Fingerprint{"pi": {Entrypoint: "providers/pi/run", SHA256: sha}}}
+	controller := core.Contract{SchemaVersion: 2, ControllerABI: 2, BuildID: sha, Platform: "linux/amd64", RuntimePath: core.Root + "/runtime", RuntimeSHA256: sha, GoVersion: "go1.26.1", ShimPaths: map[string]string{}}
+	for _, alias := range []string{"pi", "codex", "copilot", "agy"} {
+		controller.ShimPaths[alias] = core.Root + "/shims/" + alias
+	}
+	executable := runtimeimage.Executable{Path: "/opt/multica/tools/bin/pi", Version: "1.0.0", SHA256: sha}
+	return runtimeimage.Ref{SchemaVersion: 2, Image: "example.invalid/runtime@sha256:" + sha, Platform: "linux/amd64", ImageBuildID: uuid.NewSHA1(uuid.NameSpaceOID, []byte(name)).String(), DescriptorDigest: sha, Controller: controller, Daemon: runtimeimage.Daemon{Executable: runtimeimage.Executable{Path: "/opt/multica/tools/bin/multica", Version: "0.4.40", SHA256: sha}, AdapterContract: runtimeimage.AdapterContract}, Providers: map[string]runtimeimage.Executable{"pi": executable}, ConfigurationDigest: sha}
 }
-func testObservation(ref environment.Ref) Observation {
+func testObservation(ref runtimeimage.Ref) Observation {
 	id := uuid.NewString()
-	return Observation{ID: id, WorkspaceID: "workspace", AgentID: "agent", IssueID: "issue", AuthToken: "mat_" + id, RepositoryURLs: []string{"https://example.invalid/private.git"}, Environment: ref}
+	return Observation{ID: id, WorkspaceID: "workspace", AgentID: "agent", IssueID: "issue", AuthToken: "mat_" + id, RepositoryURLs: []string{"https://example.invalid/private.git"}, RuntimeRef: ref}
 }
 func approve(t *testing.T, store *Store, task Observation) Claim {
 	t.Helper()

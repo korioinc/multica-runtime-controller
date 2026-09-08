@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/korioinc/multica-runtime-controller/internal/configuration"
 	"github.com/korioinc/multica-runtime-controller/internal/core"
 	"github.com/korioinc/multica-runtime-controller/internal/kubernetes"
 	"github.com/korioinc/multica-runtime-controller/internal/wire"
@@ -47,8 +48,22 @@ func (j *journal) validate(a attempt) error {
 	if !core.ValidSHA(r.PodDigest) {
 		return errors.New("attempt Pod payload fingerprint required")
 	}
-	if a.SchemaVersion != 1 || a.OwnerID != j.owner || a.Created.IsZero() || !wire.UUID(r.TaskID) || !wire.UUID(r.StorageID) || !wire.UUID(r.AttemptID) || r.Namespace == "" || r.Owner.Name == "" || r.Owner.UID == "" || !core.ValidSHA(r.RequestDigest) || !core.ValidSHA(r.EnvironmentID) || !core.PinnedImage(r.CoreImage) || !core.PinnedImage(r.EnvironmentImage) || r.PodName != "task-worker-"+r.StorageID || r.SecretName != "task-request-"+r.AttemptID || a.PodStarted && (!a.SecretStarted || r.SecretUID == "") || r.PodUID != "" && !a.PodStarted || r.SecretUID != "" && !a.SecretStarted {
-		return errors.New("corrupt or foreign attempt journal")
+	if a.SchemaVersion != 2 || a.OwnerID != j.owner || a.Created.IsZero() || !wire.UUID(r.TaskID) || !wire.UUID(r.StorageID) || !wire.UUID(r.AttemptID) || r.Namespace == "" || r.Owner.Name == "" || r.Owner.UID == "" || !core.ValidSHA(r.RequestDigest) || r.PodName != "task-worker-"+r.StorageID || r.SecretName != "task-request-"+r.AttemptID || a.PodStarted && (!a.SecretStarted || r.SecretUID == "") || r.PodUID != "" && !a.PodStarted || r.SecretUID != "" && !a.SecretStarted {
+		return errors.New("corrupt, legacy, or foreign attempt journal; schema 2 required")
+	}
+	if err := r.RuntimeRef.Validate(); err != nil {
+		return err
+	}
+	if err := configuration.ValidateRefs(r.Snapshots); err != nil {
+		return err
+	}
+	if configuration.DigestRefs(r.Snapshots) != r.RuntimeRef.ConfigurationDigest {
+		return errors.New("attempt snapshot configuration mismatch")
+	}
+	for _, ref := range r.Snapshots {
+		if ref.Namespace != r.Namespace {
+			return errors.New("attempt snapshot namespace mismatch")
+		}
 	}
 	return nil
 }
@@ -59,6 +74,9 @@ func (j *journal) save(a *attempt) error {
 	raw, err := json.Marshal(a)
 	if err != nil {
 		return err
+	}
+	if len(raw) > wire.MaxRequestBytes {
+		return errors.New("attempt exceeds supported configuration metadata size")
 	}
 	return durableWrite(filepath.Join(j.directory, a.Ref.AttemptID+".json"), raw)
 }
@@ -78,7 +96,7 @@ func (j *journal) read(id string) (*attempt, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(raw) > 32768 {
+	if len(raw) > wire.MaxRequestBytes {
 		return nil, errors.New("attempt record too large")
 	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))

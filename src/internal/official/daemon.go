@@ -43,6 +43,9 @@ func RunDaemon(ctx context.Context, listener net.Listener, handler http.Handler,
 	go func() { finished <- command.Wait() }()
 	select {
 	case err := <-finished:
+		if err == nil && ctx.Err() == nil {
+			return errors.New("official daemon exited while controller was active")
+		}
 		return err
 	case err := <-serving:
 		cancel()

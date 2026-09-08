@@ -34,7 +34,7 @@ func TestCorruptBindingCannotTransferAnotherScopesPrivateWork(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var state registry
+	var state Registry
 	if err := json.Unmarshal(raw, &state); err != nil {
 		t.Fatal(err)
 	}

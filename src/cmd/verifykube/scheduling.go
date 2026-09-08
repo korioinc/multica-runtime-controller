@@ -149,7 +149,7 @@ func (f *fixture) alternativeNode(fixed string) (*corev1.Node, error) {
 }
 func (f *fixture) scheduling() error {
 	cfg := f.selection.Worker
-	if cfg.SingleNodeName == "" || cfg.ToolsAccessMode != corev1.ReadWriteOnce && cfg.WorkspaceAccessMode != corev1.ReadWriteOnce {
+	if cfg.SingleNodeName == "" || cfg.WorkspaceAccessMode != corev1.ReadWriteOnce {
 		return errors.New("RWO fixture with explicit singleNodeName required")
 	}
 	node, err := f.api.CoreV1().Nodes().Get(f.ctx, cfg.SingleNodeName, metav1.GetOptions{})
@@ -165,7 +165,7 @@ func (f *fixture) scheduling() error {
 	}
 	// Verify the fixture really uses RWO storage, rather than only declaring it in
 	// the runtime config while Kubernetes sees a different access model.
-	for claim, mode := range map[string]corev1.PersistentVolumeAccessMode{cfg.ToolsClaim: cfg.ToolsAccessMode, cfg.WorkspaceClaim: cfg.WorkspaceAccessMode} {
+	for claim, mode := range map[string]corev1.PersistentVolumeAccessMode{cfg.WorkspaceClaim: cfg.WorkspaceAccessMode} {
 		pvc, err := f.api.CoreV1().PersistentVolumeClaims(f.selection.Namespace).Get(f.ctx, claim, metav1.GetOptions{})
 		if err != nil {
 			return err
@@ -249,7 +249,7 @@ func (f *fixture) scheduling() error {
 	if _, err = f.client.CreatePod(f.ctx, wrong, invalidRef, request, f.selection.Gateway); err == nil {
 		return errors.New("conflicting selector created a task Pod")
 	}
-	// Actual controller recreation uses the real chart Deployment and both PVCs.
+	// Actual controller recreation uses the real chart Deployment and workspace PVC.
 	old, err := f.api.CoreV1().Pods(f.selection.Namespace).Get(f.ctx, f.selection.Controller.Name, metav1.GetOptions{})
 	if err != nil {
 		return err

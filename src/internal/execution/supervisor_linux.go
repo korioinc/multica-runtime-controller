@@ -8,6 +8,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/korioinc/multica-runtime-controller/internal/wire"
 	"golang.org/x/sys/unix"
 )
 
@@ -17,7 +18,7 @@ func superviseWorker(ctx context.Context, grace time.Duration) error {
 	if err := unix.Prctl(unix.PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0); err != nil {
 		return err
 	}
-	child, err := os.StartProcess("/opt/multica/core/runtime", []string{"runtime", "worker", "proxy"}, &os.ProcAttr{Env: os.Environ(), Files: []*os.File{nil, os.Stdout, os.Stderr}})
+	child, err := os.StartProcess(wire.ControllerRoot+"/runtime", []string{"runtime", "worker", "proxy"}, &os.ProcAttr{Env: os.Environ(), Files: []*os.File{nil, os.Stdout, os.Stderr}})
 	if err != nil {
 		return err
 	}
