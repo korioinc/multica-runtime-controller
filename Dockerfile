@@ -24,6 +24,9 @@ RUN /scripts/core-contract.sh /out --platform "linux/${TARGETARCH}" \
 
 FROM golang:${GO_VERSION}-bookworm AS task-sdk
 FROM debian:bookworm-slim AS runtime
+RUN groupadd --gid 65532 multica \
+ && useradd --uid 65532 --gid multica --no-create-home --no-log-init \
+      --home-dir /home/multica/agents --shell /bin/bash multica
 COPY --from=task-sdk /usr/local/go /usr/local/go
 COPY --from=core-build /etc/ssl/certs /etc/ssl/certs
 COPY --from=core-build /out /opt/multica/controller
