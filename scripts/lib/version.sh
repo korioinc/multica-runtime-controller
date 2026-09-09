@@ -14,8 +14,7 @@ version_stable() {
 version_read() {
   local value
   value=$(cat -- "$1") || return 1
-  [[ $(wc -l <"$1") -eq 1 ]] ||
-    { version_error 'VERSION must contain one newline-terminated stable semantic version'; return 1; }
+  value=${value%$'\r'}
   version_stable "$value" || return 1
   printf '%s\n' "$value"
 }
