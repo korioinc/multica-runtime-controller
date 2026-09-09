@@ -57,3 +57,31 @@ func TestExecutableMutationInvalidatesEveryConsumer(t *testing.T) {
 		t.Fatal("consumer accepted mutation through a shared executable alias")
 	}
 }
+
+func TestReplacedShimMustMatchRuntime(t *testing.T) {
+	target := artifactFixture(t)
+	data, err := os.ReadFile(filepath.Join(target, "runtime"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(target, "shims", "pi")
+	if err = os.Remove(alias); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(alias, data, 0555); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = Check(target, "linux/amd64"); err != nil {
+		t.Fatalf("consumer rejected an identical standalone executable: %v", err)
+	}
+	if err = os.Remove(alias); err != nil {
+		t.Fatal(err)
+	}
+	data[len(data)-1] ^= 1
+	if err = os.WriteFile(alias, data, 0555); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = Check(target, "linux/amd64"); err == nil {
+		t.Fatal("consumer accepted a modified standalone executable")
+	}
+}

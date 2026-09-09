@@ -131,9 +131,6 @@ func copyHomeContents(root *os.Root, in io.Reader, destination string, mode fs.F
 	}
 	defer root.Remove(temporary)
 	_, copyErr := io.Copy(out, in)
-	if copyErr == nil {
-		copyErr = out.Sync()
-	}
 	closeErr := out.Close()
 	if copyErr != nil {
 		return copyErr

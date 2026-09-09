@@ -215,7 +215,7 @@ func validateTaskHomeTree(home string) error {
 		if walkErr != nil || path == "." {
 			return walkErr
 		}
-		info, err := root.Lstat(path)
+		info, err := entry.Info()
 		if err != nil {
 			return err
 		}

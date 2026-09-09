@@ -34,6 +34,7 @@ func CheckReceipt(run string, d Descriptor, digest string) error {
 
 // PublishReceipt never replaces an existing receipt, including across a
 // container restart. The link commits the complete file without an overwrite.
+// This receipt shares the Pod-private lifetime of the HOME it admits.
 func PublishReceipt(run string, d Descriptor, digest string) error {
 	path := filepath.Join(run, ReceiptName)
 	if _, err := os.Lstat(path); err == nil {
@@ -50,9 +51,7 @@ func PublishReceipt(run string, d Descriptor, digest string) error {
 		return err
 	}
 	defer os.Remove(f.Name())
-	if _, err = f.Write(raw); err == nil {
-		err = f.Sync()
-	}
+	_, err = f.Write(raw)
 	closeErr := f.Close()
 	if err != nil {
 		return err
@@ -61,14 +60,6 @@ func PublishReceipt(run string, d Descriptor, digest string) error {
 		return closeErr
 	}
 	if err = os.Link(f.Name(), path); err != nil && !os.IsExist(err) {
-		return err
-	}
-	dir, err := os.Open(run)
-	if err != nil {
-		return err
-	}
-	defer dir.Close()
-	if err = dir.Sync(); err != nil {
 		return err
 	}
 	return CheckReceipt(run, d, digest)

@@ -128,6 +128,7 @@ func Check(root, platform string) (result Contract, resultErr error) {
 	for _, path := range result.ShimPaths {
 		paths = append(paths, path)
 	}
+	verifiedFiles := make([]os.FileInfo, 0, len(paths))
 	for _, path := range paths {
 		info, err := os.Lstat(path)
 		if err != nil {
@@ -136,6 +137,18 @@ func Check(root, platform string) (result Contract, resultErr error) {
 		if !info.Mode().IsRegular() || info.Mode().Perm()&0111 == 0 {
 			return result, fmt.Errorf("controller executable is not a regular executable: %s", filepath.Base(path))
 		}
+		// Installed controller files are immutable. Reuse successful verification
+		// for their hard links only within this call, after checking each path.
+		alreadyVerified := false
+		for _, verified := range verifiedFiles {
+			if os.SameFile(info, verified) {
+				alreadyVerified = true
+				break
+			}
+		}
+		if alreadyVerified {
+			continue
+		}
 		got, err := HashFile(path)
 		if err != nil {
 			return result, err
@@ -143,6 +156,7 @@ func Check(root, platform string) (result Contract, resultErr error) {
 		if got != result.RuntimeSHA256 {
 			return result, fmt.Errorf("controller executable digest mismatch: %s", filepath.Base(path))
 		}
+		verifiedFiles = append(verifiedFiles, info)
 	}
 	entries, err := os.ReadDir(filepath.Join(root, "disabled"))
 	if err != nil {
