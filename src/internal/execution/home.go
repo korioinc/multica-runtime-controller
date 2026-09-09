@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"flag"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -15,45 +14,31 @@ import (
 	"github.com/korioinc/multica-runtime-controller/internal/wire"
 )
 
-type configCopies []configuration.Copy
-
-func (c *configCopies) String() string { return "sourceGroup/source/target JSON" }
-func (c *configCopies) Set(raw string) error {
-	var copy configuration.Copy
-	if err := runtimeimage.Decode([]byte(raw), &copy); err != nil {
-		return errors.New("home configuration copy requires sourceGroup/source/target JSON")
-	}
-	*c = append(*c, copy)
-	return nil
+type HomeOptions struct {
+	PrivateRoot string
+	RequestPath string
+	Copies      []configuration.Copy
 }
 
-// LayoutHome owns only a Pod-private volume. It commits its immutable source
-// capture before publishing any operator file into the writable native HOME.
-func LayoutHome(ctx context.Context, arguments []string) error {
-	flags := flag.NewFlagSet("home layout", flag.ContinueOnError)
-	flags.SetOutput(os.Stderr)
-	private := flags.String("private-root", "", "whole Pod-private volume preparation path")
-	requestPath := flags.String("request", "", "worker's read-only request input")
-	var copies configCopies
-	flags.Var(&copies, "config-copy", "sourceGroup/source/target JSON")
-	if err := flags.Parse(arguments); err != nil {
-		return err
-	}
-	if flags.NArg() != 0 || *private == "" || !filepath.IsAbs(*private) || filepath.Clean(*private) != *private || *private == "/" {
+// LayoutHome owns only a Pod-private volume. Controllers commit their operator
+// input; workers install an already prepared task HOME without selecting skills.
+func LayoutHome(ctx context.Context, options HomeOptions) error {
+	private := options.PrivateRoot
+	if private == "" || !filepath.IsAbs(private) || filepath.Clean(private) != private || private == "/" {
 		return errors.New("home layout requires --private-root canonical directory")
 	}
-	if *requestPath != "" && (*requestPath != wire.RequestPath || len(copies) != 0) {
+	if options.RequestPath != "" && (options.RequestPath != wire.RequestPath || len(options.Copies) != 0) {
 		return errors.New("worker home requires only its fixed read-only request input")
 	}
-	info, err := os.Lstat(*private)
+	info, err := os.Lstat(private)
 	if err != nil {
 		return err
 	}
-	resolved, err := filepath.EvalSymlinks(*private)
-	if err != nil || resolved != *private || !info.IsDir() {
+	resolved, err := filepath.EvalSymlinks(private)
+	if err != nil || resolved != private || !info.IsDir() {
 		return errors.New("private preparation root must be a real directory")
 	}
-	volume, err := os.OpenRoot(*private)
+	volume, err := os.OpenRoot(private)
 	if err != nil {
 		return err
 	}
@@ -74,7 +59,7 @@ func LayoutHome(ctx context.Context, arguments []string) error {
 			return err
 		}
 	}
-	run, home := filepath.Join(*private, "run"), filepath.Join(*private, "agents")
+	run, home := filepath.Join(private, "run"), filepath.Join(private, "agents")
 	d, digest, err := runtimeimage.Check(ctx, runtimeimage.Root, core.Root, core.HostPlatform())
 	if err != nil {
 		return err
@@ -82,43 +67,33 @@ func LayoutHome(ctx context.Context, arguments []string) error {
 	if err = runtimeimage.PublishReceipt(run, d, digest); err != nil {
 		return err
 	}
-	var bundle configuration.Bundle
-	if *requestPath == "" {
-		bundle, err = configuration.CaptureOrRead(run, copies, configuration.InputRoot)
-	} else {
-		raw, readErr := os.ReadFile(*requestPath)
-		if readErr != nil {
-			return readErr
+	if options.RequestPath == "" {
+		bundle, err := configuration.CaptureOrRead(run, options.Copies, configuration.InputRoot)
+		if err != nil {
+			return err
 		}
-		request, readErr := wire.Decode(raw)
-		if readErr != nil {
-			return readErr
-		}
-		if readErr = runtimeimage.Match(d, digest, request.RuntimeRef); readErr != nil {
-			return readErr
-		}
-		if _, readErr = os.Lstat(filepath.Join(run, configuration.BundleName)); readErr == nil {
-			bundle, err = configuration.Read(run)
-		} else if os.IsNotExist(readErr) {
-			bundle, err = configuration.FromSnapshots(request.Snapshots, configuration.InputRoot)
-			if err == nil {
-				bundle, err = configuration.Commit(run, bundle)
-			}
-		} else {
-			return readErr
-		}
-		if err == nil && bundle.Digest != request.RuntimeRef.ConfigurationDigest {
-			return errors.New("worker configuration capture differs from its selected runtime")
-		}
+		return layoutBaseHome(home, d.HomeSeed, bundle)
 	}
+	raw, err := os.ReadFile(options.RequestPath)
 	if err != nil {
 		return err
 	}
-	if err = CopyBundle(home, bundle); err != nil {
+	request, err := wire.Decode(raw)
+	if err != nil {
 		return err
 	}
-	if d.HomeSeed != "" {
-		if err = copyHomeSeed(home, d.HomeSeed); err != nil {
+	if err := runtimeimage.Match(d, digest, request.RuntimeRef); err != nil {
+		return err
+	}
+	return InstallTaskHome(home, wire.HomeArtifactPath, request)
+}
+
+func layoutBaseHome(home, seed string, bundle configuration.Bundle) error {
+	if err := CopyBundle(home, bundle); err != nil {
+		return err
+	}
+	if seed != "" {
+		if err := copyHomeSeed(home, seed); err != nil {
 			return err
 		}
 	}
@@ -128,7 +103,7 @@ func LayoutHome(ctx context.Context, arguments []string) error {
 	}
 	defer root.Close()
 	for _, path := range []string{".multica/pi-sessions", ".codex/skills", ".pi/agent"} {
-		if err = homeDirectories(root, path); err != nil {
+		if err := homeDirectories(root, path); err != nil {
 			return err
 		}
 	}

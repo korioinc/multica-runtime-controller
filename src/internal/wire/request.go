@@ -17,41 +17,43 @@ import (
 )
 
 const (
-	ControllerRoot   = core.Root
-	PrivateRoot      = "/opt/multica/private"
-	WorkspaceRoot    = "/workspace"
-	Home             = configuration.Home
-	PiSessionsRoot   = Home + "/.multica/pi-sessions"
-	ControlRoot      = "/run/multica"
-	RequestPath      = "/etc/multica/task/request.json"
-	RequestKey       = "request.json"
-	MaxRequestBytes  = 1 << 20
-	SelectionPath    = ControlRoot + "/selection.json"
-	WorkerConfigPath = "/etc/multica/runtime/worker.json"
-	SecretHeader     = "X-Multica-Request-Secret"
-	TaskHeader       = "X-Multica-Task-ID"
-	TokenHeader      = "X-Multica-Task-Token"
-	CapabilityHeader = "X-Multica-Broker-Token"
-	BranchHeader     = "X-Multica-Checkout-Branch"
-	ArchiveType      = "application/vnd.multica.checkout+tar"
+	RequestSchemaVersion = 3
+	ControllerRoot       = core.Root
+	PrivateRoot          = "/opt/multica/private"
+	WorkspaceRoot        = "/workspace"
+	Home                 = configuration.Home
+	PiSessionsRoot       = Home + "/.multica/pi-sessions"
+	ControlRoot          = "/run/multica"
+	RequestPath          = "/etc/multica/task/request.json"
+	HomeArtifactPath     = "/etc/multica/home/task-home.tar"
+	RequestKey           = "request.json"
+	MaxRequestBytes      = 1 << 20
+	SelectionPath        = ControlRoot + "/selection.json"
+	WorkerConfigPath     = "/etc/multica/runtime/worker.json"
+	SecretHeader         = "X-Multica-Request-Secret"
+	TaskHeader           = "X-Multica-Task-ID"
+	TokenHeader          = "X-Multica-Task-Token"
+	CapabilityHeader     = "X-Multica-Broker-Token"
+	BranchHeader         = "X-Multica-Checkout-Branch"
+	ArchiveType          = "application/vnd.multica.checkout+tar"
 )
 
 type Request struct {
-	SchemaVersion           int                         `json:"schemaVersion"`
-	TaskID                  string                      `json:"taskID"`
-	Provider                string                      `json:"provider"`
-	Args                    []string                    `json:"args"`
-	Env                     []string                    `json:"env"`
-	WorkDir                 string                      `json:"workDir"`
-	WorkerSubPath           string                      `json:"workerSubPath"`
-	RepositoryURLs          []string                    `json:"repositoryURLs"`
-	RuntimeRef              runtimeimage.Ref            `json:"runtimeRef"`
-	Snapshots               []configuration.SnapshotRef `json:"snapshots"`
-	AttemptID               string                      `json:"attemptID"`
-	OwnerID                 string                      `json:"ownerID"`
-	BrokerPort              int                         `json:"brokerPort"`
-	BrokerToken             string                      `json:"brokerToken"`
-	TerminationGraceSeconds int                         `json:"terminationGraceSeconds"`
+	SchemaVersion           int              `json:"schemaVersion"`
+	TaskID                  string           `json:"taskID"`
+	Provider                string           `json:"provider"`
+	Args                    []string         `json:"args"`
+	Env                     []string         `json:"env"`
+	WorkDir                 string           `json:"workDir"`
+	WorkerSubPath           string           `json:"workerSubPath"`
+	RepositoryURLs          []string         `json:"repositoryURLs"`
+	RuntimeRef              runtimeimage.Ref `json:"runtimeRef"`
+	AttemptID               string           `json:"attemptID"`
+	OwnerID                 string           `json:"ownerID"`
+	HomeDigest              string           `json:"homeDigest"`
+	BrokerPort              int              `json:"brokerPort"`
+	BrokerToken             string           `json:"brokerToken"`
+	TerminationGraceSeconds int              `json:"terminationGraceSeconds"`
 }
 
 // Plan and Result preserve the official checkout protocol. The assigned URL is
@@ -198,20 +200,17 @@ func Decode(raw []byte) (Request, error) {
 	if err := runtimeimage.Decode(raw, &request); err != nil {
 		return request, errors.New("invalid task request")
 	}
-	if request.SchemaVersion != 2 || !UUID(request.TaskID) || !UUID(request.AttemptID) || !UUID(request.OwnerID) || Alias(request.Provider) == "" || request.TaskID != Value(request.Env, "MULTICA_TASK_ID") || request.BrokerPort < 1 || request.BrokerPort > 65535 || len(request.BrokerToken) < 32 || request.TerminationGraceSeconds < 1 {
+	if request.SchemaVersion != RequestSchemaVersion || !UUID(request.TaskID) || !UUID(request.AttemptID) || !UUID(request.OwnerID) || Alias(request.Provider) == "" || request.TaskID != Value(request.Env, "MULTICA_TASK_ID") || request.BrokerPort < 1 || request.BrokerPort > 65535 || len(request.BrokerToken) < 32 || request.TerminationGraceSeconds < 1 {
 		return request, errors.New("invalid task authority or request contract")
 	}
 	if err := request.RuntimeRef.Validate(); err != nil {
 		return request, err
 	}
+	if !core.ValidSHA(request.HomeDigest) {
+		return request, errors.New("task requires its prepared HOME digest")
+	}
 	if _, enabled := request.RuntimeRef.Providers[request.Provider]; !enabled {
 		return request, errors.New("task provider is not enabled in the selected runtime")
-	}
-	if err := configuration.ValidateRefs(request.Snapshots); err != nil {
-		return request, err
-	}
-	if configuration.DigestRefs(request.Snapshots) != request.RuntimeRef.ConfigurationDigest {
-		return request, errors.New("task snapshot reference differs from runtime configuration")
 	}
 	if _, err := StorageRoot(request); err != nil {
 		return request, err

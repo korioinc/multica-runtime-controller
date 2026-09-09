@@ -132,7 +132,7 @@ func ValidateNPMSeed(path string) error {
 			return fmt.Errorf("Pi npm seed contains non-package state %q", relative)
 		}
 		if info.Mode()&os.ModeSymlink != 0 {
-			return validateNPMCommandLink(root, path)
+			return ValidateNPMCommandLink(root, path)
 		}
 		if !info.IsDir() && !info.Mode().IsRegular() {
 			return errors.New("Pi npm seed contains a special file")
@@ -141,7 +141,13 @@ func ValidateNPMSeed(path string) error {
 	})
 }
 
-func validateNPMCommandLink(root, path string) error {
+// ValidateNPMCommandLink checks one relative npm command link and its executable
+// target are confined to the supplied npm tree. It does not require an image's
+// package manifest or installed package inventory; ValidateNPMSeed owns those.
+func ValidateNPMCommandLink(root, path string) error {
+	if relative, err := filepath.Rel(root, path); err != nil || relative == "." || !filepath.IsLocal(relative) {
+		return errors.New("Pi npm command link is outside its installation")
+	}
 	parent := filepath.Dir(path)
 	if filepath.Base(parent) != ".bin" || filepath.Base(filepath.Dir(parent)) != "node_modules" {
 		return errors.New("Pi npm seed only permits npm command links")

@@ -121,50 +121,7 @@ func (p *Publisher) Publish(ctx context.Context, plan wire.Plan, branch string, 
 			return wire.Result{}, err
 		}
 		defer existing.Close()
-		if err := standalone(existing); err != nil {
-			return wire.Result{}, err
-		}
-		var have checkoutIdentity
-		raw, err := plainRead(existing, checkoutRecord)
-		if err != nil || json.Unmarshal(raw, &have) != nil || have.SchemaVersion != 1 || have.URL != wanted.URL || have.Ref != wanted.Ref {
-			return wire.Result{}, errors.New("existing repository has no matching checkout authority")
-		}
-		if have.HookDigest != wanted.HookDigest {
-			current, err := readHook(existing)
-			if err != nil {
-				return wire.Result{}, err
-			}
-			currentDigest := ""
-			if len(current) > 0 {
-				currentDigest = wire.Digest(current)
-			}
-			if currentDigest != "" && currentDigest != have.HookDigest && currentDigest != wanted.HookDigest {
-				return wire.Result{}, errors.New("official coauthor update conflicts with a user hook")
-			}
-			if len(hook) == 0 {
-				if err := existing.Remove(".git/hooks/prepare-commit-msg"); err != nil && !errors.Is(err, os.ErrNotExist) {
-					return wire.Result{}, err
-				}
-			} else if err := replace(existing, ".git/hooks/prepare-commit-msg", hook, 0755); err != nil {
-				return wire.Result{}, err
-			}
-			if err := saveIdentity(existing, wanted); err != nil {
-				return wire.Result{}, err
-			}
-		}
-		resultPath := filepath.Join(plan.WorkDir, name)
-		command := exec.CommandContext(ctx, "git", "-c", "core.hooksPath=/dev/null", "-C", resultPath, "symbolic-ref", "--quiet", "--short", "HEAD")
-		command.Env = p.env
-		raw, err = command.Output()
-		if err != nil {
-			command = exec.CommandContext(ctx, "git", "-c", "core.hooksPath=/dev/null", "-C", resultPath, "rev-parse", "--verify", "HEAD^{commit}")
-			command.Env = p.env
-			if err := command.Run(); err != nil {
-				return wire.Result{}, errors.New("existing repository HEAD is invalid")
-			}
-			raw = nil
-		}
-		return wire.Result{Path: resultPath, BranchName: strings.TrimSpace(string(raw))}, nil
+		return p.reuseCheckout(ctx, existing, filepath.Join(plan.WorkDir, name), wanted, hook)
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return wire.Result{}, err
 	}
@@ -187,6 +144,66 @@ func (p *Publisher) Publish(ctx context.Context, plan wire.Plan, branch string, 
 	}
 	return wire.Result{Path: filepath.Join(plan.WorkDir, name), BranchName: branch}, nil
 }
+
+func (p *Publisher) reuseCheckout(ctx context.Context, existing *os.Root, path string, wanted checkoutIdentity, hook []byte) (wire.Result, error) {
+	if err := standalone(existing); err != nil {
+		return wire.Result{}, err
+	}
+	var have checkoutIdentity
+	raw, err := plainRead(existing, checkoutRecord)
+	if err != nil || json.Unmarshal(raw, &have) != nil || have.SchemaVersion != 1 || have.URL != wanted.URL || have.Ref != wanted.Ref {
+		return wire.Result{}, errors.New("existing repository has no matching checkout authority")
+	}
+	if err := reconcileCheckoutHook(existing, have, wanted, hook); err != nil {
+		return wire.Result{}, err
+	}
+	branch, err := p.checkoutBranch(ctx, path)
+	if err != nil {
+		return wire.Result{}, err
+	}
+	return wire.Result{Path: path, BranchName: branch}, nil
+}
+
+func reconcileCheckoutHook(existing *os.Root, have, wanted checkoutIdentity, hook []byte) error {
+	if have.HookDigest == wanted.HookDigest {
+		return nil
+	}
+	current, err := readHook(existing)
+	if err != nil {
+		return err
+	}
+	currentDigest := ""
+	if len(current) > 0 {
+		currentDigest = wire.Digest(current)
+	}
+	if currentDigest != "" && currentDigest != have.HookDigest && currentDigest != wanted.HookDigest {
+		return errors.New("official coauthor update conflicts with a user hook")
+	}
+	if len(hook) == 0 {
+		if err := existing.Remove(".git/hooks/prepare-commit-msg"); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	} else if err := replace(existing, ".git/hooks/prepare-commit-msg", hook, 0755); err != nil {
+		return err
+	}
+	return saveIdentity(existing, wanted)
+}
+
+func (p *Publisher) checkoutBranch(ctx context.Context, path string) (string, error) {
+	command := exec.CommandContext(ctx, "git", "-c", "core.hooksPath=/dev/null", "-C", path, "symbolic-ref", "--quiet", "--short", "HEAD")
+	command.Env = p.env
+	raw, err := command.Output()
+	if err == nil {
+		return strings.TrimSpace(string(raw)), nil
+	}
+	command = exec.CommandContext(ctx, "git", "-c", "core.hooksPath=/dev/null", "-C", path, "rev-parse", "--verify", "HEAD^{commit}")
+	command.Env = p.env
+	if err := command.Run(); err != nil {
+		return "", errors.New("existing repository HEAD is invalid")
+	}
+	return "", nil
+}
+
 func saveIdentity(root *os.Root, value checkoutIdentity) error {
 	raw, err := json.Marshal(value)
 	if err != nil {

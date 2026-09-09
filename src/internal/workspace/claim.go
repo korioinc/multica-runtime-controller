@@ -22,14 +22,6 @@ type Observation struct {
 }
 type ReuseDecision struct{ ResetWorkDir, ResetSession bool }
 
-func (s *Store) Observe(task Observation) (ReuseDecision, error) {
-	decisions, err := s.ObserveBatch([]Observation{task})
-	if err != nil {
-		return ReuseDecision{}, err
-	}
-	return decisions[0], nil
-}
-
 // ObserveBatch publishes a complete successful claim response atomically. An
 // invalid task in the batch cannot authorize an earlier task in that response.
 func (s *Store) ObserveBatch(tasks []Observation) ([]ReuseDecision, error) {
@@ -71,16 +63,20 @@ func (s *Store) ObserveBatch(tasks []Observation) ([]ReuseDecision, error) {
 		if err != nil {
 			return err
 		}
-		changedScope := false
+		// Empty polls still validate persisted authority, but publish no changes.
+		if len(claims) == 0 {
+			return nil
+		}
+		revoked := false
 		for _, claim := range claims {
-			if old, ok := state.Claims[claim.ID]; ok && (old.Denied || old.Grant != claim.Grant) {
+			if old, ok := state.Claims[claim.ID]; ok && (old.Denied || old.Grant != claim.Grant || state.Retired[old.WorkerSubPath] != "") {
 				old.Denied = true
 				old.TokenHash = ""
 				state.Claims[claim.ID] = old
-				changedScope = true
+				revoked = true
 			}
 		}
-		if changedScope {
+		if revoked {
 			if err := s.write(state); err != nil {
 				return err
 			}
@@ -122,7 +118,7 @@ func (s *Store) Lookup(taskID, token, workspaceID, agentID string) (Claim, error
 			return err
 		}
 		value, ok := state.Claims[taskID]
-		if !ok || value.Denied || value.ExecutionState != "observed" || value.RuntimeRef == nil || token == "" || value.TokenHash != digest(token) || value.WorkspaceID != workspaceID || value.AgentID != agentID {
+		if !ok || value.Denied || state.Retired[value.WorkerSubPath] != "" || value.ExecutionState != "observed" || value.RuntimeRef == nil || token == "" || value.TokenHash != digest(token) || value.WorkspaceID != workspaceID || value.AgentID != agentID {
 			return errors.New("provider does not match an observed task claim")
 		}
 		claim = value

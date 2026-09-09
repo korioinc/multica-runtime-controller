@@ -9,7 +9,6 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/korioinc/multica-runtime-controller/internal/configuration"
 	"github.com/korioinc/multica-runtime-controller/internal/core"
 	"github.com/korioinc/multica-runtime-controller/internal/kubernetes"
 	"github.com/korioinc/multica-runtime-controller/internal/runtimeimage"
@@ -17,22 +16,23 @@ import (
 	"github.com/korioinc/multica-runtime-controller/internal/workspace"
 )
 
+const SelectionSchemaVersion = 3
+
 type Selection struct {
-	SchemaVersion int                         `json:"schemaVersion"`
-	OwnerID       string                      `json:"ownerID"`
-	Controller    kubernetes.Owner            `json:"controller"`
-	Namespace     string                      `json:"namespace"`
-	Gateway       string                      `json:"gateway"`
-	Backend       string                      `json:"backend"`
-	RuntimeRef    runtimeimage.Ref            `json:"runtimeRef"`
-	Snapshots     []configuration.SnapshotRef `json:"snapshots"`
-	Worker        kubernetes.Config           `json:"worker"`
-	OperatorKeys  []string                    `json:"operatorKeys"`
+	SchemaVersion int               `json:"schemaVersion"`
+	OwnerID       string            `json:"ownerID"`
+	Controller    kubernetes.Owner  `json:"controller"`
+	Namespace     string            `json:"namespace"`
+	Gateway       string            `json:"gateway"`
+	Backend       string            `json:"backend"`
+	RuntimeRef    runtimeimage.Ref  `json:"runtimeRef"`
+	Worker        kubernetes.Config `json:"worker"`
+	OperatorKeys  []string          `json:"operatorKeys"`
 }
 
 func (s Selection) Validate() error {
-	if s.SchemaVersion != 2 || !wire.UUID(s.OwnerID) || s.Namespace == "" || s.Controller.Name == "" || s.Controller.UID == "" || s.RuntimeRef.Platform != core.HostPlatform() {
-		return errors.New("invalid runtime selection; schema 2 required")
+	if s.SchemaVersion != SelectionSchemaVersion || !wire.UUID(s.OwnerID) || s.Namespace == "" || s.Controller.Name == "" || s.Controller.UID == "" || s.RuntimeRef.Platform != core.HostPlatform() {
+		return errors.New("invalid runtime selection; schema 3 required")
 	}
 	if err := s.Worker.Validate(); err != nil {
 		return err
@@ -42,17 +42,6 @@ func (s Selection) Validate() error {
 	}
 	if err := s.RuntimeRef.Validate(); err != nil {
 		return err
-	}
-	if err := configuration.ValidateRefs(s.Snapshots); err != nil {
-		return err
-	}
-	for _, ref := range s.Snapshots {
-		if ref.Namespace != s.Namespace {
-			return errors.New("snapshot belongs to a different namespace")
-		}
-	}
-	if configuration.DigestRefs(s.Snapshots) != s.RuntimeRef.ConfigurationDigest {
-		return errors.New("runtime configuration selection mismatch")
 	}
 	return nil
 }

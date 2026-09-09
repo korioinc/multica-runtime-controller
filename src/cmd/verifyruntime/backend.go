@@ -111,6 +111,10 @@ func (f *runtimeBackend) persist() error {
 func (f *runtimeBackend) fail(err error) { f.state.Error = err.Error(); _ = f.persist() }
 
 func (f *runtimeBackend) control(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/fixture/home" && r.Method == http.MethodPost {
+		f.captureHome(w, r)
+		return
+	}
 	f.mutex.Lock()
 	defer f.mutex.Unlock()
 	switch {
@@ -162,11 +166,6 @@ func (f *runtimeBackend) control(w http.ResponseWriter, r *http.Request) {
 			record.Checkpoint = &checkpoint
 		}
 		f.state.LastEnvironment = report.RuntimeRef.ImageBuildID
-		if len(report.Request) > 0 {
-			if err := os.WriteFile(filepath.Join(f.evidence, "request.json"), report.Request, 0600); err != nil {
-				f.fail(err)
-			}
-		}
 		if err := f.persist(); err != nil {
 			http.Error(w, err.Error(), 500)
 			return

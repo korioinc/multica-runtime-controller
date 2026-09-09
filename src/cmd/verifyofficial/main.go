@@ -64,6 +64,9 @@ type running struct {
 }
 
 func main() {
+	if len(os.Args) > 2 && os.Args[1] == "home-provider" {
+		os.Exit(homeProvider(os.Args[2], os.Args[3:]))
+	}
 	if len(os.Args) > 1 && (os.Args[1] == "provider" || os.Args[1] == "forbidden") {
 		os.Exit(providerHelper(os.Args[1], os.Args[2:]))
 	}
@@ -234,6 +237,9 @@ func verify(ctx context.Context, cfg configuration) error {
 		return err
 	}
 	if err := v.nativeCatalog(ctx); err != nil {
+		return err
+	}
+	if err := v.taskHome(ctx); err != nil {
 		return err
 	}
 	if _, err := core.Check(wire.ControllerRoot, core.HostPlatform()); err != nil {

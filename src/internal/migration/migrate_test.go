@@ -165,11 +165,11 @@ func TestMigrationPreservesPrivateWorkAndRequiresFreshAuthority(t *testing.T) {
 	observation := f.observation(f.task, ref)
 	observation.PriorWorkDir = filepath.Join(f.preparation, "workdir")
 	observation.PriorSession = filepath.Join(workspace.DefaultSessionRoot, filepath.Base(f.session))
-	decision, err := store.Observe(observation)
+	decisions, err := store.ObserveBatch([]workspace.Observation{observation})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if decision.ResetWorkDir || !decision.ResetSession {
+	if decisions[0].ResetWorkDir || !decisions[0].ResetSession {
 		t.Fatal("migration must preserve authorized work but exclude archived session continuation")
 	}
 	claim, err := store.Lookup(f.task, f.token, "workspace", "agent")
@@ -181,7 +181,7 @@ func TestMigrationPreservesPrivateWorkAndRequiresFreshAuthority(t *testing.T) {
 		t.Fatal(err)
 	}
 	dataEquals(t, filepath.Join(f.root, binding.WorkerSubPath, "uncommitted"), []byte("unfinished user work"))
-	if _, err := store.Observe(f.observation(f.denied, ref)); err == nil {
+	if _, err := store.ObserveBatch([]workspace.Observation{f.observation(f.denied, ref)}); err == nil {
 		t.Fatal("a fresh observation restored permanently denied authority")
 	}
 }
@@ -312,7 +312,7 @@ func TestMigrationRetryPreservesCommittedAuthorityAfterEachDurableBoundary(t *te
 				t.Fatal(err)
 			}
 			next := f.observation(uuid.NewString(), currentRef())
-			if _, err := store.Observe(next); err != nil {
+			if _, err := store.ObserveBatch([]workspace.Observation{next}); err != nil {
 				t.Fatal(err)
 			}
 			if _, err := Migrate(f.commit()); err != nil {
