@@ -2,6 +2,7 @@ package execution
 
 import (
 	"archive/tar"
+	"bufio"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -28,6 +29,8 @@ type taskHomeReceipt struct {
 
 // InstallTaskHome publishes one verified tree and its completion receipt in the
 // same rename. A completed attempt owns all later private edits and deletions.
+// HOME is Pod-local scratch: close and verify its writes before publication
+// without forcing disposable files to durable storage.
 func InstallTaskHome(home, artifactPath string, request wire.Request) error {
 	if _, err := homeIdentity(request); err != nil {
 		return err
@@ -54,10 +57,7 @@ func InstallTaskHome(home, artifactPath string, request wire.Request) error {
 		return err
 	}
 	if complete, err := installedTaskHome(parent, name, request); err != nil || complete {
-		if err != nil {
-			return err
-		}
-		return syncHomeDirectory(parent, ".")
+		return err
 	}
 	input, err := openTaskHomeArtifact(artifactPath)
 	if err != nil {
@@ -77,20 +77,11 @@ func InstallTaskHome(home, artifactPath string, request wire.Request) error {
 	if err := extractTaskHomeArchive(staged, input, request); err != nil {
 		return err
 	}
-	if err := validateTaskHomeTree(filepath.Join(parentPath, stage)); err != nil {
-		return err
-	}
 	if err := writeTaskHomeReceipt(staged, request); err != nil {
 		return err
 	}
-	if err := syncTaskHomeTree(staged); err != nil {
-		return err
-	}
 	if complete, err := installedTaskHome(parent, name, request); err != nil || complete {
-		if err != nil {
-			return err
-		}
-		return syncHomeDirectory(parent, ".")
+		return err
 	}
 	if err := publishInitialTaskHome(parent, stage, name); err != nil {
 		// Another initializer may have published the same complete attempt.
@@ -98,7 +89,7 @@ func InstallTaskHome(home, artifactPath string, request wire.Request) error {
 			return errors.Join(err, checkErr)
 		}
 	}
-	return syncHomeDirectory(parent, ".")
+	return nil
 }
 
 func publishInitialTaskHome(parent *os.Root, stage, name string) error {
@@ -237,9 +228,6 @@ func writeTaskHomeReceipt(home *os.Root, request wire.Request) error {
 		return err
 	}
 	_, err = file.Write(raw)
-	if err == nil {
-		err = file.Sync()
-	}
 	return errors.Join(err, file.Close())
 }
 
@@ -262,7 +250,7 @@ func openTaskHomeArtifact(path string) (*os.File, error) {
 
 func extractTaskHomeArchive(home *os.Root, input io.Reader, request wire.Request) error {
 	hash := sha256.New()
-	verified := io.TeeReader(input, hash)
+	verified := bufio.NewReaderSize(io.TeeReader(input, hash), 128<<10)
 	archive := tar.NewReader(verified)
 	header, err := archive.Next()
 	if err != nil || header.Name != taskHomeIdentityFile || header.Typeflag != tar.TypeReg || header.Size <= 0 || header.Size > wire.MaxRequestBytes {
@@ -290,7 +278,12 @@ func extractTaskHomeArchive(home *os.Root, input io.Reader, request wire.Request
 
 func extractTaskHomeEntries(home *os.Root, archive *tar.Reader) error {
 	seen := map[string]bool{}
-	links := map[string]string{}
+	extractor := homeArchiveExtractor{
+		home:        home,
+		directories: newStagedDirectories(home),
+		links:       map[string]string{},
+		buffer:      make([]byte, 32<<10),
+	}
 	for {
 		header, err := archive.Next()
 		if errors.Is(err, io.EOF) {
@@ -312,28 +305,30 @@ func extractTaskHomeEntries(home *os.Root, archive *tar.Reader) error {
 			return errors.New("task HOME archive contains an unconfined or reserved path")
 		}
 		seen[name] = true
-		if err := extractTaskHomeEntry(home, archive, path, header, links); err != nil {
+		if err := extractor.writeEntry(archive, path, header); err != nil {
 			return err
 		}
 	}
 	if !seen["home"] {
 		return errors.New("task HOME archive is missing its completed tree")
 	}
-	// Links become visible only after all files, so archive paths can never
-	// traverse an earlier link while writing another entry.
-	for path, target := range links {
-		if err := home.Symlink(target, path); err != nil {
-			return err
-		}
-	}
-	return nil
+	return extractor.publishLinks()
 }
 
-func extractTaskHomeEntry(home *os.Root, archive *tar.Reader, path string, header *tar.Header, links map[string]string) error {
+// Paths and file types are validated while writing this exclusively owned tree.
+// Only command links need filesystem validation after extraction.
+type homeArchiveExtractor struct {
+	home        *os.Root
+	directories *stagedDirectories
+	links       map[string]string
+	buffer      []byte
+}
+
+func (e *homeArchiveExtractor) writeEntry(archive *tar.Reader, path string, header *tar.Header) error {
 	if header.Typeflag == tar.TypeDir {
-		return homeDirectories(home, path)
+		return e.directories.mkdirAll(path)
 	}
-	if err := homeDirectories(home, filepath.Dir(path)); err != nil {
+	if err := e.directories.mkdirAll(filepath.Dir(path)); err != nil {
 		return err
 	}
 	if header.Typeflag == tar.TypeSymlink {
@@ -341,35 +336,33 @@ func extractTaskHomeEntry(home *os.Root, archive *tar.Reader, path string, heade
 		if !npmCommandPath(path) || filepath.IsAbs(header.Linkname) || !strings.HasPrefix(joined, runtimeimage.PiNPMDirectory+"/") {
 			return errors.New("task HOME archive contains an unapproved package link")
 		}
-		links[path] = header.Linkname
+		e.links[path] = header.Linkname
 		return nil
 	}
 	if header.Typeflag != tar.TypeReg {
 		return errors.New("task HOME archive contains a special file")
 	}
-	file, err := home.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600|os.FileMode(header.Mode)&0100)
+	file, err := e.home.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600|os.FileMode(header.Mode)&0100)
 	if err != nil {
 		return err
 	}
-	_, err = io.Copy(file, archive)
-	if err == nil {
-		err = file.Sync()
-	}
+	// Hide File.ReadFrom so CopyBuffer reuses this archive's buffer instead of
+	// allocating another copy buffer for every file.
+	_, err = io.CopyBuffer(struct{ io.Writer }{file}, archive, e.buffer)
 	return errors.Join(err, file.Close())
 }
 
-func syncTaskHomeTree(home *os.Root) error {
-	var directories []string
-	if err := fs.WalkDir(home.FS(), ".", func(path string, entry fs.DirEntry, walkErr error) error {
-		if walkErr == nil && entry.IsDir() {
-			directories = append(directories, path)
+func (e *homeArchiveExtractor) publishLinks() error {
+	// Links become visible only after all files, so archive paths can never
+	// traverse an earlier link while writing another entry.
+	for path, target := range e.links {
+		if err := e.home.Symlink(target, path); err != nil {
+			return err
 		}
-		return walkErr
-	}); err != nil {
-		return err
 	}
-	for i := len(directories) - 1; i >= 0; i-- {
-		if err := syncHomeDirectory(home, directories[i]); err != nil {
+	root := filepath.Join(e.home.Name(), runtimeimage.PiNPMDirectory)
+	for path := range e.links {
+		if err := runtimeimage.ValidateNPMCommandLink(root, filepath.Join(e.home.Name(), path)); err != nil {
 			return err
 		}
 	}

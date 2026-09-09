@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -165,6 +166,59 @@ func TestHomePublicationRefusesUnmarkedNativeDirectoryLinks(t *testing.T) {
 		t.Fatal("initialization adopted unmarked native state through a HOME link")
 	}
 	taskHomeContents(t, protected, "unrelated private configuration")
+}
+
+func TestTaskHomeRejectsUnusablePackageCommandsBeforePublication(t *testing.T) {
+	for _, failure := range []string{"missing target", "non-executable target"} {
+		t.Run(failure, func(t *testing.T) {
+			seed := canonicalHomeDirectory(t)
+			packageSeed(t, seed)
+			fixture := newTaskHomeFixture(t, taskHomeBundle(t, canonicalHomeDirectory(t)), seed)
+			artifact := fixture.prepare(t)
+			raw, err := os.ReadFile(artifact)
+			if err != nil {
+				t.Fatal(err)
+			}
+			input := tar.NewReader(bytes.NewReader(raw))
+			var rewritten bytes.Buffer
+			output := tar.NewWriter(&rewritten)
+			for {
+				header, err := input.Next()
+				if errors.Is(err, io.EOF) {
+					break
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				if failure == "missing target" && header.Typeflag == tar.TypeSymlink {
+					header.Linkname = "../fixture/missing-command"
+				}
+				if failure == "non-executable target" && header.Typeflag == tar.TypeReg {
+					header.Mode &^= 0111
+				}
+				if err := output.WriteHeader(header); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := io.Copy(output, input); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := output.Close(); err != nil {
+				t.Fatal(err)
+			}
+			fixture.request.HomeDigest = core.Digest(rewritten.Bytes())
+			if err := os.WriteFile(artifact, rewritten.Bytes(), 0600); err != nil {
+				t.Fatal(err)
+			}
+			home := canonicalHomeDirectory(t)
+			if err := InstallTaskHome(home, artifact, fixture.request); err == nil {
+				t.Fatal("HOME initialization accepted an unusable package command")
+			}
+			if err := CheckTaskHome(home, fixture.request); err == nil {
+				t.Fatal("an invalid package tree acquired completed HOME authority")
+			}
+		})
+	}
 }
 
 func TestConcurrentTaskHomeInitializationPublishesOneCompletePrivateTree(t *testing.T) {

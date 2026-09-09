@@ -72,6 +72,12 @@ read-only mount, validates it and publishes the complete private HOME atomically
 It does not compose provider configuration or skills again. A matching completed
 HOME survives init retries, including native edits, deleted files and npm changes.
 An incomplete or mismatched HOME cannot start a provider.
+Native HOME and init receipts are disposable Pod-local data. Init closes their
+writes before publication without forcing each file and directory to durable
+storage. The controller's archive on the workspace PVC remains durable.
+Directory checks are reused only within a newly created staging tree. Worker
+init validates archive paths and types during extraction, then verifies package
+command links against the completed tree before publishing it.
 
 Provider configuration can map complete directories to `.codex` and `.pi`.
 Nested skills, references and other selected files keep their relative paths.

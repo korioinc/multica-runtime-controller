@@ -70,11 +70,7 @@ func ValidateSeedContents(root string) error {
 		if prohibitedSeed(rel) {
 			return fmt.Errorf("home seed contains credential/session/log path %q", rel)
 		}
-		info, err := entry.Info()
-		if err != nil {
-			return err
-		}
-		if !info.IsDir() && !info.Mode().IsRegular() {
+		if !entry.IsDir() && !entry.Type().IsRegular() {
 			return errors.New("home seed contains link or special file")
 		}
 		return nil
@@ -118,23 +114,19 @@ func ValidateNPMSeed(path string) error {
 		if err != nil || relative == "." {
 			return err
 		}
-		info, err := entry.Info()
-		if err != nil {
-			return err
-		}
 		if relative != "node_modules" && !strings.HasPrefix(relative, "node_modules/") {
 			switch relative {
 			case "package.json", "package-lock.json", "npm-shrinkwrap.json", ".gitignore":
-				if info.Mode().IsRegular() {
+				if entry.Type().IsRegular() {
 					return nil
 				}
 			}
 			return fmt.Errorf("Pi npm seed contains non-package state %q", relative)
 		}
-		if info.Mode()&os.ModeSymlink != 0 {
+		if entry.Type()&os.ModeSymlink != 0 {
 			return ValidateNPMCommandLink(root, path)
 		}
-		if !info.IsDir() && !info.Mode().IsRegular() {
+		if !entry.IsDir() && !entry.Type().IsRegular() {
 			return errors.New("Pi npm seed contains a special file")
 		}
 		return nil
