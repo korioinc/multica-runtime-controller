@@ -56,16 +56,17 @@ func copyNPMSeed(home, source string) error {
 		return err
 	}
 	defer staged.Close()
+	directories := newStagedDirectories(staged)
 	if err := fs.WalkDir(input.FS(), ".", func(path string, entry fs.DirEntry, err error) error {
 		if err != nil || path == "." {
 			return err
 		}
-		info, err := input.Lstat(path)
+		info, err := entry.Info()
 		if err != nil {
 			return err
 		}
 		if info.IsDir() {
-			return homeDirectories(staged, path)
+			return directories.mkdirAll(path)
 		}
 		if info.Mode()&os.ModeSymlink != 0 {
 			target, err := input.Readlink(path)
