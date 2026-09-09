@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/korioinc/multica-runtime-controller/internal/execution"
+	"github.com/korioinc/multica-runtime-controller/internal/fixturehome"
 	runtimekube "github.com/korioinc/multica-runtime-controller/internal/kubernetes"
 	"github.com/korioinc/multica-runtime-controller/internal/wire"
 	corev1 "k8s.io/api/core/v1"
@@ -46,6 +47,7 @@ type fixture struct {
 	client        *runtimekube.Client
 	selection     execution.Selection
 	request       wire.Request
+	home          *fixturehome.Fixture
 	indexImage    string
 	indexManifest string
 	evidence      evidence
@@ -117,9 +119,6 @@ func run(kubeconfig, namespace, selectionPath, requestPath, evidencePath, select
 	if request.OwnerID != selection.OwnerID || !request.RuntimeRef.Equal(selection.RuntimeRef) {
 		return errors.New("request does not belong to selected fixture environment")
 	}
-	// A new controller owns new snapshot objects even when the stable runtime
-	// contents remain compatible. Match Runner's new-attempt selection behavior.
-	request.Snapshots = selection.Snapshots
 	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Minute)
 	defer cancel()
 	f := &fixture{ctx: ctx, api: api, config: cfg, client: &runtimekube.Client{API: api, Transport: cfg, Namespace: namespace}, selection: selection, request: request, evidence: evidence{SchemaVersion: 1, Started: time.Now().UTC(), Namespace: namespace}}
@@ -134,6 +133,9 @@ func run(kubeconfig, namespace, selectionPath, requestPath, evidencePath, select
 	defer func() {
 		for i := len(f.cleanup) - 1; i >= 0; i-- {
 			f.cleanup[i]()
+		}
+		if f.home != nil {
+			f.home.Close()
 		}
 		f.evidence.Completed = time.Now().UTC()
 		if result != nil {
@@ -151,6 +153,10 @@ func run(kubeconfig, namespace, selectionPath, requestPath, evidencePath, select
 	if _, err = f.client.Controller(ctx, selection.Controller.Name, selection.Controller.UID, selection.Worker.SingleNodeName); err != nil {
 		return fmt.Errorf("live fixture controller: %w", err)
 	}
+	f.home, err = fixturehome.Open(ctx, api, selection, request)
+	if err != nil {
+		return err
+	}
 	steps := []struct {
 		name string
 		run  func() error
@@ -161,6 +167,7 @@ func run(kubeconfig, namespace, selectionPath, requestPath, evidencePath, select
 		{"pod-payload-substitution", f.payloadSubstitution},
 		{"pod-uid-replacement", f.podReplacement},
 		{"secret-uid-replacement", f.secretReplacement},
+		{"controller-owner-authority", f.ownerAuthority},
 		{"referenced-secret", f.referencedSecret},
 		{"cleanup-recovery-preserves-files", f.cleanupRecovery},
 	}

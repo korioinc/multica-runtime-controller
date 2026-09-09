@@ -95,13 +95,13 @@ func TestScopeAndCredentialCannotAuthorizeAnotherStorage(t *testing.T) {
 	}
 	changed := first
 	changed.RepositoryURLs = other.RepositoryURLs
-	if _, err := store.Observe(changed); err == nil {
+	if _, err := store.ObserveBatch([]Observation{changed}); err == nil {
 		t.Fatal("same TaskID changed repository authority")
 	}
 	if _, err := store.Lookup(first.ID, first.AuthToken, first.WorkspaceID, first.AgentID); err == nil {
 		t.Fatal("revoked claim remained authorized")
 	}
-	if _, err := store.Observe(first); err == nil {
+	if _, err := store.ObserveBatch([]Observation{first}); err == nil {
 		t.Fatal("replaying old scope restored revoked authorization")
 	}
 	assertData(t, session, []byte("repository A history"))
@@ -144,7 +144,7 @@ func TestOwnerMismatchAndCorruptionPreserveAuthorityBytes(t *testing.T) {
 	if _, err := Open(options); err == nil {
 		t.Fatal("corrupt registry allowed startup")
 	}
-	if _, err := store.Observe(task); err == nil {
+	if _, err := store.ObserveBatch([]Observation{task}); err == nil {
 		t.Fatal("new claim repaired corrupt authority by overwriting it")
 	}
 	assertData(t, path, damaged)
@@ -261,7 +261,7 @@ func testObservation(ref runtimeimage.Ref) Observation {
 }
 func approve(t *testing.T, store *Store, task Observation) Claim {
 	t.Helper()
-	if _, err := store.Observe(task); err != nil {
+	if _, err := store.ObserveBatch([]Observation{task}); err != nil {
 		t.Fatal(err)
 	}
 	claim, err := store.Lookup(task.ID, task.AuthToken, task.WorkspaceID, task.AgentID)

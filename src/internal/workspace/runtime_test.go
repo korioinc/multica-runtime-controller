@@ -29,11 +29,11 @@ func TestArchivedEmptySessionCannotBeReactivated(t *testing.T) {
 	}
 	task.PriorWorkDir = filepath.Join(root, "workdir")
 	task.PriorSession = session
-	decision, err := store.Observe(task)
+	decisions, err := store.ObserveBatch([]Observation{task})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if decision.ResetWorkDir || !decision.ResetSession {
+	if decisions[0].ResetWorkDir || !decisions[0].ResetSession {
 		t.Fatal("archived session was offered for continuation")
 	}
 	claim, err = store.Lookup(task.ID, task.AuthToken, task.WorkspaceID, task.AgentID)

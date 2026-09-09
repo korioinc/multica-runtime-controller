@@ -13,7 +13,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/korioinc/multica-runtime-controller/internal/configuration"
 	"github.com/korioinc/multica-runtime-controller/internal/core"
 	"github.com/korioinc/multica-runtime-controller/internal/runtimeimage"
 	"github.com/korioinc/multica-runtime-controller/internal/wire"
@@ -49,14 +48,10 @@ func readWorkerRequest(digest, uid string) (wire.Request, runtimeimage.Descripto
 	if err := runtimeimage.CheckReceipt(wire.ControlRoot, manifest, imageDigest); err != nil {
 		return request, empty, err
 	}
-	bundle, err := configuration.Read(wire.ControlRoot)
-	if err != nil {
+	if err := CheckPrivate(); err != nil {
 		return request, empty, err
 	}
-	if bundle.Digest != request.RuntimeRef.ConfigurationDigest {
-		return request, empty, errors.New("worker committed configuration differs from request")
-	}
-	if err := CheckPrivate(); err != nil {
+	if err := CheckTaskHome(wire.Home, request); err != nil {
 		return request, empty, err
 	}
 	return request, manifest, nil
@@ -66,21 +61,9 @@ func WorkerServe(ctx context.Context) error {
 	if os.Getpid() != 1 {
 		return errors.New("worker serve must own container PID 1")
 	}
-	request, manifest, err := readWorkerRequest(os.Getenv("MULTICA_REQUEST_DIGEST"), os.Getenv("POD_UID"))
+	request, _, err := readWorkerRequest(os.Getenv("MULTICA_REQUEST_DIGEST"), os.Getenv("POD_UID"))
 	if err != nil {
 		return err
-	}
-	if request.Provider == "codex" {
-		bundle, err := configuration.Read(wire.ControlRoot)
-		if err != nil {
-			return err
-		}
-		if bundle.Digest != request.RuntimeRef.ConfigurationDigest {
-			return errors.New("worker committed configuration differs from request")
-		}
-		if err := hydrateSkills(wire.ControlRoot+"/assigned-skills", wire.Home, manifest.HomeSeed, bundle); err != nil {
-			return err
-		}
 	}
 	for _, dir := range []string{wire.ControlRoot, wire.Home + "/.multica/pi-sessions", wire.Home + "/.pi/agent", wire.Home + "/.codex"} {
 		if err := os.MkdirAll(dir, 0700); err != nil {

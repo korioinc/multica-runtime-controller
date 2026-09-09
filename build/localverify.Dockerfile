@@ -36,5 +36,5 @@ RUN LOCALVERIFY_DISPOSABLE_CONTAINER=true /usr/local/bin/verifyofficial --image 
 FROM prepared AS final
 COPY --from=verify --chown=0:0 --chmod=0444 /out/verification.json /opt/multica/runtime/verification.json
 USER 65532:65532
-ENTRYPOINT ["/opt/multica/controller/runtime"]
+# Exercise the runtime image's real startup sequence in task-worker Pods.
 CMD ["controller"]

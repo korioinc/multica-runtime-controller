@@ -141,6 +141,12 @@ func treeDigest(directory string) (string, error) {
 		if err != nil || name == "." {
 			return err
 		}
+		// HOME archives are attempt-owned transport artifacts. The positive
+		// execution creates and cleans them; all work and session data still
+		// participate in the preservation proof.
+		if name == ".runtime-home" && entry.IsDir() {
+			return fs.SkipDir
+		}
 		info, err := entry.Info()
 		if err != nil {
 			return err

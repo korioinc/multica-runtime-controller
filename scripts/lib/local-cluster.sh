@@ -30,6 +30,7 @@ lv_build_fixtures() {
 }
 lv_backend_ready() { lv_backend http://127.0.0.1:18080/fixture/health >/dev/null 2>&1; }
 lv_api_ready() { [[ $(lv_kube get --raw /readyz 2>/dev/null) == ok ]]; }
+lv_node_registered() { lv_kube get node verification-node >/dev/null 2>&1; }
 lv_registry_ready() {
   local registry
   registry=$(lv_owned_container registry) || return
@@ -80,6 +81,7 @@ lv_start_cluster() {
   docker start "$node" >/dev/null
   printf 'Live K3s container: %s %s\n' "$lv_name-node" "$node"
   lv_wait 'owned K3s API' 300 lv_api_ready
+  lv_wait 'owned K3s Node registration' 180 lv_node_registered
   lv_kube wait --for=condition=Ready node/verification-node --timeout=180s
   port=$(docker port "$node" 6443/tcp | awk -F: '/^127\.0\.0\.1:/ {print $NF}')
   [[ $port =~ ^[0-9]+$ ]] || lv_fail 'K3s must have exactly one loopback API port'

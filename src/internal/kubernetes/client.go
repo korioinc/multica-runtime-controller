@@ -4,33 +4,21 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
-	"io"
 	"slices"
 	"strings"
 	"time"
 
-	"github.com/go-logr/logr"
+	"github.com/korioinc/multica-runtime-controller/internal/diagnostics"
 	"github.com/korioinc/multica-runtime-controller/internal/wire"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	streamprotocol "k8s.io/apimachinery/pkg/util/remotecommand"
 	"k8s.io/apimachinery/pkg/util/wait"
 	clientset "k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/remotecommand"
-	"k8s.io/client-go/transport/spdy"
-	utilexec "k8s.io/client-go/util/exec"
-	"k8s.io/klog/v2"
 )
 
-type Streams struct {
-	Stdin          io.Reader
-	Stdout, Stderr io.Writer
-}
 type Client struct {
 	API       clientset.Interface
 	Transport *rest.Config
@@ -98,7 +86,7 @@ func podMatches(p *corev1.Pod, r Reference) bool {
 		return false
 	}
 	worker, init := p.Spec.Containers[0], p.Spec.InitContainers[0]
-	if worker.Name != "worker" || worker.Image != r.RuntimeRef.Image || init.Name != "home-layout" || init.Image != r.RuntimeRef.Image || !slices.Equal(worker.Command, []string{wire.ControllerRoot + "/runtime", "worker", "serve"}) || !slices.Equal(init.Command, []string{wire.ControllerRoot + "/runtime", "home", "layout", "--private-root=" + wire.PrivateRoot, "--request=" + wire.RequestPath}) {
+	if worker.Name != "worker" || worker.Image != r.RuntimeRef.Image || len(worker.Command) != 0 || !slices.Equal(worker.Args, []string{"worker", "serve"}) || init.Name != "home-layout" || init.Image != r.RuntimeRef.Image || !slices.Equal(init.Command, []string{wire.ControllerRoot + "/runtime", "home", "layout", "--private-root=" + wire.PrivateRoot, "--request=" + wire.RequestPath}) {
 		return false
 	}
 	if p.Spec.NodeSelector["kubernetes.io/os"] != "linux" || p.Spec.NodeSelector["kubernetes.io/arch"] != strings.TrimPrefix(r.RuntimeRef.Platform, "linux/") {
@@ -142,17 +130,18 @@ func podMatches(p *corev1.Pod, r Reference) bool {
 	return secretVolume && storage && private["agents"] && private["tmp"] && private["run"] && digest == r.RequestDigest && task == r.TaskID
 }
 
-func (c *Client) validateReferenceSnapshots(ctx context.Context, r Reference) error {
+func (c *Client) validateReferenceAuthority(ctx context.Context, r Reference) error {
 	if c.Namespace != r.Namespace {
 		return errors.New("task reference namespace mismatch")
 	}
 	if err := r.RuntimeRef.Validate(); err != nil {
 		return err
 	}
-	return c.ValidateSnapshots(ctx, r.Owner, r.Snapshots, r.RuntimeRef.ConfigurationDigest)
+	_, err := c.Controller(ctx, r.Owner.Name, r.Owner.UID, r.FixedNode)
+	return diagnostics.Wrap("controller_authority_changed", err)
 }
 func (c *Client) CreateSecret(ctx context.Context, r Reference, request wire.Request) (string, error) {
-	if err := c.validateReferenceSnapshots(ctx, r); err != nil {
+	if err := c.validateReferenceAuthority(ctx, r); err != nil {
 		return "", err
 	}
 	want, err := secretObject(r, request)
@@ -169,7 +158,7 @@ func (c *Client) CreateSecret(ctx context.Context, r Reference, request wire.Req
 	return string(s.UID), nil
 }
 func (c *Client) CreatePod(ctx context.Context, cfg Config, r Reference, request wire.Request, gateway string) (string, error) {
-	if err := c.validateReferenceSnapshots(ctx, r); err != nil {
+	if err := c.validateReferenceAuthority(ctx, r); err != nil {
 		return "", err
 	}
 	want, err := podObject(cfg, r, request, gateway)
@@ -186,14 +175,14 @@ func (c *Client) CreatePod(ctx context.Context, cfg Config, r Reference, request
 	return string(p.UID), nil
 }
 func (c *Client) ResolveSecret(ctx context.Context, r Reference) (string, error) {
-	if err := c.validateReferenceSnapshots(ctx, r); err != nil {
+	if err := c.validateReferenceAuthority(ctx, r); err != nil {
 		return "", err
 	}
 	return c.ResolveCleanupSecret(ctx, r)
 }
 
 // ResolveCleanupSecret identifies a journaled resource for deletion only.
-// Owner GC may already have removed its shared configuration snapshots.
+// The controller may already be terminating or absent.
 func (c *Client) ResolveCleanupSecret(ctx context.Context, r Reference) (string, error) {
 	if c.Namespace != r.Namespace {
 		return "", errors.New("cleanup reference namespace mismatch")
@@ -208,14 +197,14 @@ func (c *Client) ResolveCleanupSecret(ctx context.Context, r Reference) (string,
 	return string(s.UID), nil
 }
 func (c *Client) ResolvePod(ctx context.Context, r Reference) (string, error) {
-	if err := c.validateReferenceSnapshots(ctx, r); err != nil {
+	if err := c.validateReferenceAuthority(ctx, r); err != nil {
 		return "", err
 	}
 	return c.ResolveCleanupPod(ctx, r)
 }
 
 // ResolveCleanupPod cannot grant execution authority; reuse and execution keep
-// the live snapshot checks in ResolvePod and Execute.
+// the live controller checks in ResolvePod and Execute.
 func (c *Client) ResolveCleanupPod(ctx context.Context, r Reference) (string, error) {
 	if c.Namespace != r.Namespace {
 		return "", errors.New("cleanup reference namespace mismatch")
@@ -424,80 +413,4 @@ func ReferencesSecret(p *corev1.Pod, name string) bool {
 		return false
 	}
 	return visit(spec, "")
-}
-
-func (c *Client) Execute(ctx context.Context, r Reference, deadline time.Duration, streams Streams) error {
-	if r.PodUID == "" || r.SecretUID == "" {
-		return errors.New("execution UIDs are unresolved")
-	}
-	if err := wait.PollUntilContextTimeout(ctx, 250*time.Millisecond, min(deadline, 5*time.Minute), true, func(ctx context.Context) (bool, error) {
-		p, err := c.pod(ctx, r.PodName)
-		if err != nil {
-			return false, err
-		}
-		if !podMatches(p, r) || p.DeletionTimestamp != nil {
-			return false, errors.New("execution Pod identity changed")
-		}
-		if p.Status.Phase == corev1.PodFailed || p.Status.Phase == corev1.PodSucceeded {
-			return false, errors.New("worker ended before execution")
-		}
-		for _, s := range p.Status.ContainerStatuses {
-			if s.Name == "worker" && s.Ready {
-				return true, nil
-			}
-		}
-		return false, nil
-	}); err != nil {
-		return err
-	}
-	if err := c.validateReferenceSnapshots(ctx, r); err != nil {
-		return err
-	}
-	secret, err := c.secret(ctx, r.SecretName)
-	if err != nil {
-		return err
-	}
-	if !secretMatches(secret, r) || secret.DeletionTimestamp != nil {
-		return errors.New("execution request Secret identity changed")
-	}
-	u := c.API.CoreV1().RESTClient().Post().Resource("pods").Namespace(c.Namespace).Name(r.PodName).SubResource("exec").VersionedParams(&corev1.PodExecOptions{Container: "worker", Command: []string{wire.ControllerRoot + "/runtime", "worker", "execute", "--request-digest=" + r.RequestDigest, "--pod-uid=" + r.PodUID, fmt.Sprintf("--stdin=%t", streams.Stdin != nil), fmt.Sprintf("--stdout=%t", streams.Stdout != nil), fmt.Sprintf("--stderr=%t", streams.Stderr != nil)}, Stdin: streams.Stdin != nil, Stdout: streams.Stdout != nil, Stderr: streams.Stderr != nil}, scheme.ParameterCodec).URL()
-	transport, upgrader, err := spdy.RoundTripperFor(c.Transport)
-	if err != nil {
-		return fmt.Errorf("%w: configure exec upgrade: %w", ErrTransport, err)
-	}
-	executor, err := remotecommand.NewSPDYExecutorForProtocols(transport, statusUpgrader{delegate: upgrader}, "POST", u, streamprotocol.StreamProtocolV4Name)
-	if err != nil {
-		return fmt.Errorf("%w: create exec stream: %w", ErrTransport, err)
-	}
-	streamContext, cancel := context.WithCancel(ctx)
-	defer cancel()
-	fault := &streamFault{cancel: cancel}
-	options := remotecommand.StreamOptions{}
-	if streams.Stdin != nil {
-		options.Stdin = trackedReader{source: streams.Stdin, fault: fault}
-	}
-	if streams.Stdout != nil {
-		options.Stdout = trackedWriter{target: streams.Stdout, fault: fault}
-	}
-	if streams.Stderr != nil {
-		options.Stderr = trackedWriter{target: streams.Stderr, fault: fault}
-	}
-	err = executor.StreamWithContext(klog.NewContext(streamContext, logr.Discard()), options)
-	if localErr := fault.failure(); localErr != nil {
-		return fmt.Errorf("%w: task stream endpoint failed: %w", ErrTransport, localErr)
-	}
-	if _, exited := ExitCode(err); err != nil && !exited {
-		return fmt.Errorf("%w: %w", ErrTransport, err)
-	}
-	return err
-}
-func ExitCode(err error) (int, bool) {
-	if err == nil {
-		return 0, true
-	}
-	var code utilexec.ExitError
-	if errors.As(err, &code) {
-		return code.ExitStatus(), true
-	}
-	return 1, false
 }

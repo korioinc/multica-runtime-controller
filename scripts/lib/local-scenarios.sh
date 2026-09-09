@@ -246,12 +246,6 @@ lv_task_complete() {
   if jq -e --arg task "$task" '.tasks[$task].failure != null' <<<"$state" >/dev/null; then lv_fail 'the fixture task failed'; return 125; fi
   jq -e --arg task "$task" '.tasks[$task].completion != null and .tasks[$task].provider.stage == "completed"' <<<"$state" >/dev/null
 }
-lv_task_rejected() {
-  local task=$1 state
-  state=$(lv_backend_state) || return
-  if jq -e --arg task "$task" '.tasks[$task].provider != null or .tasks[$task].completion != null' <<<"$state" >/dev/null; then lv_fail 'replaced snapshot authority reached provider execution'; return 125; fi
-  jq -e --arg task "$task" '.tasks[$task].failure != null' <<<"$state" >/dev/null
-}
 lv_task_pod() {
   lv_kube -n "$lv_namespace" get pods -l "multica.ai/task-id=$1" -o json |
     jq -er 'if (.items | length) == 1 then .items[0].metadata.name else error("one task Pod required") end'
@@ -261,20 +255,46 @@ lv_release_task() {
   lv_wait 'held task completion' 180 lv_task_complete "$1"
 }
 lv_worker_content_rejection() {
-  local worker=$1 snapshot name
-  snapshot=$(jq -er '.snapshots[0].name' "$lv_evidence/selection.json")
-  name=fixture-tampered-snapshot
-  lv_kube -n "$lv_namespace" get configmap "$snapshot" -o json |
-    jq --arg name "$name" --arg ns "$lv_namespace" '{apiVersion:"v1",kind:"ConfigMap",metadata:{name:$name,namespace:$ns},immutable:true,data:(.data | with_entries(.value += "tampered")),binaryData}' |
-    lv_kube create -f -
+  local worker=$1 expected
+  expected=$(jq -er '.homeDigest | select(test("^[0-9a-f]{64}$"))' "$lv_evidence/pending-request.json")
+  cat >"$lv_work/tamper-home.sh" <<'TAMPER'
+set -eu
+archive_source=/etc/multica/home/task-home.tar
+scratch=/opt/multica/private/fixture-artifact
+mkdir -m 0700 "$scratch" "$scratch/tree"
+cp "$archive_source" "$scratch/original.tar"
+test "$(sha256sum "$scratch/original.tar" | cut -d ' ' -f 1)" = "$1"
+tar -xf "$scratch/original.tar" -C "$scratch/tree"
+test -f "$scratch/tree/home/.fixture/operator.txt"
+printf 'untrusted-worker-configuration\n' >"$scratch/tree/home/.fixture/operator.txt"
+tar -cf "$scratch/task-home.tar" -C "$scratch/tree" identity.json home
+after=$(sha256sum "$scratch/task-home.tar" | cut -d ' ' -f 1)
+test "$after" != "$1"
+test "$(tar -xOf "$scratch/task-home.tar" home/.fixture/operator.txt)" = untrusted-worker-configuration
+printf 'HOME content substitution prepared: source=%s tampered=%s\n' "$1" "$after"
+TAMPER
   lv_kube -n "$lv_namespace" get pod "$worker" -o json |
-    jq --arg ns "$lv_namespace" --arg name "$name" '{apiVersion:"v1",kind:"Pod",metadata:{name:"worker-content-reject",namespace:$ns},spec:.spec} |
-      del(.spec.nodeName) | .spec.volumes |= map(if .configMap != null then .configMap.name=$name else . end)' >"$lv_work/worker-content-reject.json"
+    jq --arg ns "$lv_namespace" --arg expected "$expected" --rawfile tamper "$lv_work/tamper-home.sh" '
+      . as $pod | ($pod.spec.initContainers[] | select(.name == "home-layout")) as $home |
+      ($home.volumeMounts[] | select(.mountPath == "/etc/multica/home/task-home.tar")) as $input |
+      {apiVersion:"v1",kind:"Pod",metadata:{name:"worker-content-reject",namespace:$ns},spec:$pod.spec} |
+      del(.spec.nodeName) |
+      .spec.initContainers |= map(if .name == "home-layout" then
+        .volumeMounts |= map(if .mountPath == "/etc/multica/home/task-home.tar" then
+          {name:"runtime-private",mountPath:.mountPath,subPath:"fixture-artifact/task-home.tar",readOnly:true}
+          else . end) else . end) |
+      .spec.initContainers = ([{name:"tamper-home",image:$home.image,imagePullPolicy:$home.imagePullPolicy,
+        command:["/bin/sh","-ec",$tamper,"tamper-home",$expected],securityContext:$home.securityContext,
+        volumeMounts:[{name:"runtime-private",mountPath:"/opt/multica/private"},$input]}] + .spec.initContainers)
+    ' >"$lv_work/worker-content-reject.json"
   lv_kube create -f - <"$lv_work/worker-content-reject.json"
-  lv_wait 'worker-mounted payload rejection' 120 lv_pod_phase worker-content-reject Failed
+  lv_wait 'worker HOME archive content rejection' 120 lv_pod_phase worker-content-reject Failed
   lv_kube -n "$lv_namespace" get pod worker-content-reject -o json >"$lv_evidence/worker-content-reject.json"
-  jq -e 'any(.status.initContainerStatuses[]?; .name == "home-layout" and .state.terminated.exitCode != null and .state.terminated.exitCode != 0) and all(.status.containerStatuses[]?; .state.running == null and .state.terminated == null)' "$lv_evidence/worker-content-reject.json" >/dev/null
-  lv_pass 'worker init rejects changed mounted payload before any provider process starts'
+  lv_kube -n "$lv_namespace" logs worker-content-reject -c tamper-home >"$lv_evidence/worker-home-tamper.log"
+  lv_kube -n "$lv_namespace" logs worker-content-reject -c home-layout >"$lv_evidence/worker-home-rejection.log"
+  jq -e 'any(.status.initContainerStatuses[]?; .name == "tamper-home" and .state.terminated.exitCode == 0) and any(.status.initContainerStatuses[]?; .name == "home-layout" and .state.terminated.exitCode != null and .state.terminated.exitCode != 0) and all(.status.containerStatuses[]?; .state.running == null and .state.terminated == null)' "$lv_evidence/worker-content-reject.json" >/dev/null
+  rg -q 'reason=task_home_digest_mismatch' "$lv_evidence/worker-home-rejection.log"
+  lv_pass 'worker init rejects changed HOME archive contents before any provider process starts'
 }
 lv_tag_and_configuration_drift() {
   lv_stage 'Moving latest and operator sources while A workers keep their admitted inputs'
@@ -293,7 +313,7 @@ lv_tag_and_configuration_drift() {
   lv_kube -n "$lv_namespace" exec "$first_worker" -c worker -- sh -ec 'printf worker-private > /home/multica/agents/.fixture/operator.txt'
   [[ $(lv_kube -n "$lv_namespace" exec "$controller" -c controller -- cat /home/multica/agents/.fixture/operator.txt) == controller-private ]]
   lv_kube cordon verification-node >/dev/null
-  result=$(lv_backend -X POST -H 'Content-Type: application/json' --data '{"case":"pending-snapshot","scope":"b","transport":"http","hold":true}' http://127.0.0.1:18080/fixture/run)
+  result=$(lv_backend -X POST -H 'Content-Type: application/json' --data '{"case":"pending-home-archive","scope":"b","transport":"http","hold":true}' http://127.0.0.1:18080/fixture/run)
   second=$(jq -er .input.taskID <<<"$result")
   lv_state --arg first "$first" --arg second "$second" '.heldOriginal=$first | .heldPending=$second'
   lv_wait 'worker pending while its source is removed' 90 lv_task_pod_pending "$second"
@@ -302,39 +322,17 @@ lv_tag_and_configuration_drift() {
   jq -e --arg image "$lv_image_a" 'all(.spec.containers[]; .image == $image) and all(.spec.initContainers[]; .image == $image)' "$lv_evidence/pending-worker.json" >/dev/null
   lv_kube -n "$lv_namespace" delete configmap fixture-provider --wait=true
   lv_kube uncordon verification-node >/dev/null
-  lv_wait 'pending A worker uses its preserved snapshot' 180 lv_task_started "$second"
+  lv_wait 'pending A worker uses its preserved HOME archive' 180 lv_task_started "$second"
   [[ $(lv_kube -n "$lv_namespace" exec "$second_worker" -c worker -- cat /home/multica/agents/.fixture/operator.txt) == configuration-A ]]
   [[ $(lv_kube -n "$lv_namespace" exec "$first_worker" -c worker -- cat /home/multica/agents/.fixture/operator.txt) == worker-private ]]
   lv_kube -n "$lv_namespace" get pod "$second_worker" -o json >"$lv_evidence/admitted-worker.json"
   jq -e --arg image "$lv_image_a" 'all(.status.containerStatuses[]; (.imageID | sub("^docker-pullable://";"")) == $image) and all(.status.initContainerStatuses[]; (.imageID | sub("^docker-pullable://";"")) == $image)' "$lv_evidence/admitted-worker.json" >/dev/null
   lv_kube -n "$lv_namespace" exec "$second_worker" -c worker -- cat /etc/multica/task/request.json >"$lv_evidence/pending-request.json"
-  jq -e --slurpfile selected "$lv_evidence/selection.json" '.runtimeRef == $selected[0].runtimeRef and .snapshots == $selected[0].snapshots' "$lv_evidence/pending-request.json" >/dev/null
+  jq -e --slurpfile selected "$lv_evidence/selection.json" '.runtimeRef == $selected[0].runtimeRef and .ownerID == $selected[0].ownerID and (.homeDigest | test("^[0-9a-f]{64}$"))' "$lv_evidence/pending-request.json" >/dev/null
   lv_worker_content_rejection "$second_worker"
   lv_release_task "$first"
   lv_drive release
-  lv_pass 'latest A→B, mutable source update/deletion and pending scheduling keep A digest/platform/snapshots; controller and worker HOME changes are isolated'
-}
-lv_snapshot_replacement() {
-  lv_stage 'Replacing a same-name snapshot while its worker waits for scheduling'
-  local name uid result task
-  lv_export_selection
-  name=$(jq -er '.snapshots[0].name' "$lv_evidence/selection.json")
-  uid=$(jq -er '.snapshots[0].uid' "$lv_evidence/selection.json")
-  lv_kube -n "$lv_namespace" get configmap "$name" -o json >"$lv_work/replaced-snapshot.json"
-  jq -e --arg uid "$uid" '.metadata.uid == $uid' "$lv_work/replaced-snapshot.json" >/dev/null
-  lv_kube cordon verification-node >/dev/null
-  result=$(lv_backend -X POST -H 'Content-Type: application/json' --data '{"case":"replaced-snapshot","scope":"b","transport":"http"}' http://127.0.0.1:18080/fixture/run)
-  task=$(jq -er .input.taskID <<<"$result")
-  lv_state --arg task "$task" '.snapshotRejectionTask=$task'
-  lv_wait 'worker pending before snapshot replacement' 90 lv_task_pod_pending "$task"
-  jq -cn --arg uid "$uid" '{apiVersion:"v1",kind:"DeleteOptions",preconditions:{uid:$uid}}' |
-    lv_kube delete --raw "/api/v1/namespaces/$lv_namespace/configmaps/$name" -f - >/dev/null
-  jq 'del(.metadata.uid,.metadata.resourceVersion,.metadata.creationTimestamp,.metadata.managedFields)' "$lv_work/replaced-snapshot.json" | lv_kube create -f -
-  lv_kube uncordon verification-node >/dev/null
-  lv_wait 'snapshot UID replacement rejection before provider execution' 180 lv_task_rejected "$task"
-  lv_kube -n "$lv_namespace" get configmap "$name" -o json >"$lv_evidence/replaced-snapshot.json"
-  jq -e --arg uid "$uid" '.metadata.uid != $uid' "$lv_evidence/replaced-snapshot.json" >/dev/null
-  lv_pass 'same-name, same-content snapshot replacement is rejected before the pending worker executes'
+  lv_pass 'latest A→B, mutable source update/deletion and pending scheduling keep A image/platform and HOME contents; controller and worker HOME changes are isolated'
 }
 lv_access_absent() {
   local task kind
@@ -358,6 +356,7 @@ lv_kubernetes_checks() {
   lv_stage 'Checking actual Kubernetes response loss, UID fencing, cleanup and scheduling'
   local index backend digest
   lv_export_selection
+  cp "$lv_evidence/selection.json" "$lv_evidence/equivalent-selection-before.json"
   lv_backend_state | jq -e '[.tasks[] | select(.input.case == "environment-change" and .completion != null and .provider != null)] | if length == 1 then .[0] else error("one completed B continuation required") end' >"$lv_evidence/equivalent-before.json"
   index=$(jq -er .publishedImageB "$lv_work/state.json")
   digest=${index##*@}
@@ -366,24 +365,31 @@ lv_kubernetes_checks() {
   [[ "sha256:$(lv_sha <"$lv_evidence/index-manifest.json")" == "$digest" ]] || lv_fail 'registry index bytes differ from the selected index digest'
   jq -e --arg arch "$lv_arch" '(.mediaType == "application/vnd.oci.image.index.v1+json" or .mediaType == "application/vnd.docker.distribution.manifest.list.v2+json") and ([.manifests[] | select(.platform.os == "linux" and .platform.architecture == $arch)] | length == 1)' "$lv_evidence/index-manifest.json" >/dev/null
   lv_run kubernetes.log docker exec --env LOCALVERIFY_DISPOSABLE_CLUSTER=true "$(lv_owned_container node)" /verifykube --kubeconfig /etc/rancher/k3s/k3s.yaml --namespace "$lv_namespace" --selection /verification-evidence/selection.json --request /verification-evidence/request.json --index-image "$index" --index-manifest /verification-evidence/index-manifest.json --evidence /verification-evidence/kubernetes.json
-  lv_pass 'actual K3s create-response loss, payload/UID substitution, referenced Secret protection, cleanup recovery and fixed-node scheduling'
+  lv_pass 'actual K3s create-response loss, payload/UID substitution, live controller authority, referenced Secret protection, cleanup recovery and fixed-node scheduling'
 }
 lv_equivalent_configuration() {
-  lv_stage 'Continuing a native session after only controller/snapshot object identity changes'
+  lv_stage 'Continuing a native session after the actual controller Pod is recreated'
   local prior result task
   lv_export_selection
+  cp "$lv_evidence/selection.json" "$lv_evidence/equivalent-selection-after.json"
+  jq -e --slurpfile before "$lv_evidence/equivalent-selection-before.json" --slurpfile checks "$lv_evidence/kubernetes.json" '
+    . as $after | $before[0] as $before |
+    $after.controller.uid != $before.controller.uid and $after.runtimeRef == $before.runtimeRef and
+    any($checks[0].checks[]; .name == "actual-controller-recreated" and .passed == true and
+      .details.beforeUID == $before.controller.uid and .details.afterUID == $after.controller.uid)
+  ' "$lv_evidence/equivalent-selection-after.json" >/dev/null
   prior=$(jq -er .input.taskID "$lv_evidence/equivalent-before.json")
-  result=$(jq -cn --arg prior "$prior" '{case:"snapshot-object-continuation",scope:"a",transport:"http",priorTaskID:$prior}')
+  result=$(jq -cn --arg prior "$prior" '{case:"controller-object-continuation",scope:"a",transport:"http",priorTaskID:$prior}')
   task=$(lv_backend -X POST -H 'Content-Type: application/json' --data "$result" http://127.0.0.1:18080/fixture/run | jq -er .input.taskID)
-  lv_wait 'same-runtime continuation with newly owned snapshot objects' 240 lv_task_complete "$task"
+  lv_wait 'same-runtime continuation under the new controller UID' 240 lv_task_complete "$task"
   lv_backend_state | jq -e --arg task "$task" '.tasks[$task]' >"$lv_evidence/equivalent-after.json"
   jq -e --slurpfile before "$lv_evidence/equivalent-before.json" '
     .provider as $after | $before[0].provider as $before |
     $after.priorWork == true and $after.priorSession == true and
     $after.storage == $before.storage and $after.branch == $before.branch and $after.session == $before.session and
-    $after.runtimeRef == $before.runtimeRef and $after.request.snapshots != $before.request.snapshots
+    $after.runtimeRef == $before.runtimeRef
   ' "$lv_evidence/equivalent-after.json" >/dev/null
-  lv_pass 'same logical image/configuration preserves real files, branch and Pi session across new controller/snapshot names and UIDs'
+  lv_pass 'same logical image/configuration preserves real files, branch and Pi session across a verified controller UID change'
 }
 lv_transport_checks() {
   lv_stage 'Severing an active Kubernetes execution stream'
@@ -404,11 +410,10 @@ lv_runtime_scenarios() {
   lv_step interrupted-recovered lv_interrupted_recovered
   lv_step hold lv_drive hold
   lv_step image-and-config-drift lv_tag_and_configuration_drift
-  lv_step snapshot-replaced lv_snapshot_replacement
   lv_step install-b lv_install B
   lv_step changed lv_drive changed
   lv_step access lv_access_checks
   lv_step kubernetes lv_kubernetes_checks
-  lv_step equivalent-snapshots lv_equivalent_configuration
+  lv_step equivalent-controller lv_equivalent_configuration
   lv_step transport lv_transport_checks
 }

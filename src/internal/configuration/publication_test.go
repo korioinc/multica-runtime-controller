@@ -13,7 +13,7 @@ import (
 func TestUnpublishableGroupCannotPublishPartialBundleOrHome(t *testing.T) {
 	input, run, home := t.TempDir(), t.TempDir(), t.TempDir()
 	content := bytes.Repeat([]byte("x"), configuration.MaxGroupBytes*3/4)
-	// Each file fits one source object; together they cannot form one snapshot.
+	// Each file fits the source limit; the combined group exceeds it.
 	if err := os.Mkdir(filepath.Join(input, "combined"), 0700); err != nil {
 		t.Fatal(err)
 	}

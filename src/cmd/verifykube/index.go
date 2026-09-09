@@ -8,7 +8,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/korioinc/multica-runtime-controller/internal/core"
 	runtimekube "github.com/korioinc/multica-runtime-controller/internal/kubernetes"
 	"github.com/korioinc/multica-runtime-controller/internal/runtimeimage"
 	"github.com/korioinc/multica-runtime-controller/internal/wire"
@@ -24,41 +23,9 @@ func (f *fixture) indexWorker() error {
 	if err != nil {
 		return err
 	}
-	if !strings.HasSuffix(image, "@sha256:"+core.Digest(raw)) {
-		return errors.New("raw registry index differs from its digest")
-	}
-	var index struct {
-		SchemaVersion int    `json:"schemaVersion"`
-		MediaType     string `json:"mediaType"`
-		Manifests     []struct {
-			Digest   string `json:"digest"`
-			Platform struct {
-				OS           string `json:"os"`
-				Architecture string `json:"architecture"`
-			} `json:"platform"`
-			Annotations map[string]string `json:"annotations"`
-		} `json:"manifests"`
-	}
-	if err = json.Unmarshal(raw, &index); err != nil {
-		return err
-	}
-	if index.SchemaVersion != 2 || index.MediaType != "application/vnd.oci.image.index.v1+json" && index.MediaType != "application/vnd.docker.distribution.manifest.list.v2+json" {
-		return errors.New("registry object is not an executable OCI index")
-	}
-	native := 0
-	for _, entry := range index.Manifests {
-		if entry.Platform.OS == "unknown" && entry.Platform.Architecture == "unknown" && entry.Annotations["vnd.docker.reference.type"] == "attestation-manifest" {
-			continue
-		}
-		if entry.Platform.OS+"/"+entry.Platform.Architecture != f.selection.RuntimeRef.Platform || !strings.HasPrefix(entry.Digest, "sha256:") || !core.ValidSHA(strings.TrimPrefix(entry.Digest, "sha256:")) {
-			return errors.New("index has an unexpected executable platform")
-		}
-		native++
-	}
-	if native != 1 {
-		return errors.New("index must select exactly one native executable")
-	}
-	ref, request, err := f.attempt()
+	// HOME rebinding also proves that this index selects the sample's exact
+	// native manifest; other runtime/configuration contents remain unchanged.
+	ref, request, err := f.attemptWithImage(image, raw)
 	if err != nil {
 		return err
 	}
@@ -67,8 +34,6 @@ func (f *fixture) indexWorker() error {
 		return err
 	}
 	request.Args = []string{"--version", "--session", session}
-	request.RuntimeRef.Image = image
-	ref.RuntimeRef = request.RuntimeRef
 	raw, err = json.Marshal(request)
 	if err != nil {
 		return err
