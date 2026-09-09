@@ -1,7 +1,6 @@
 package execution
 
 import (
-	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -13,7 +12,7 @@ import (
 	"github.com/korioinc/multica-runtime-controller/internal/runtimeimage"
 )
 
-func journalAttempt(t *testing.T, files int) (*journal, *attempt) {
+func journalAttempt(t *testing.T) (*journal, *attempt) {
 	t.Helper()
 	root, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
@@ -30,19 +29,14 @@ func journalAttempt(t *testing.T, files int) (*journal, *attempt) {
 		c.ShimPaths[alias] = core.Root + "/shims/" + alias
 	}
 	g := configuration.Group{Name: "provider", Directories: []string{".fixture"}, Files: []configuration.File{}}
-	for i := 0; i < files; i++ {
-		content := []byte(fmt.Sprintf("operator setting %d", i))
-		g.Files = append(g.Files, configuration.File{Target: fmt.Sprintf(".fixture/settings-%05d.json", i), Mode: 0600, SHA256: core.Digest(content), Content: content})
-	}
-	refs := []configuration.SnapshotRef{{Namespace: "fixture", Name: "snapshot", UID: uuid.NewString(), SourceGroup: g.Name, Digest: configuration.GroupDigest(g), Directories: g.Directories, Mappings: g.Mappings()}}
-	runtime := runtimeimage.Ref{SchemaVersion: 2, Image: "registry.example/runtime@sha256:" + sha, Platform: c.Platform, ImageBuildID: uuid.NewString(), DescriptorDigest: sha, Controller: c, Daemon: runtimeimage.Daemon{Executable: runtimeimage.Executable{Path: "/opt/tools/multica", Version: "0.4.40", SHA256: sha}, AdapterContract: runtimeimage.AdapterContract}, Providers: map[string]runtimeimage.Executable{"pi": {Path: "/opt/tools/pi", Version: "1.0.0", SHA256: sha}}, ConfigurationDigest: configuration.DigestRefs(refs)}
+	runtime := runtimeimage.Ref{SchemaVersion: 2, Image: "registry.example/runtime@sha256:" + sha, Platform: c.Platform, ImageBuildID: uuid.NewString(), DescriptorDigest: sha, Controller: c, Daemon: runtimeimage.Daemon{Executable: runtimeimage.Executable{Path: "/opt/tools/multica", Version: "0.4.40", SHA256: sha}, AdapterContract: runtimeimage.AdapterContract}, Providers: map[string]runtimeimage.Executable{"pi": {Path: "/opt/tools/pi", Version: "1.0.0", SHA256: sha}}, ConfigurationDigest: configuration.Digest([]configuration.Group{g})}
 	storage, task, id := uuid.NewString(), uuid.NewString(), uuid.NewString()
-	a := &attempt{SchemaVersion: 2, OwnerID: owner, Created: time.Now().UTC(), Ref: kubernetes.Reference{Namespace: "fixture", Owner: kubernetes.Owner{Name: "controller", UID: uuid.NewString()}, TaskID: task, StorageID: storage, AttemptID: id, PodName: "task-worker-" + storage, SecretName: "task-request-" + id, PodDigest: sha, RequestDigest: sha, RuntimeRef: runtime, Snapshots: refs}}
+	a := &attempt{SchemaVersion: attemptSchemaVersion, OwnerID: owner, Created: time.Now().UTC(), Ref: kubernetes.Reference{Namespace: "fixture", Owner: kubernetes.Owner{Name: "controller", UID: uuid.NewString()}, TaskID: task, StorageID: storage, AttemptID: id, PodName: "task-worker-" + storage, SecretName: "task-request-" + id, PodDigest: sha, RequestDigest: sha, RuntimeRef: runtime}}
 	return j, a
 }
 
-func TestManyOperatorFilesRemainRecoverableInAttemptJournal(t *testing.T) {
-	j, a := journalAttempt(t, 700)
+func TestAttemptReopenPreservesExecutionAuthority(t *testing.T) {
+	j, a := journalAttempt(t)
 	if err := j.save(a); err != nil {
 		t.Fatal(err)
 	}
@@ -63,15 +57,14 @@ func TestManyOperatorFilesRemainRecoverableInAttemptJournal(t *testing.T) {
 }
 
 func TestRejectedJournalWritePreservesExistingRecoveryState(t *testing.T) {
-	j, a := journalAttempt(t, 1)
+	j, a := journalAttempt(t)
 	if err := j.save(a); err != nil {
 		t.Fatal(err)
 	}
-	_, oversized := journalAttempt(t, 12000)
-	oversized.OwnerID, oversized.Ref.AttemptID = a.OwnerID, a.Ref.AttemptID
-	oversized.Ref.SecretName = a.Ref.SecretName
-	if err := j.save(oversized); err == nil {
-		t.Fatal("unreadable attempt replaced durable recovery state")
+	foreign := *a
+	foreign.OwnerID = uuid.NewString()
+	if err := j.save(&foreign); err == nil {
+		t.Fatal("foreign attempt replaced durable recovery state")
 	}
 	got, err := j.read(a.Ref.AttemptID)
 	if err != nil {

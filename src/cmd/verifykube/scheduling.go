@@ -13,6 +13,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/util/retry"
 )
 
 func (f *fixture) fixedAffinity(node string) *corev1.Affinity {
@@ -115,18 +116,23 @@ func (f *fixture) alternativeNode(fixed string) (*corev1.Node, error) {
 		_ = f.api.CoreV1().Nodes().Delete(ctx, name, metav1.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &uid}})
 	})
 	heartbeat := func(ctx context.Context) error {
-		current, err := f.api.CoreV1().Nodes().Get(ctx, name, metav1.GetOptions{})
-		if err != nil {
+		return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			current, err := f.api.CoreV1().Nodes().Get(ctx, name, metav1.GetOptions{})
+			if err != nil {
+				return err
+			}
+			if current.UID != uid {
+				return errors.New("scheduler fixture Node was replaced")
+			}
+			current.Status.Capacity = corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("128"), corev1.ResourceMemory: resource.MustParse("512Gi"), corev1.ResourcePods: resource.MustParse("110")}
+			current.Status.Allocatable = current.Status.Capacity.DeepCopy()
+			current.Status.Conditions = []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue, Reason: "DisposableSchedulerFixture", LastHeartbeatTime: metav1.Now(), LastTransitionTime: metav1.Now()}}
+			_, err = f.api.CoreV1().Nodes().UpdateStatus(ctx, current, metav1.UpdateOptions{})
 			return err
-		}
-		if current.UID != uid {
-			return errors.New("scheduler fixture Node was replaced")
-		}
-		current.Status.Capacity = corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("128"), corev1.ResourceMemory: resource.MustParse("512Gi"), corev1.ResourcePods: resource.MustParse("110")}
-		current.Status.Allocatable = current.Status.Capacity.DeepCopy()
-		current.Status.Conditions = []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue, Reason: "DisposableSchedulerFixture", LastHeartbeatTime: metav1.Now(), LastTransitionTime: metav1.Now()}}
-		_, err = f.api.CoreV1().Nodes().UpdateStatus(ctx, current, metav1.UpdateOptions{})
-		return err
+		})
 	}
 	if err = heartbeat(f.ctx); err != nil {
 		close(done)

@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,6 +22,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/korioinc/multica-runtime-controller/internal/execution"
+	"github.com/korioinc/multica-runtime-controller/internal/fixturehome"
 	runtimekube "github.com/korioinc/multica-runtime-controller/internal/kubernetes"
 	"github.com/korioinc/multica-runtime-controller/internal/wire"
 	corev1 "k8s.io/api/core/v1"
@@ -67,7 +69,6 @@ type streamFixture struct {
 	config    *rest.Config
 	client    *runtimekube.Client
 	selection execution.Selection
-	sample    wire.Request
 }
 
 func main() {
@@ -145,7 +146,6 @@ func run(kubeconfig, namespace, selectionPath, requestPath, evidencePath string)
 	if sample.OwnerID != selection.OwnerID || !sample.RuntimeRef.Equal(selection.RuntimeRef) || sample.Provider != "pi" {
 		return errors.New("sample request does not belong to the current Pi fixture environment")
 	}
-	sample.Snapshots = selection.Snapshots
 	session, err := wire.PiSession(sample)
 	if err != nil {
 		return err
@@ -156,27 +156,44 @@ func run(kubeconfig, namespace, selectionPath, requestPath, evidencePath string)
 	if _, err := client.Controller(ctx, selection.Controller.Name, selection.Controller.UID, selection.Worker.SingleNodeName); err != nil {
 		return err
 	}
-	root, release, err := lockStorage(ctx, api, selection, sample)
+	home, err := fixturehome.Open(ctx, api, selection, sample)
 	if err != nil {
 		return err
 	}
-	defer release()
-	if err := client.StorageAvailable(ctx, selection.Worker.WorkspaceClaim, filepath.Base(sample.WorkerSubPath), selection.Controller); err != nil {
-		return err
+	defer home.Close()
+	root := home.Root()
+	// Publish both verifier-owned artifacts before the preservation baseline.
+	// The comparison then includes their exact bytes alongside the user's work.
+	modes := []string{"upstream-sdk-control", "runtime-strict-status"}
+	requests := make([]wire.Request, len(modes))
+	for i := range requests {
+		request := sample
+		request.AttemptID = uuid.NewString()
+		request.Args = []string{"--fixture-transport-hold", "--session", session}
+		request.Env = append(slices.Clone(request.Env), fixturehome.PreserveSampleEnv+"=true")
+		request.HomeDigest, err = home.Publish(ctx, request, nil)
+		if err != nil {
+			return err
+		}
+		requests[i] = request
 	}
 	before, err := snapshotStorage(root, session)
 	if err != nil {
 		return err
 	}
-	if len(before.Files) == 0 {
+	workPresent := false
+	for name := range before.Files {
+		workPresent = workPresent || !strings.HasPrefix(name, ".runtime-home/")
+	}
+	if !workPresent {
 		return errors.New("sample worker has no existing files to preserve")
 	}
 	proof.BeforeSHA256 = before.digest()
-	fixture := &streamFixture{api: api, config: config, client: client, selection: selection, sample: sample}
+	fixture := &streamFixture{api: api, config: config, client: client, selection: selection}
 	// The SDK control records the previous behavior without requiring a specific
 	// SDK bug: the production case must independently reject the missing status.
-	for _, mode := range []string{"upstream-sdk-control", "runtime-strict-status"} {
-		caseProof, err := fixture.severCase(ctx, target.Host, session, mode)
+	for i, mode := range modes {
+		caseProof, err := fixture.severCase(ctx, target.Host, requests[i], mode)
 		proof.Cases = append(proof.Cases, caseProof)
 		if err != nil {
 			return err
@@ -195,11 +212,8 @@ func run(kubeconfig, namespace, selectionPath, requestPath, evidencePath string)
 	return nil
 }
 
-func (f *streamFixture) severCase(ctx context.Context, target, session, mode string) (proof caseEvidence, result error) {
+func (f *streamFixture) severCase(ctx context.Context, target string, request wire.Request, mode string) (proof caseEvidence, result error) {
 	proof.Mode = mode
-	request := f.sample
-	request.AttemptID = uuid.NewString()
-	request.Args = []string{"--fixture-transport-hold", "--session", session}
 	raw, err := json.Marshal(request)
 	if err != nil {
 		return proof, err
@@ -207,7 +221,7 @@ func (f *streamFixture) severCase(ctx context.Context, target, session, mode str
 	if _, err := wire.Decode(raw); err != nil {
 		return proof, err
 	}
-	ref := runtimekube.Reference{Namespace: f.selection.Namespace, Owner: f.selection.Controller, TaskID: request.TaskID, StorageID: filepath.Base(request.WorkerSubPath), AttemptID: request.AttemptID, PodName: "task-worker-" + filepath.Base(request.WorkerSubPath), SecretName: "task-request-" + request.AttemptID, RequestDigest: wire.Digest(raw), RuntimeRef: request.RuntimeRef, Snapshots: request.Snapshots, FixedNode: f.selection.Worker.SingleNodeName}
+	ref := runtimekube.Reference{Namespace: f.selection.Namespace, Owner: f.selection.Controller, TaskID: request.TaskID, StorageID: filepath.Base(request.WorkerSubPath), AttemptID: request.AttemptID, PodName: "task-worker-" + filepath.Base(request.WorkerSubPath), SecretName: "task-request-" + request.AttemptID, RequestDigest: wire.Digest(raw), RuntimeRef: request.RuntimeRef, FixedNode: f.selection.Worker.SingleNodeName}
 	ref.PodDigest, err = runtimekube.PodFingerprint(f.selection.Worker, ref, request, f.selection.Gateway)
 	if err != nil {
 		return proof, err

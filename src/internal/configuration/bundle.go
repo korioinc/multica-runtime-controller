@@ -50,22 +50,6 @@ type Bundle struct {
 	Digest        string  `json:"digest"`
 }
 
-type Mapping struct {
-	Key    string `json:"key"`
-	Target string `json:"target"`
-	Mode   uint32 `json:"mode"`
-}
-
-type SnapshotRef struct {
-	Namespace   string    `json:"namespace"`
-	Name        string    `json:"name"`
-	UID         string    `json:"uid"`
-	SourceGroup string    `json:"sourceGroup"`
-	Digest      string    `json:"digest"`
-	Directories []string  `json:"directories"`
-	Mappings    []Mapping `json:"mappings"`
-}
-
 func GroupName(value string) bool { return len(value) <= 63 && groupName.MatchString(value) }
 
 func HomePath(path string, directory bool) bool {
@@ -105,7 +89,7 @@ func (g Group) Validate() error {
 		size += len(file.Content)
 	}
 	if size > MaxGroupBytes {
-		return diagnostics.ForGroup("configuration_payload_too_large", g.Name, errors.New("configuration exceeds ConfigMap payload limit"))
+		return diagnostics.ForGroup("configuration_payload_too_large", g.Name, errors.New("configuration source exceeds supported payload size"))
 	}
 	for path := range files {
 		if directories[path] {
@@ -160,19 +144,6 @@ func Digest(groups []Group) string {
 	return core.Digest(raw)
 }
 
-func DigestRefs(refs []SnapshotRef) string {
-	type record struct {
-		Name   string `json:"name"`
-		Digest string `json:"digest"`
-	}
-	items := make([]record, 0, len(refs))
-	for _, r := range refs {
-		items = append(items, record{r.SourceGroup, r.Digest})
-	}
-	raw, _ := json.Marshal(items)
-	return core.Digest(raw)
-}
-
 func (b Bundle) Validate() error {
 	if b.SchemaVersion != 1 || b.Groups == nil || !core.ValidSHA(b.Digest) {
 		return errors.New("invalid configuration bundle")
@@ -209,48 +180,6 @@ func (b Bundle) Validate() error {
 	}
 	if Digest(b.Groups) != b.Digest {
 		return errors.New("configuration bundle digest mismatch")
-	}
-	return nil
-}
-
-func Key(target string) string { return "f-" + core.Digest([]byte(target)) }
-
-func (g Group) Mappings() []Mapping {
-	result := make([]Mapping, 0, len(g.Files))
-	for _, file := range g.Files {
-		result = append(result, Mapping{Key(file.Target), file.Target, file.Mode})
-	}
-	return result
-}
-
-func (r SnapshotRef) Validate() error {
-	if r.Namespace == "" || r.Name == "" || r.UID == "" || !GroupName(r.SourceGroup) || !core.ValidSHA(r.Digest) || r.Directories == nil || r.Mappings == nil {
-		return errors.New("invalid configuration snapshot reference")
-	}
-	for i, path := range r.Directories {
-		if !relativeTarget(path, true) || i > 0 && r.Directories[i-1] >= path {
-			return errors.New("invalid snapshot directories")
-		}
-	}
-	for i, m := range r.Mappings {
-		if !relativeTarget(m.Target, false) || m.Key != Key(m.Target) || m.Mode != 0600 && m.Mode != 0700 || i > 0 && r.Mappings[i-1].Target >= m.Target {
-			return errors.New("invalid snapshot target mapping")
-		}
-	}
-	return nil
-}
-
-func ValidateRefs(refs []SnapshotRef) error {
-	if refs == nil {
-		return errors.New("missing configuration snapshot references")
-	}
-	for i, r := range refs {
-		if err := r.Validate(); err != nil {
-			return err
-		}
-		if i > 0 && refs[i-1].SourceGroup >= r.SourceGroup {
-			return errors.New("snapshot groups are not unique/canonical")
-		}
 	}
 	return nil
 }

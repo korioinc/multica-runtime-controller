@@ -3,11 +3,73 @@ package kubernetes
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"net/url"
 	"sync"
+
+	"github.com/go-logr/logr"
+	streamprotocol "k8s.io/apimachinery/pkg/util/remotecommand"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/remotecommand"
+	"k8s.io/client-go/transport/spdy"
+	utilexec "k8s.io/client-go/util/exec"
+	"k8s.io/klog/v2"
 )
 
 var ErrTransport = errors.New("task transport failed")
+
+type Streams struct {
+	Stdin          io.Reader
+	Stdout, Stderr io.Writer
+}
+
+func streamExec(ctx context.Context, config *rest.Config, endpoint *url.URL, streams Streams) error {
+	transport, upgrader, err := spdy.RoundTripperFor(config)
+	if err != nil {
+		return fmt.Errorf("%w: configure exec upgrade: %w", ErrTransport, err)
+	}
+	executor, err := remotecommand.NewSPDYExecutorForProtocols(transport, statusUpgrader{delegate: upgrader}, "POST", endpoint, streamprotocol.StreamProtocolV4Name)
+	if err != nil {
+		return fmt.Errorf("%w: create exec stream: %w", ErrTransport, err)
+	}
+	return transferStreams(ctx, executor, streams)
+}
+
+func transferStreams(ctx context.Context, executor remotecommand.Executor, streams Streams) error {
+	streamContext, cancel := context.WithCancel(ctx)
+	defer cancel()
+	fault := &streamFault{cancel: cancel}
+	options := remotecommand.StreamOptions{}
+	if streams.Stdin != nil {
+		options.Stdin = trackedReader{source: streams.Stdin, fault: fault}
+	}
+	if streams.Stdout != nil {
+		options.Stdout = trackedWriter{target: streams.Stdout, fault: fault}
+	}
+	if streams.Stderr != nil {
+		options.Stderr = trackedWriter{target: streams.Stderr, fault: fault}
+	}
+	err := executor.StreamWithContext(klog.NewContext(streamContext, logr.Discard()), options)
+	if localErr := fault.failure(); localErr != nil {
+		return fmt.Errorf("%w: task stream endpoint failed: %w", ErrTransport, localErr)
+	}
+	if _, exited := ExitCode(err); err != nil && !exited {
+		return fmt.Errorf("%w: %w", ErrTransport, err)
+	}
+	return err
+}
+
+func ExitCode(err error) (int, bool) {
+	if err == nil {
+		return 0, true
+	}
+	var code utilexec.ExitError
+	if errors.As(err, &code) {
+		return code.ExitStatus(), true
+	}
+	return 1, false
+}
 
 // client-go reports remote exit status separately from local io.Copy failures.
 // Capture broken local endpoints and cancel the transport instead of returning

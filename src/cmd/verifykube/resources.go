@@ -10,11 +10,13 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/korioinc/multica-runtime-controller/internal/fixturehome"
 	runtimekube "github.com/korioinc/multica-runtime-controller/internal/kubernetes"
 	"github.com/korioinc/multica-runtime-controller/internal/wire"
 	corev1 "k8s.io/api/core/v1"
@@ -42,6 +44,7 @@ type transportFault struct {
 	denyDelete    bool
 	forbidExec    bool
 	execAttempted bool
+	ownerRead     *ownerReadObservation
 }
 
 func (t *transportFault) RoundTrip(request *http.Request) (*http.Response, error) {
@@ -60,6 +63,9 @@ func (t *transportFault) RoundTrip(request *http.Request) (*http.Response, error
 		delete(t.losePost, filepath.Base(request.URL.Path))
 	}
 	t.mutex.Unlock()
+	if t.ownerRead != nil && request.Method == http.MethodGet && request.URL.Path == t.ownerRead.path {
+		return t.ownerRead.roundTrip(t.base, request)
+	}
 	response, err := t.base.RoundTrip(request)
 	if err != nil || !lose {
 		return response, err
@@ -97,8 +103,32 @@ func (f *fixture) faultClient(fault *transportFault) (*runtimekube.Client, error
 	return &runtimekube.Client{API: api, Transport: cfg, Namespace: f.selection.Namespace}, nil
 }
 func (f *fixture) attempt() (runtimekube.Reference, wire.Request, error) {
+	return f.attemptWithImage("", nil)
+}
+
+func (f *fixture) attemptWithImage(image string, index []byte) (runtimekube.Reference, wire.Request, error) {
 	request := f.request
 	request.AttemptID = uuid.NewString()
+	request.Env = append(slices.Clone(request.Env), fixturehome.PreserveSampleEnv+"=true")
+	if image != "" {
+		if index == nil {
+			return runtimekube.Reference{}, request, errors.New("fixture index execution requires its captured registry bytes")
+		}
+		request.RuntimeRef.Image = image
+	}
+	storage := filepath.Base(request.WorkerSubPath)
+	podName := "task-worker-" + storage
+	if _, err := f.api.CoreV1().Pods(f.selection.Namespace).Get(f.ctx, podName, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		if err != nil {
+			return runtimekube.Reference{}, request, err
+		}
+		return runtimekube.Reference{}, request, errors.New("fixture worker name is still occupied; refusing to adopt it")
+	}
+	var err error
+	request.HomeDigest, err = f.home.Publish(f.ctx, request, index)
+	if err != nil {
+		return runtimekube.Reference{}, request, err
+	}
 	raw, err := json.Marshal(request)
 	if err != nil {
 		return runtimekube.Reference{}, request, err
@@ -106,14 +136,7 @@ func (f *fixture) attempt() (runtimekube.Reference, wire.Request, error) {
 	if _, err = wire.Decode(raw); err != nil {
 		return runtimekube.Reference{}, request, err
 	}
-	storage := filepath.Base(request.WorkerSubPath)
-	ref := runtimekube.Reference{Namespace: f.selection.Namespace, Owner: f.selection.Controller, TaskID: request.TaskID, StorageID: storage, AttemptID: request.AttemptID, PodName: "task-worker-" + storage, SecretName: "task-request-" + request.AttemptID, RequestDigest: wire.Digest(raw), RuntimeRef: request.RuntimeRef, Snapshots: request.Snapshots, FixedNode: f.selection.Worker.SingleNodeName}
-	if _, err = f.api.CoreV1().Pods(ref.Namespace).Get(f.ctx, ref.PodName, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
-		if err != nil {
-			return ref, request, err
-		}
-		return ref, request, errors.New("fixture worker name is still occupied; refusing to adopt it")
-	}
+	ref := runtimekube.Reference{Namespace: f.selection.Namespace, Owner: f.selection.Controller, TaskID: request.TaskID, StorageID: storage, AttemptID: request.AttemptID, PodName: podName, SecretName: "task-request-" + request.AttemptID, RequestDigest: wire.Digest(raw), RuntimeRef: request.RuntimeRef, FixedNode: f.selection.Worker.SingleNodeName}
 	ref.PodDigest, err = runtimekube.PodFingerprint(f.selection.Worker, ref, request, f.selection.Gateway)
 	return ref, request, err
 }

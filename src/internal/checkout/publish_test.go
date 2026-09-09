@@ -16,7 +16,7 @@ import (
 
 func gitFixture(t *testing.T, directory string, args ...string) string {
 	t.Helper()
-	command := exec.Command("git", append([]string{"-c", "user.name=Fixture", "-c", "user.email=fixture@invalid", "-C", directory}, args...)...)
+	command := exec.Command("git", append([]string{"-c", "user.name=Fixture", "-c", "user.email=fixture@invalid", "-c", "maintenance.auto=false", "-C", directory}, args...)...)
 	out, err := command.CombinedOutput()
 	if err != nil {
 		t.Fatalf("fixture git: %v: %s", err, out)

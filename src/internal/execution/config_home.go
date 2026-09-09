@@ -14,14 +14,8 @@ import (
 	"github.com/korioinc/multica-runtime-controller/internal/wire"
 )
 
-// copyHomeConfig publishes private, writable files without replacing native
-// state. A retry preserves completed files; this is not a whole-tree transaction.
-func copyHomeConfig(home, source, target string) error {
-	return copyHomeConfigExcept(home, source, target, "")
-}
-
-// Image npm state is published as one directory after ordinary defaults. It
-// must not be partially populated by the per-file configuration copier.
+// copyHomeConfigExcept publishes plain defaults without replacing native files.
+// Image npm state is excluded and published separately as a complete directory.
 func copyHomeConfigExcept(home, source, target, excluded string) error {
 	info, err := os.Lstat(source)
 	if err != nil {
@@ -48,37 +42,18 @@ func copyHomeConfigExcept(home, source, target, excluded string) error {
 	if !info.IsDir() {
 		return copyHomeFile(root, source, strings.TrimPrefix(target, wire.Home+"/"), info.Mode())
 	}
-	// Kubelet projects directories through ..data. Resolve that link once so
-	// traversal sees the selected payload, rather than kubelet's internal links.
-	snapshot := source
-	if data, statErr := os.Lstat(filepath.Join(source, "..data")); statErr == nil {
-		if data.Mode()&os.ModeSymlink == 0 {
-			return errors.New("configuration projection has an invalid data link")
-		}
-		snapshot, err = filepath.EvalSymlinks(filepath.Join(source, "..data"))
-		if err != nil {
-			return err
-		}
-		base, err := filepath.EvalSymlinks(source)
-		if err != nil {
-			return err
-		}
-		relative, err := filepath.Rel(base, snapshot)
-		if err != nil || relative == "." || !filepath.IsLocal(relative) {
-			return errors.New("configuration projection escapes its input")
-		}
-		dataInfo, err := os.Stat(snapshot)
-		if err != nil || !dataInfo.IsDir() {
-			return errors.New("configuration projection payload is not a directory")
-		}
+	// Operator projections are captured by configuration before reaching HOME.
+	// Seeds are plain trees; preserve rejection of every reserved ..data entry.
+	if _, statErr := os.Lstat(filepath.Join(source, "..data")); statErr == nil {
+		return errors.New("HOME source must not contain a configuration projection")
 	} else if !os.IsNotExist(statErr) {
 		return statErr
 	}
-	return filepath.WalkDir(snapshot, func(path string, entry fs.DirEntry, walkErr error) error {
+	return filepath.WalkDir(source, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
-		relative, err := filepath.Rel(snapshot, path)
+		relative, err := filepath.Rel(source, path)
 		if err != nil {
 			return err
 		}

@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/korioinc/multica-runtime-controller/internal/configuration"
 	"github.com/korioinc/multica-runtime-controller/internal/wire"
 )
 
@@ -29,14 +30,22 @@ func TestCopiedConfigurationKeepsTaskChangesPrivate(t *testing.T) {
 	if err := os.Symlink("..data/settings.json", filepath.Join(source, "settings.json")); err != nil {
 		t.Fatal(err)
 	}
+	source, err := filepath.EvalSymlinks(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle, err := configuration.CaptureOrRead(t.TempDir(), []configuration.Copy{{SourceGroup: filepath.Base(source), Source: source, Target: wire.Home + "/.pi/agent"}}, filepath.Dir(source))
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, home := range []string{first, second} {
-		if err := copyHomeConfig(home, source, wire.Home+"/.pi/agent"); err != nil {
+		if err := CopyBundle(home, bundle); err != nil {
 			t.Fatal(err)
 		}
 	}
 	destination := filepath.Join(first, ".pi/agent/settings.json")
 	configFile(t, destination, "task customization")
-	if err := copyHomeConfig(first, source, wire.Home+"/.pi/agent"); err != nil {
+	if err := CopyBundle(first, bundle); err != nil {
 		t.Fatal(err)
 	}
 	changed, err := os.ReadFile(destination)
@@ -55,14 +64,22 @@ func TestCopiedConfigurationKeepsTaskChangesPrivate(t *testing.T) {
 
 func TestConfigurationCopyDoesNotFollowNativeHomeLinks(t *testing.T) {
 	source, home, outside := t.TempDir(), t.TempDir(), t.TempDir()
+	source, err := filepath.EvalSymlinks(source)
+	if err != nil {
+		t.Fatal(err)
+	}
 	input := filepath.Join(source, "config.toml")
 	configFile(t, input, "operator input")
+	bundle, err := configuration.CaptureOrRead(t.TempDir(), []configuration.Copy{{SourceGroup: filepath.Base(source), Source: source, Target: wire.Home + "/.codex"}}, filepath.Dir(source))
+	if err != nil {
+		t.Fatal(err)
+	}
 	protected := filepath.Join(outside, "config.toml")
 	configFile(t, protected, "unrelated private file")
 	if err := os.Symlink(outside, filepath.Join(home, ".codex")); err != nil {
 		t.Fatal(err)
 	}
-	if err := copyHomeConfig(home, input, wire.Home+"/.codex/config.toml"); err == nil {
+	if err := CopyBundle(home, bundle); err == nil {
 		t.Fatal("configuration copy followed a native HOME directory link")
 	}
 	got, err := os.ReadFile(protected)
@@ -72,15 +89,16 @@ func TestConfigurationCopyDoesNotFollowNativeHomeLinks(t *testing.T) {
 }
 
 func TestConfigurationProjectionCannotReadOutsideItsInput(t *testing.T) {
-	source, home, outside := t.TempDir(), t.TempDir(), t.TempDir()
+	source, outside := t.TempDir(), t.TempDir()
+	source, err := filepath.EvalSymlinks(source)
+	if err != nil {
+		t.Fatal(err)
+	}
 	configFile(t, filepath.Join(outside, "private.txt"), "ungranted credential")
 	if err := os.Symlink(outside, filepath.Join(source, "..data")); err != nil {
 		t.Fatal(err)
 	}
-	if err := copyHomeConfig(home, source, wire.Home+"/.codex"); err == nil {
+	if _, err := configuration.CaptureOrRead(t.TempDir(), []configuration.Copy{{SourceGroup: filepath.Base(source), Source: source, Target: wire.Home + "/.codex"}}, filepath.Dir(source)); err == nil {
 		t.Fatal("projection obtained access outside the operator input")
-	}
-	if _, err := os.Stat(filepath.Join(home, ".codex/private.txt")); !os.IsNotExist(err) {
-		t.Fatal("projection disclosed ungranted data to the task", err)
 	}
 }
