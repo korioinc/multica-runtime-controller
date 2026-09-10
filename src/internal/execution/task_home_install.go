@@ -284,6 +284,7 @@ func extractTaskHomeEntries(home *os.Root, archive *tar.Reader) error {
 		links:       map[string]string{},
 		buffer:      make([]byte, 32<<10),
 	}
+	defer extractor.closeFileParent()
 	for {
 		header, err := archive.Next()
 		if errors.Is(err, io.EOF) {
@@ -312,16 +313,21 @@ func extractTaskHomeEntries(home *os.Root, archive *tar.Reader) error {
 	if !seen["home"] {
 		return errors.New("task HOME archive is missing its completed tree")
 	}
+	if err := extractor.closeFileParent(); err != nil {
+		return err
+	}
 	return extractor.publishLinks()
 }
 
 // Paths and file types are validated while writing this exclusively owned tree.
 // Only command links need filesystem validation after extraction.
 type homeArchiveExtractor struct {
-	home        *os.Root
-	directories *stagedDirectories
-	links       map[string]string
-	buffer      []byte
+	home           *os.Root
+	directories    *stagedDirectories
+	links          map[string]string
+	buffer         []byte
+	fileParent     *os.Root
+	fileParentPath string
 }
 
 func (e *homeArchiveExtractor) writeEntry(archive *tar.Reader, path string, header *tar.Header) error {
@@ -342,7 +348,7 @@ func (e *homeArchiveExtractor) writeEntry(archive *tar.Reader, path string, head
 	if header.Typeflag != tar.TypeReg {
 		return errors.New("task HOME archive contains a special file")
 	}
-	file, err := e.home.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600|os.FileMode(header.Mode)&0100)
+	file, err := e.openFile(path, 0600|os.FileMode(header.Mode)&0100)
 	if err != nil {
 		return err
 	}
@@ -350,6 +356,35 @@ func (e *homeArchiveExtractor) writeEntry(archive *tar.Reader, path string, head
 	// allocating another copy buffer for every file.
 	_, err = io.CopyBuffer(struct{ io.Writer }{file}, archive, e.buffer)
 	return errors.Join(err, file.Close())
+}
+
+// Reuse only the latest file parent in this fresh, exclusively owned stage.
+// Consecutive siblings avoid repeatedly opening every ancestor; arbitrary
+// archive ordering still needs at most one cached directory handle.
+func (e *homeArchiveExtractor) openFile(path string, mode os.FileMode) (*os.File, error) {
+	parentPath := filepath.Dir(path)
+	if e.fileParent == nil || e.fileParentPath != parentPath {
+		if err := e.closeFileParent(); err != nil {
+			return nil, err
+		}
+		parent, err := e.home.OpenRoot(parentPath)
+		if err != nil {
+			return nil, err
+		}
+		e.fileParent = parent
+		e.fileParentPath = parentPath
+	}
+	return e.fileParent.OpenFile(filepath.Base(path), os.O_CREATE|os.O_EXCL|os.O_WRONLY, mode)
+}
+
+func (e *homeArchiveExtractor) closeFileParent() error {
+	if e.fileParent == nil {
+		return nil
+	}
+	err := e.fileParent.Close()
+	e.fileParent = nil
+	e.fileParentPath = ""
+	return err
 }
 
 func (e *homeArchiveExtractor) publishLinks() error {
