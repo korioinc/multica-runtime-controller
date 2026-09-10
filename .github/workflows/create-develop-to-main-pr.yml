@@ -28,6 +28,7 @@ jobs:
       contents: read
       pull-requests: read
     outputs:
+      should_run: ${{ steps.resolve.outputs.should_run }}
       head_sha: ${{ steps.resolve.outputs.head_sha }}
       pull_request_number: ${{ steps.resolve.outputs.pull_request_number }}
       verify_check_id: ${{ steps.checks.outputs.verify_check_id }}
@@ -52,22 +53,39 @@ jobs:
             head_sha=$DISPATCH_HEAD
             number=$DISPATCH_NUMBER
           fi
-          case "$head_sha" in
-            [0-9a-f][0-9a-f]*) [ "${#head_sha}" -eq 40 ] ;;
-            *) echo 'Invalid head SHA.' >&2; exit 1 ;;
-          esac
+          [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]] || {
+            echo 'Invalid head SHA.' >&2; exit 1;
+          }
+          [[ "$number" =~ ^[1-9][0-9]*$ ]] || {
+            echo 'Invalid PR number.' >&2; exit 1;
+          }
           pr=$(gh api "repos/$GH_REPO/pulls/$number")
-          jq -e --arg head_sha "$head_sha" \
-            '.state == "open" and .head.sha == $head_sha and
-             (.base.ref == "develop" or .base.ref == "main")' \
-            <<<"$pr" >/dev/null
+          jq -e --argjson number "$number" \
+            '.number == $number and
+             (.state == "open" or .state == "closed") and
+             (.head.sha | type == "string" and test("^[0-9a-f]{40}$")) and
+             (.base.ref | type == "string" and length > 0)' \
+            <<<"$pr" >/dev/null || {
+              echo 'Invalid PR response from GitHub.' >&2; exit 1;
+            }
+          reason=$(jq -r --arg head_sha "$head_sha" '
+            if .state == "closed" then "PR is already closed or merged."
+            elif .head.sha != $head_sha then "PR head changed since this run was queued."
+            elif .base.ref != "develop" and .base.ref != "main" then "PR no longer targets develop or main."
+            else "" end' <<<"$pr")
+          if [[ -n "$reason" ]]; then
+            printf 'Skipping PR #%s: %s\n' "$number" "$reason" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo 'should_run=false' >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
           {
+            echo 'should_run=true'
             echo "head_sha=$head_sha"
             echo "pull_request_number=$number"
           } >>"$GITHUB_OUTPUT"
       - name: Create required checks for a bot PR
         id: checks
-        if: github.event_name == 'repository_dispatch'
+        if: github.event_name == 'repository_dispatch' && steps.resolve.outputs.should_run == 'true'
         env:
           HEAD_SHA: ${{ steps.resolve.outputs.head_sha }}
         run: |
@@ -84,6 +102,7 @@ jobs:
   verify:
     name: verify
     needs: context
+    if: needs.context.outputs.should_run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -126,6 +145,7 @@ jobs:
   runtime-image:
     name: runtime-image
     needs: context
+    if: needs.context.outputs.should_run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
