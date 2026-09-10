@@ -1,0 +1,11 @@
+**
+!src/
+!src/go.mod
+!src/go.sum
+!src/cmd/
+!src/cmd/**
+!src/internal/
+!src/internal/**
+!scripts/
+!scripts/core-contract.sh
+**/*_test.go
