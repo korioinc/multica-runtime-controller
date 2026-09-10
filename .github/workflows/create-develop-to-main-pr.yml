@@ -6,32 +6,27 @@ on:
   push:
     branches: [develop]
   repository_dispatch:
-    types: [automation-ci, create-develop-to-main-pr]
+    types: [create-develop-to-main-pr]
   workflow_dispatch:
 
 permissions: {}
 
 concurrency:
-  group: develop-to-main-${{ github.event.pull_request.number || github.event.client_payload.pull_request_number || github.ref }}
+  group: develop-to-main-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: false
 
 jobs:
   context:
     name: check-context
-    if: >-
-      github.event_name == 'pull_request' ||
-      (github.event_name == 'repository_dispatch' && github.event.action == 'automation-ci')
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
-      checks: write
       contents: read
       pull-requests: read
     outputs:
+      should_run: ${{ steps.resolve.outputs.should_run }}
       head_sha: ${{ steps.resolve.outputs.head_sha }}
-      pull_request_number: ${{ steps.resolve.outputs.pull_request_number }}
-      verify_check_id: ${{ steps.checks.outputs.verify_check_id }}
-      image_check_id: ${{ steps.checks.outputs.image_check_id }}
     env:
       GH_REPO: ${{ github.repository }}
       GH_TOKEN: ${{ github.token }}
@@ -39,59 +34,50 @@ jobs:
       - name: Resolve the exact PR head
         id: resolve
         env:
-          DISPATCH_HEAD: ${{ github.event.client_payload.head_sha }}
-          DISPATCH_NUMBER: ${{ github.event.client_payload.pull_request_number }}
           EVENT_HEAD: ${{ github.event.pull_request.head.sha }}
           EVENT_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           set -euo pipefail
-          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
-            head_sha=$EVENT_HEAD
-            number=$EVENT_NUMBER
-          else
-            head_sha=$DISPATCH_HEAD
-            number=$DISPATCH_NUMBER
-          fi
-          case "$head_sha" in
-            [0-9a-f][0-9a-f]*) [ "${#head_sha}" -eq 40 ] ;;
-            *) echo 'Invalid head SHA.' >&2; exit 1 ;;
-          esac
+          head_sha=$EVENT_HEAD
+          number=$EVENT_NUMBER
+          [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]] || {
+            echo 'Invalid head SHA.' >&2; exit 1;
+          }
+          [[ "$number" =~ ^[1-9][0-9]*$ ]] || {
+            echo 'Invalid PR number.' >&2; exit 1;
+          }
           pr=$(gh api "repos/$GH_REPO/pulls/$number")
-          jq -e --arg head_sha "$head_sha" \
-            '.state == "open" and .head.sha == $head_sha and
-             (.base.ref == "develop" or .base.ref == "main")' \
-            <<<"$pr" >/dev/null
+          jq -e --argjson number "$number" \
+            '.number == $number and
+             (.state == "open" or .state == "closed") and
+             (.head.sha | type == "string" and test("^[0-9a-f]{40}$")) and
+             (.base.ref | type == "string" and length > 0)' \
+            <<<"$pr" >/dev/null || {
+              echo 'Invalid PR response from GitHub.' >&2; exit 1;
+            }
+          reason=$(jq -r --arg head_sha "$head_sha" '
+            if .state == "closed" then "PR is already closed or merged."
+            elif .head.sha != $head_sha then "PR head changed since this run was queued."
+            elif .base.ref != "develop" and .base.ref != "main" then "PR no longer targets develop or main."
+            else "" end' <<<"$pr")
+          if [[ -n "$reason" ]]; then
+            printf 'Skipping PR #%s: %s\n' "$number" "$reason" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo 'should_run=false' >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
           {
+            echo 'should_run=true'
             echo "head_sha=$head_sha"
-            echo "pull_request_number=$number"
-          } >>"$GITHUB_OUTPUT"
-      - name: Create required checks for a bot PR
-        id: checks
-        if: github.event_name == 'repository_dispatch'
-        env:
-          HEAD_SHA: ${{ steps.resolve.outputs.head_sha }}
-        run: |
-          set -euo pipefail
-          verify_id=$(gh api --method POST "repos/$GH_REPO/check-runs" \
-            -f name="verify" -f head_sha="$HEAD_SHA" -f status=in_progress --jq .id)
-          image_id=$(gh api --method POST "repos/$GH_REPO/check-runs" \
-            -f name="runtime-image" -f head_sha="$HEAD_SHA" -f status=in_progress --jq .id)
-          {
-            echo "verify_check_id=$verify_id"
-            echo "image_check_id=$image_id"
           } >>"$GITHUB_OUTPUT"
 
   verify:
     name: verify
     needs: context
+    if: needs.context.outputs.should_run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
-      checks: write
       contents: read
-    env:
-      GH_REPO: ${{ github.repository }}
-      GH_TOKEN: ${{ github.token }}
     steps:
       - name: Check out the exact PR head
         uses: actions/checkout@v7
@@ -105,35 +91,19 @@ jobs:
           go-version-file: src/go.mod
           cache-dependency-path: src/go.sum
       - name: Verify repository
-        id: run
-        continue-on-error: true
         run: |
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends ripgrep
           make verify
-      - name: Finish the bot PR verify check
-        if: always() && github.event_name == 'repository_dispatch'
-        env:
-          CHECK_ID: ${{ needs.context.outputs.verify_check_id }}
-          CONCLUSION: ${{ steps.run.outcome == 'success' && 'success' || 'failure' }}
-        run: |
-          gh api --method PATCH "repos/$GH_REPO/check-runs/$CHECK_ID" \
-            -f status=completed -f conclusion="$CONCLUSION" >/dev/null
-      - name: Fail when verification failed
-        if: steps.run.outcome != 'success'
-        run: exit 1
 
   runtime-image:
     name: runtime-image
     needs: context
+    if: needs.context.outputs.should_run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
-      checks: write
       contents: read
-    env:
-      GH_REPO: ${{ github.repository }}
-      GH_TOKEN: ${{ github.token }}
     steps:
       - name: Check out the exact PR head
         uses: actions/checkout@v7
@@ -156,25 +126,12 @@ jobs:
             echo EOF
           } >>"$GITHUB_OUTPUT"
       - name: Build the runtime image
-        id: run
-        continue-on-error: true
         uses: docker/build-push-action@v7
         with:
           context: .
           platforms: linux/amd64
           push: false
           build-args: ${{ steps.args.outputs.value }}
-      - name: Finish the bot PR runtime-image check
-        if: always() && github.event_name == 'repository_dispatch'
-        env:
-          CHECK_ID: ${{ needs.context.outputs.image_check_id }}
-          CONCLUSION: ${{ steps.run.outcome == 'success' && 'success' || 'failure' }}
-        run: |
-          gh api --method PATCH "repos/$GH_REPO/check-runs/$CHECK_ID" \
-            -f status=completed -f conclusion="$CONCLUSION" >/dev/null
-      - name: Fail when the image build failed
-        if: steps.run.outcome != 'success'
-        run: exit 1
 
   promote:
     name: create-develop-to-main-pr
@@ -186,7 +143,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
-      contents: write
+      contents: read
       pull-requests: write
     env:
       GH_REPO: ${{ github.repository }}
@@ -219,10 +176,5 @@ jobs:
           pr=$(gh api "repos/$GH_REPO/pulls/$number")
           head_sha=$(jq -r .head.sha <<<"$pr")
           [ "$head_sha" = "$develop_sha" ]
-          jq -n \
-            --arg number "$number" \
-            --arg head_sha "$head_sha" \
-            '{event_type:"automation-ci",client_payload:{pull_request_number:$number,head_sha:$head_sha}}' \
-            | gh api --method POST "repos/$GH_REPO/dispatches" --input -
           printf "Promotion PR #%s targets develop '%s'.\n" \
             "$number" "$head_sha" >>"$GITHUB_STEP_SUMMARY"

@@ -11,6 +11,7 @@ import (
 	"github.com/korioinc/multica-runtime-controller/internal/runtimeimage"
 	"github.com/korioinc/multica-runtime-controller/internal/wire"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
@@ -83,6 +84,7 @@ func podObject(cfg Config, ref Reference, request wire.Request, gateway string) 
 	}
 	volumes := []corev1.Volume{
 		{Name: "runtime-private", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+		{Name: "runtime-shm", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory, SizeLimit: ptr.To(resource.MustParse("256Mi"))}}},
 		{Name: "runtime-request", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: ref.SecretName, DefaultMode: ptr.To[int32](0400)}}},
 		{Name: "runtime-workspace", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: cfg.WorkspaceClaim}}},
 	}
@@ -92,6 +94,7 @@ func podObject(cfg Config, ref Reference, request wire.Request, gateway string) 
 		{Name: "runtime-workspace", MountPath: root, SubPath: request.WorkerSubPath},
 		{Name: "runtime-private", MountPath: wire.Home, SubPath: "agents"},
 		{Name: "runtime-private", MountPath: "/tmp", SubPath: "tmp"},
+		{Name: "runtime-shm", MountPath: "/dev/shm"},
 	}
 	if session != "" {
 		mounts = append(mounts, corev1.VolumeMount{Name: "runtime-workspace", MountPath: session, SubPath: ".multica-runtime/sessions/" + filepath.Base(session)})
