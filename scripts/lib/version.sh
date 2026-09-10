@@ -54,22 +54,6 @@ version_build_args() {
     '{GO_VERSION:$pin, VERSION:$version, COMMIT:$revision}'
 }
 
-version_next_patch() {
-  local major minor patch digit index carry=1 result=''
-  version_stable "$1" || return 1
-  IFS=. read -r major minor patch <<<"$1"
-  # Work one digit at a time; release versions need not fit shell integers.
-  for ((index=${#patch}-1; index >= 0; index--)); do
-    digit=${patch:index:1}
-    if [[ $carry == 1 ]]; then
-      if [[ $digit == 9 ]]; then digit=0; else digit=$((digit + 1)); carry=0; fi
-    fi
-    result=$digit$result
-  done
-  [[ $carry == 0 ]] || result=1$result
-  printf '%s.%s.%s\n' "$major" "$minor" "$result"
-}
-
 version_compare() {
   local left right index
   local -a left_parts right_parts

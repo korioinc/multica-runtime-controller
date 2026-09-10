@@ -16,11 +16,9 @@ import (
 )
 
 const (
-	Root              = "/opt/multica/runtime"
-	DescriptorPath    = Root + "/image.json"
-	VerificationPath  = Root + "/verification.json"
-	AdapterContract   = "multica-v0.4.40-v1"
-	VerificationSuite = "official-adapter-v1"
+	Root            = "/opt/multica/runtime"
+	DescriptorPath  = Root + "/image.json"
+	AdapterContract = "multica-v0.4.40-v1"
 )
 
 type Executable struct {
@@ -45,18 +43,6 @@ type Descriptor struct {
 	BinDirs       []string              `json:"binDirs"`
 	Env           map[string]string     `json:"env"`
 	HomeSeed      string                `json:"homeSeed,omitempty"`
-}
-
-type Verification struct {
-	SchemaVersion     int    `json:"schemaVersion"`
-	ImageBuildID      string `json:"imageBuildID"`
-	DescriptorDigest  string `json:"descriptorDigest"`
-	ControllerBuildID string `json:"controllerBuildID"`
-	ControllerSHA256  string `json:"controllerSHA256"`
-	DaemonSHA256      string `json:"daemonSHA256"`
-	AdapterContract   string `json:"adapterContract"`
-	Suite             string `json:"suite"`
-	Passed            bool   `json:"passed"`
 }
 
 // Ref contains only stable execution identity. Kubernetes resource identity is
