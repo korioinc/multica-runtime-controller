@@ -79,6 +79,8 @@ The workspace PVC stores task work, selected native sessions and controller reco
 
 Workers run as the `multica` user with UID/GID `65532`, a read-only root filesystem and private writable HOME, temporary and control directories. Providers and interactive worker shells start in `/workspace/<workspace>/<task>/workdir`; HOME is `/home/multica/agents`.
 
+Each worker mounts a separate memory-backed `emptyDir` at `/dev/shm`, with a `256Mi` size limit. This is a capacity limit, not a memory reservation; actual usage counts toward the worker's memory limit. HOME, `/tmp` and control directories remain on the ordinary `runtime-private` emptyDir. Browsers launched with `--disable-dev-shm-usage` use temporary storage instead of this mount, so the `256Mi` limit does not cap their total shared-memory or RAM usage. Account for worker memory, temporary storage and concurrent task load when sizing the deployment.
+
 Supply provider configuration files through the chart's `operator.configVolumes` and `operator.configMounts`, and environment values through `operator.env` and `operator.envFrom`. Controller tokens and task requests use dedicated Secrets.
 
 Controller init captures selected ConfigMap files into a committed configuration bundle. For each attempt, the controller combines that bundle with image defaults and task-specific provider inputs to prepare a complete HOME archive. Worker init validates the archive's contents and identity before publishing HOME. Operator files take precedence over image defaults.
