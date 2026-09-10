@@ -2,13 +2,24 @@ name: Release
 
 on:
   push:
-    branches: [main]
+    tags: ['[0-9]*.[0-9]*.[0-9]*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag matching VERSION
+        required: true
+        type: string
+      expected_revision:
+        description: Full commit SHA originally selected for this release
+        required: true
+        type: string
 
 permissions: {}
 
 concurrency:
   group: release
   cancel-in-progress: false
+  queue: max
 
 env:
   IMAGE: ghcr.io/korioinc/multica-runtime-controller
@@ -16,6 +27,7 @@ env:
 jobs:
   plan:
     name: plan-release
+    if: github.event_name == 'workflow_dispatch' || github.event.deleted == false
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -23,12 +35,18 @@ jobs:
       packages: read
     outputs:
       version: ${{ steps.plan.outputs.version }}
+      revision: ${{ steps.plan.outputs.revision }}
       published: ${{ steps.plan.outputs.published }}
     env:
       GH_REPO: ${{ github.repository }}
       GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+      EXPECTED_REVISION: ${{ inputs.expected_revision }}
+      RELEASE_EVENT: ${{ github.event_name }}
+      RELEASE_REF_TYPE: ${{ github.ref_type }}
+      RELEASE_REF_NAME: ${{ github.ref_name }}
     steps:
-      - name: Check out the exact main revision
+      - name: Check out the release event revision
         uses: actions/checkout@v7.0.1
         with:
           ref: ${{ github.sha }}
@@ -42,11 +60,20 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
-      - name: Validate VERSION, source revision and existing release bytes
+      - name: Validate the tag, VERSION, source revision and existing release bytes
         id: plan
-        run: >-
-          .github/scripts/release.sh --root "$GITHUB_WORKSPACE"
-          --image "$IMAGE" --revision "$GITHUB_SHA" plan
+        run: |
+          set -euo pipefail
+          revision=$(git rev-parse 'HEAD^{commit}')
+          if [[ "$RELEASE_EVENT" == workflow_dispatch ]]; then
+            if [[ "$RELEASE_REF_TYPE" != tag || "$RELEASE_REF_NAME" != "$RELEASE_TAG" ]]; then
+              echo 'Release dispatch must run on the requested tag ref' >&2
+              exit 1
+            fi
+            revision=$EXPECTED_REVISION
+          fi
+          .github/scripts/release.sh --root "$GITHUB_WORKSPACE" \
+            --image "$IMAGE" --revision "$revision" --version "$RELEASE_TAG" plan
 
   verify:
     name: verify-release-source
@@ -60,7 +87,7 @@ jobs:
       - name: Check out the exact release source
         uses: actions/checkout@v7.0.1
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ needs.plan.outputs.revision }}
           fetch-depth: 0
           persist-credentials: false
       - name: Set up Go
@@ -75,6 +102,9 @@ jobs:
   build:
     name: build-${{ matrix.architecture }}
     needs: [plan, verify]
+    env:
+      RELEASE_REVISION: ${{ needs.plan.outputs.revision }}
+      RELEASE_VERSION: ${{ needs.plan.outputs.version }}
     if: needs.plan.outputs.published != 'true'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
@@ -95,7 +125,7 @@ jobs:
       - name: Check out the exact release source
         uses: actions/checkout@v7.0.1
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ needs.plan.outputs.revision }}
           fetch-depth: 0
           persist-credentials: false
       - name: Set up Docker Buildx
@@ -110,7 +140,7 @@ jobs:
         id: candidate
         run: >-
           .github/scripts/release.sh --root "$GITHUB_WORKSPACE"
-          --image "$IMAGE" --revision "$GITHUB_SHA"
+          --image "$IMAGE" --revision "$RELEASE_REVISION" --version "$RELEASE_VERSION"
           prepare-native --platform '${{ matrix.platform }}'
       - name: Resolve controller-only build arguments
         if: steps.candidate.outputs.reuse != 'true'
@@ -118,7 +148,7 @@ jobs:
         run: |
           set -euo pipefail
           scripts/runtime-versions.sh --root "$GITHUB_WORKSPACE" build-args \
-            --revision "$GITHUB_SHA" \
+            --revision "$RELEASE_REVISION" --version "$RELEASE_VERSION" \
             | jq -r 'to_entries[] | "\(.key)=\(.value)"' >"$RUNNER_TEMP/build-args"
           {
             echo 'value<<EOF'
@@ -140,7 +170,7 @@ jobs:
       - name: Execute the native base check and push only verified candidate bytes
         run: >-
           .github/scripts/release.sh --root "$GITHUB_WORKSPACE"
-          --image "$IMAGE" --revision "$GITHUB_SHA"
+          --image "$IMAGE" --revision "$RELEASE_REVISION" --version "$RELEASE_VERSION"
           record-native --platform '${{ matrix.platform }}'
           --records "$RUNNER_TEMP/native-results"
       - name: Upload the verified native result
@@ -167,11 +197,13 @@ jobs:
     env:
       GH_REPO: ${{ github.repository }}
       GH_TOKEN: ${{ github.token }}
+      RELEASE_REVISION: ${{ needs.plan.outputs.revision }}
+      RELEASE_VERSION: ${{ needs.plan.outputs.version }}
     steps:
       - name: Check out the exact release source
         uses: actions/checkout@v7.0.1
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ needs.plan.outputs.revision }}
           fetch-depth: 0
           persist-credentials: false
       - name: Download native results
@@ -192,5 +224,5 @@ jobs:
       - name: Publish the immutable version, GitHub Release and current latest
         run: >-
           .github/scripts/release.sh --root "$GITHUB_WORKSPACE"
-          --image "$IMAGE" --revision "$GITHUB_SHA"
+          --image "$IMAGE" --revision "$RELEASE_REVISION" --version "$RELEASE_VERSION"
           publish --records "$RUNNER_TEMP/native-results"

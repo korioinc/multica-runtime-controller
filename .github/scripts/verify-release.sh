@@ -15,13 +15,20 @@ revision=1111111111111111111111111111111111111111
 other=2222222222222222222222222222222222222222
 printf '%s\n' "$revision" >"$fixture/main"
 printf '%s\n' "$revision" >"$fixture/head"
+printf '%s\n' identical >"$fixture/main-comparison"
 printf '%s\n' 1.2.3 >"$fixture/checkout/VERSION"
+cp "$fixture/checkout/VERSION" "$fixture/committed-version"
+jq -cn --arg sha "$revision" '{object:{type:"commit",sha:$sha}}' >"$fixture/tag.json"
 printf '%s\n' GO_VERSION=1.26.1 >"$fixture/checkout/build/runtime-versions.env"
 cp "$repository/.github/scripts/verify-base.sh" "$fixture/checkout/.github/scripts/verify-base.sh"
 cat >"$fixture/bin/git" <<'STUB'
 #!/usr/bin/env bash
 set -euo pipefail
 if [[ $# == 4 && $1 == -C && $3 == rev-parse && $4 == HEAD ]]; then cat "$RELEASE_FIXTURE_ROOT/head"; exit; fi
+if [[ $# == 4 && $1 == -C && $3 == show && $4 == "$(cat "$RELEASE_FIXTURE_ROOT/head"):VERSION" ]]; then
+  cat "$RELEASE_FIXTURE_ROOT/committed-version"
+  exit
+fi
 printf 'unexpected fixture git command\n' >&2
 exit 1
 STUB
@@ -38,22 +45,54 @@ if [[ $# == 3 && $1 == api && $2 == --include ]]; then
       printf 'HTTP/2.0 200 OK\nContent-Type: application/json\n\n'
       jq -cn --arg sha "$(cat "$root/main")" '{object:{type:"commit",sha:$sha}}' ;;
     repos/fixture/controller/git/ref/tags/1.2.3) respond "$root/tag.json" ;;
+    repos/fixture/controller/git/tags/*) respond "$root/tag-object.json" ;;
+    repos/fixture/controller/compare/*)
+      [[ $3 == "repos/fixture/controller/compare/$(cat "$root/head")...$(cat "$root/main")" ]]
+      printf 'HTTP/2.0 200 OK\nContent-Type: application/json\n\n'
+      jq -cn --arg status "$(cat "$root/main-comparison")" '{status:$status}' ;;
     repos/fixture/controller/releases/tags/1.2.3) respond "$root/release.json" ;;
+    repos/fixture/controller/releases/latest) respond "$root/github-latest.json" ;;
     *) printf 'unexpected fixture GitHub lookup\n' >&2; exit 1 ;;
   esac
   exit
 fi
 if [[ ${1:-} == release && ${2:-} == create && ${3:-} == 1.2.3 ]]; then
   shift 3
-  target=''
+  target=main latest=true verify_tag=false
   while [[ $# -gt 0 ]]; do
-    case $1 in --target) target=$2 ;; --notes-file) [[ -f $2 ]] ;; --repo|--title) : ;; *) exit 1 ;; esac
-    shift 2
+    case $1 in
+      --target) target=$2; shift 2 ;;
+      --notes-file) [[ -f $2 ]]; shift 2 ;;
+      --repo|--title) shift 2 ;;
+      --verify-tag) verify_tag=true; shift ;;
+      --latest|--latest=true) latest=true; shift ;;
+      --latest=false) latest=false; shift ;;
+      *) exit 1 ;;
+    esac
   done
-  [[ $target == "$(cat "$root/main")" && ! -f $root/release.json ]]
-  jq -cn --arg sha "$target" '{target_commitish:$sha,draft:false,prerelease:false}' >"$root/release.json"
-  jq -cn --arg sha "$target" '{object:{type:"commit",sha:$sha}}' >"$root/tag.json"
+  [[ ! -f $root/release.json ]]
+  if [[ ! -f $root/tag.json ]]; then
+    [[ $verify_tag != true ]]
+    sha=$target
+    [[ $target != main ]] || sha=$(cat "$root/main")
+    jq -cn --arg sha "$sha" '{object:{type:"commit",sha:$sha}}' >"$root/tag.json"
+  fi
+  jq -cn --arg target "$target" '{tag_name:"1.2.3",target_commitish:$target,draft:false,prerelease:false}' >"$root/release.json"
+  [[ $latest != true ]] || cp "$root/release.json" "$root/github-latest.json"
   if [[ $(cat "$root/fault" 2>/dev/null || :) == after-release ]]; then rm "$root/fault"; exit 1; fi
+  exit
+fi
+if [[ ${1:-} == release && ${2:-} == edit && ${3:-} == 1.2.3 ]]; then
+  shift 3
+  latest=false
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --repo) shift 2 ;;
+      --latest|--latest=true) latest=true; shift ;;
+      *) exit 1 ;;
+    esac
+  done
+  [[ $latest != true ]] || cp "$root/release.json" "$root/github-latest.json"
   exit
 fi
 printf 'unexpected fixture gh command\n' >&2
@@ -172,18 +211,24 @@ else exit 1; fi
 STUB
 chmod +x "$fixture/bin/git" "$fixture/bin/gh" "$fixture/bin/docker"
 release() {
-  "$repository/.github/scripts/release.sh" --root "$fixture/checkout" --image fixture/runtime --revision "$revision" "$@" >"$fixture/result" 2>"$fixture/error"
+  "$repository/.github/scripts/release.sh" --root "$fixture/checkout" --image fixture/runtime --revision "$revision" --version 1.2.3 "$@" >"$fixture/result" 2>"$fixture/error"
 }
 require_success() {
   if ! release "$@"; then cat "$fixture/error" >&2; printf 'fixture operation unexpectedly failed: %s\n' "$*" >&2; exit 1; fi
 }
-registry_state() {
+stored_state() {
   local file
-  for file in "$fixture/registry/"*.json "$fixture/tag.json" "$fixture/release.json"; do
+  for file in "$@"; do
     [[ -f $file ]] || continue
     printf '%s\n' "${file#"$fixture/"}"
     cat "$file"
   done
+}
+registry_state() {
+  stored_state "$fixture/registry/"*.json "$fixture/tag.json" "$fixture/release.json" "$fixture/github-latest.json"
+}
+promotion_state() {
+  stored_state "$fixture/registry/latest.json" "$fixture/tag.json" "$fixture/release.json" "$fixture/github-latest.json"
 }
 require_rejected_without_writes() {
   registry_state >"$fixture/before-state"
@@ -202,10 +247,21 @@ require_success record-native --platform linux/arm64 --records "$fixture/records
 require_success publish --records "$fixture/records"
 registry_state >"$fixture/committed-state"
 cp "$fixture/registry/latest.json" "$fixture/committed-latest"
+cp "$fixture/release.json" "$fixture/committed-release"
 require_success publish --records "$fixture/records"
 registry_state >"$fixture/retried-state"
 cmp "$fixture/retried-state" "$fixture/committed-state"
 cmp "$fixture/registry/latest.json" "$fixture/committed-latest"
+# Existing releases can name a branch as target_commitish; the immutable tag
+# still owns source identity, and accepting it must preserve published bytes.
+jq '.target_commitish="main"' "$fixture/committed-release" >"$fixture/release.json"
+cp "$fixture/release.json" "$fixture/github-latest.json"
+registry_state >"$fixture/branch-target-state"
+require_success publish --records "$fixture/records"
+registry_state >"$fixture/branch-target-retry-state"
+cmp "$fixture/branch-target-state" "$fixture/branch-target-retry-state"
+cp "$fixture/committed-release" "$fixture/release.json"
+cp "$fixture/committed-release" "$fixture/github-latest.json"
 require_success prepare-native --platform linux/arm64
 require_success record-native --platform linux/arm64 --records "$fixture/records"
 registry_state >"$fixture/retried-state"
@@ -214,28 +270,78 @@ export RELEASE_FIXTURE_DIFFERENT_LOCAL=true
 require_rejected_without_writes record-native --platform linux/arm64 --records "$fixture/records"
 unset RELEASE_FIXTURE_DIFFERENT_LOCAL
 
+# Release authority comes from an existing tag, committed VERSION, and main
+# ancestry. A checkout edit or another tag target cannot authorize promotion.
+rm "$fixture/tag.json"
+require_rejected_without_writes publish --records "$fixture/records"
 jq -cn --arg sha "$other" '{object:{type:"commit",sha:$sha}}' >"$fixture/tag.json"
-require_rejected_without_writes plan
+require_rejected_without_writes publish --records "$fixture/records"
+jq -cn --arg sha "$revision" '{object:{type:"commit",sha:$sha}}' >"$fixture/tag.json"
+printf '%s\n' 1.2.4 >"$fixture/checkout/VERSION"
+require_rejected_without_writes publish --records "$fixture/records"
+cp "$fixture/checkout/VERSION" "$fixture/committed-version"
+printf '%s\n' 1.2.3 >"$fixture/checkout/VERSION"
+require_rejected_without_writes publish --records "$fixture/records"
+printf '%s\n' 1.2.3 >"$fixture/committed-version"
+cp "$fixture/committed-version" "$fixture/checkout/VERSION"
+
+# Annotated tags resolve to the same release identity. A moving main remains
+# authorized only when the selected tagged commit is still its ancestor.
+jq -cn --arg sha "$other" '{object:{type:"tag",sha:$sha}}' >"$fixture/tag.json"
+jq -cn --arg sha "$revision" '{object:{type:"commit",sha:$sha}}' >"$fixture/tag-object.json"
+require_success publish --records "$fixture/records"
 jq -cn --arg sha "$revision" '{object:{type:"commit",sha:$sha}}' >"$fixture/tag.json"
 printf '%s\n' "$other" >"$fixture/main"
+printf '%s\n' ahead >"$fixture/main-comparison"
+require_success publish --records "$fixture/records"
+registry_state >"$fixture/descendant-state"
+cmp "$fixture/committed-state" "$fixture/descendant-state"
+printf '%s\n' diverged >"$fixture/main-comparison"
 require_rejected_without_writes publish --records "$fixture/records"
 cmp "$fixture/registry/latest.json" "$fixture/committed-latest"
 printf '%s\n' "$revision" >"$fixture/main"
+printf '%s\n' identical >"$fixture/main-comparison"
+
+# An older release may finish after a newer release, preserving both latest
+# pointers and the already published immutable version bytes.
 jq --arg revision "$other" '.annotations["org.opencontainers.image.version"]="9.0.0" | .annotations["org.opencontainers.image.revision"]=$revision | .digest="sha256:9999999999999999999999999999999999999999999999999999999999999999"' "$fixture/committed-latest" >"$fixture/registry/latest.json"
 cp "$fixture/registry/latest.json" "$fixture/newer-latest"
-require_rejected_without_writes publish --records "$fixture/records"
+jq '.tag_name="9.0.0"' "$fixture/committed-release" >"$fixture/github-latest.json"
+cp "$fixture/github-latest.json" "$fixture/newer-github-latest"
+registry_state >"$fixture/newer-state"
+require_success publish --records "$fixture/records"
+registry_state >"$fixture/older-retry-state"
+cmp "$fixture/newer-state" "$fixture/older-retry-state"
+rm "$fixture/release.json"
+require_success publish --records "$fixture/records"
+cmp "$fixture/release.json" "$fixture/committed-release"
 cmp "$fixture/registry/latest.json" "$fixture/newer-latest"
+cmp "$fixture/github-latest.json" "$fixture/newer-github-latest"
 
-rm "$fixture/registry/version.json" "$fixture/registry/latest.json" "$fixture/release.json" "$fixture/tag.json"
+# If the release already exists but its latest promotion was lost, retry can
+# repair the pointer without changing the release's immutable image bytes.
+cp "$fixture/committed-latest" "$fixture/registry/latest.json"
+jq '.tag_name="1.2.2"' "$fixture/committed-release" >"$fixture/github-latest.json"
+require_success publish --records "$fixture/records"
+registry_state >"$fixture/repaired-state"
+cmp "$fixture/committed-state" "$fixture/repaired-state"
+
+rm "$fixture/registry/version.json" "$fixture/registry/latest.json" "$fixture/release.json" "$fixture/github-latest.json"
+promotion_state >"$fixture/before-promotion"
 printf '%s\n' after-version >"$fixture/fault"
 if release publish --records "$fixture/records"; then printf 'lost version response unexpectedly succeeded\n' >&2; exit 1; fi
-[[ -f $fixture/registry/version.json && ! -f $fixture/registry/latest.json && ! -f $fixture/release.json ]]
+cmp "$fixture/registry/version.json" "$fixture/committed-latest"
+promotion_state >"$fixture/after-promotion"
+cmp "$fixture/before-promotion" "$fixture/after-promotion"
 require_success publish --records "$fixture/records"
 cmp "$fixture/registry/latest.json" "$fixture/committed-latest"
-rm "$fixture/registry/latest.json" "$fixture/release.json" "$fixture/tag.json"
+rm "$fixture/registry/latest.json" "$fixture/release.json" "$fixture/github-latest.json"
+stored_state "$fixture/registry/latest.json" >"$fixture/before-promotion"
 printf '%s\n' after-release >"$fixture/fault"
 if release publish --records "$fixture/records"; then printf 'lost release response unexpectedly succeeded\n' >&2; exit 1; fi
-[[ -f $fixture/release.json && ! -f $fixture/registry/latest.json ]]
+cmp "$fixture/release.json" "$fixture/committed-release"
+stored_state "$fixture/registry/latest.json" >"$fixture/after-promotion"
+cmp "$fixture/before-promotion" "$fixture/after-promotion"
 require_success publish --records "$fixture/records"
 registry_state >"$fixture/recovered-state"
 cmp "$fixture/recovered-state" "$fixture/committed-state"
@@ -280,7 +386,7 @@ done
 unset RELEASE_FIXTURE_IMAGE_ID_KIND
 for format in oci docker; do
   export RELEASE_FIXTURE_INDEX_FORMAT=$format
-  rm -f "$fixture/registry/"*.json "$fixture/records/"*.json "$fixture/tag.json" "$fixture/release.json" "$fixture/local-"*-kind
+  rm -f "$fixture/registry/"*.json "$fixture/records/"*.json "$fixture/release.json" "$fixture/github-latest.json" "$fixture/local-"*-kind
   export RELEASE_FIXTURE_PLATFORM=linux/amd64
   require_success record-native --platform linux/amd64 --records "$fixture/records"
   require_rejected_without_writes publish --records "$fixture/records"
@@ -288,9 +394,11 @@ for format in oci docker; do
   require_rejected_without_writes record-native --platform linux/arm64 --records "$fixture/records"
   unset RELEASE_FIXTURE_FAIL_NATIVE
   require_success record-native --platform linux/arm64 --records "$fixture/records"
+  promotion_state >"$fixture/before-promotion"
   printf '%s\n' after-version >"$fixture/fault"
   if release publish --records "$fixture/records"; then printf 'lost version response unexpectedly succeeded\n' >&2; exit 1; fi
-  [[ -f $fixture/registry/version.json && ! -f $fixture/registry/latest.json && ! -f $fixture/release.json ]]
+  promotion_state >"$fixture/after-promotion"
+  cmp "$fixture/before-promotion" "$fixture/after-promotion"
   cp "$fixture/registry/version.json" "$fixture/format-version"
   require_success publish --records "$fixture/records"
   cmp "$fixture/format-version" "$fixture/registry/version.json"
@@ -327,4 +435,4 @@ for format in oci docker; do
   rm "$fixture/remote-arm64.json"
   require_success plan
 done
-printf '%s\n' 'PASS: immutable release guards, failed/partial native results, lost-response retries, monotonic latest, Docker/OCI metadata authority, and Docker config/manifest/index image identities.'
+printf '%s\n' 'PASS: tagged source authority, immutable release guards, failed/partial native results, lost-response retries, monotonic GitHub/registry latest, Docker/OCI metadata authority, and Docker config/manifest/index image identities (local fixture emulation).'

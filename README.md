@@ -21,7 +21,7 @@ flowchart LR
     Worker -->|Task storage only| Storage
 ```
 
-1. At startup, the controller validates the installed runtime descriptor, verification record and initialized configuration. It binds the running Pod and platform to the image digest reported by Kubernetes.
+1. At startup, the controller validates the installed runtime descriptor, executable contents and initialized configuration. It binds the running Pod and platform to the image digest reported by Kubernetes.
 2. The daemon claims a task and invokes a provider shim. The controller checks the observed claim, credentials, repository scope and managed workspace paths.
 3. The controller prepares task context and a private HOME archive, records the attempt, and creates its request Secret and worker Pod.
 4. Worker init verifies and publishes the prepared HOME. The worker starts the installed provider in the task workdir, preserving its input, output and exit status.
@@ -62,7 +62,7 @@ The chart configures controller capacity, polling, worker resources, task deadli
 | [Complete runtime](https://github.com/korioinc/multica-runtime) | Official Multica CLI, providers, development tools, image defaults and installation |
 | [Helm chart](https://github.com/korioinc/helm/tree/main/charts/multica-runtime-controller) | Kubernetes deployment, storage, configuration and scheduling |
 
-The base installs its executable and build metadata under `/opt/multica/controller`, with the Go SDK at `/usr/local/go`. A complete image supplies `/opt/multica/runtime/image.json` and `/opt/multica/runtime/verification.json`, binding its installed tools to successful adapter verification.
+The base installs its executable and build metadata under `/opt/multica/controller`, with the Go SDK at `/usr/local/go`. A complete image supplies `/opt/multica/runtime/image.json`, which identifies the controller build, installed tool paths and hashes, supported platform and image defaults. Admission validates these installed contents directly.
 
 Run these checks inside the relevant image:
 
@@ -71,7 +71,7 @@ Run these checks inside the relevant image:
 /opt/multica/controller/runtime image verify
 ```
 
-The first checks the controller base. The second validates the complete image, installed files and verification record. Runtime tools are installed during the image build.
+The first checks the controller base. The second validates the complete image descriptor and installed files. Runtime tools are installed during the image build; adapter integration scenarios run separately in this repository's local verification harness.
 
 ## Storage and configuration
 
@@ -125,4 +125,6 @@ scripts/verify-local.sh \
 
 Integration also requires Helm and native ORAS. The harness creates a disposable local registry, backend, Git origin and Kubernetes node to exercise real task Pods, checkout, HOME preparation, session reuse, authorization and recovery. It uses its own cluster context and prints the evidence directory. Local execution verifies the host's native platform.
 
-The [release workflow](.github/workflows/release.yml) runs on pushes to `main`. It validates the source, builds and verifies both native Linux platforms, then publishes the controller base to GHCR and creates a GitHub Release. Release identity comes from [`VERSION`](VERSION) and the source commit; published releases retain their verified image bytes.
+The develop workflow maintains a promotion PR and runs verification; it never changes [`VERSION`](VERSION). To release, explicitly increase VERSION (for example, `1.2.3`) and merge it into `main`. The [tag workflow](.github/workflows/tag-version.yml) creates the matching tag (`1.2.3`, without a `v` prefix) at that exact commit and requests the [release workflow](.github/workflows/release.yml). A main push with an unchanged VERSION does not request a release.
+
+The release workflow accepts version tag pushes or a manual dispatch on an existing tag with its original full commit SHA. The tag must match the committed VERSION and identify a commit in main's history. It validates the source, builds and verifies both native Linux platforms, then publishes the controller base to GHCR and creates a GitHub Release. Retries retain the verified image bytes; completing an older release never moves the GHCR or GitHub latest pointer backwards.

@@ -16,8 +16,11 @@ VERSION ?= $(shell cat VERSION)
 COMMIT ?= $(shell git rev-parse HEAD)
 
 ACTIONLINT_VERSION := v1.7.12
+# GitHub supports concurrency.queue; actionlint does not yet (rhysd/actionlint#657).
+ACTIONLINT_FLAGS := -ignore '^unexpected key "queue" for "concurrency" section\.'
 ACTIONLINT_WORKFLOWS := \
 	../.github/workflows/create-develop-to-main-pr.yml \
+	../.github/workflows/tag-version.yml \
 	../.github/workflows/release.yml
 
 build:
@@ -51,7 +54,7 @@ repository-validate:
 	./scripts/runtime-versions.sh --root "$(CURDIR)" validate
 
 workflow-validate:
-	go -C $(GO_MODULE_DIR) run github.com/rhysd/actionlint/cmd/actionlint@$(ACTIONLINT_VERSION) $(ACTIONLINT_WORKFLOWS)
+	go -C $(GO_MODULE_DIR) run github.com/rhysd/actionlint/cmd/actionlint@$(ACTIONLINT_VERSION) $(ACTIONLINT_FLAGS) $(ACTIONLINT_WORKFLOWS)
 
 test:
 	go -C $(GO_MODULE_DIR) test ./...

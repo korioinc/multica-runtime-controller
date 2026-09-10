@@ -32,8 +32,8 @@ import (
 )
 
 type configuration struct {
-	image                                  bool
-	official, evidence, verificationOutput string
+	image              bool
+	official, evidence string
 }
 type verifier struct {
 	configuration
@@ -83,7 +83,6 @@ func main() {
 	}
 	cfg := configuration{}
 	flag.BoolVar(&cfg.image, "image", false, "verify the prepared image and its installed official adapter")
-	flag.StringVar(&cfg.verificationOutput, "verification-output", "", "write bound verification record after all adapter probes pass")
 	flag.StringVar(&cfg.evidence, "evidence", "/evidence/official", "local evidence directory")
 	flag.Parse()
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
@@ -101,9 +100,6 @@ func verify(ctx context.Context, cfg configuration) error {
 	}
 	if !cfg.image || flag.NArg() != 0 {
 		return errors.New("--image is required; only installed image verification is supported")
-	}
-	if cfg.verificationOutput != "" && (!filepath.IsAbs(cfg.verificationOutput) || filepath.Clean(cfg.verificationOutput) != cfg.verificationOutput) {
-		return errors.New("verification output must be absolute and canonical")
 	}
 	helper, err := os.Executable()
 	if err != nil {
@@ -242,32 +238,18 @@ func verify(ctx context.Context, cfg configuration) error {
 	if err := v.taskHome(ctx); err != nil {
 		return err
 	}
-	if _, err := core.Check(wire.ControllerRoot, core.HostPlatform()); err != nil {
-		return err
-	}
-	raw, _ := json.MarshalIndent(struct {
-		Proofs []string      `json:"proofs"`
-		Core   core.Contract `json:"core"`
-	}{v.results, v.descriptor.Controller}, "", "  ")
-	if err := os.WriteFile(filepath.Join(cfg.evidence, "result.json"), append(raw, '\n'), 0600); err != nil {
-		return err
-	}
-	if cfg.verificationOutput == "" {
-		return nil
-	}
-	d, digest, err := runtimeimage.CheckInstalled(ctx, runtimeimage.Root, core.Root, core.HostPlatform())
+	_, digest, err := runtimeimage.CheckInstalled(ctx, runtimeimage.Root, core.Root, core.HostPlatform())
 	if err != nil {
 		return err
 	}
 	if digest != v.descriptorDigest {
 		return errors.New("prepared image changed during adapter verification")
 	}
-	record := runtimeimage.Verification{SchemaVersion: 1, ImageBuildID: d.ImageBuildID, DescriptorDigest: digest, ControllerBuildID: d.Controller.BuildID, ControllerSHA256: d.Controller.RuntimeSHA256, DaemonSHA256: d.Daemon.SHA256, AdapterContract: d.Daemon.AdapterContract, Suite: runtimeimage.VerificationSuite, Passed: true}
-	raw, err = json.Marshal(record)
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(cfg.verificationOutput, raw, 0444)
+	raw, _ := json.MarshalIndent(struct {
+		Proofs []string      `json:"proofs"`
+		Core   core.Contract `json:"core"`
+	}{v.results, v.descriptor.Controller}, "", "  ")
+	return os.WriteFile(filepath.Join(cfg.evidence, "result.json"), append(raw, '\n'), 0600)
 }
 
 func (v *verifier) prepare(ctx context.Context) error {

@@ -8,7 +8,7 @@ source "$repository/scripts/lib/version.sh"
 
 usage() {
   cat <<'USAGE'
-Usage: release.sh --root ABSOLUTE_CHECKOUT --image REPOSITORY --revision FULL_COMMIT COMMAND
+Usage: release.sh --root ABSOLUTE_CHECKOUT --image REPOSITORY --revision FULL_COMMIT --version TAG COMMAND
   plan
   prepare-native --platform linux/amd64|linux/arm64
   record-native --platform linux/amd64|linux/arm64 --records DIRECTORY
@@ -20,12 +20,12 @@ fail() { printf 'release blocked: %s\n' "$*" >&2; exit 1; }
 supported_platform() { [[ $1 == linux/amd64 || $1 == linux/arm64 ]]; }
 valid_digest() { [[ $1 =~ ^sha256:[0-9a-f]{64}$ ]] || fail 'invalid registry digest'; printf '%s\n' "$1"; }
 
-root='' image='' revision='' release_command='' platform='' records=''
+root='' image='' revision='' version='' release_command='' platform='' records=''
 while [[ $# -gt 0 ]]; do
   case $1 in
-    --root|--image|--revision)
+    --root|--image|--revision|--version)
       [[ $# -ge 2 ]] || { usage >&2; exit 1; }
-      case $1 in --root) root=$2 ;; --image) image=$2 ;; --revision) revision=$2 ;; esac
+      case $1 in --root) root=$2 ;; --image) image=$2 ;; --revision) revision=$2 ;; --version) version=$2 ;; esac
       shift 2 ;;
     plan|prepare-native|record-native|publish) release_command=$1; shift; break ;;
     --help|-h) usage; exit 0 ;;
@@ -52,30 +52,18 @@ esac
 case $release_command in
   plan|publish) [[ -n ${GH_REPO:-} ]] || fail 'GH_REPO is required' ;;
 esac
-version=$(version_read "$root/VERSION")
+[[ -n $version ]] || fail '--version must name the release tag'
+version_stable "$version"
 version_build_args "$root" "$revision" "$version" >/dev/null
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/controller-release.XXXXXX")
 trap 'rm -rf -- "$scratch"' EXIT
+git -C "$root" show "$revision:VERSION" >"$scratch/version" || fail 'release source must contain VERSION'
+[[ $(version_read "$scratch/version") == "$version" ]] || fail 'release tag differs from committed VERSION'
 revision_label=org.opencontainers.image.revision
 version_label=org.opencontainers.image.version
 
-run_command() {
-  "$@" >"$scratch/stdout" 2>"$scratch/stderr" || fail "$1 $2 failed; no release promotion performed"
-  cat "$scratch/stdout" || fail 'cannot read command output'
-}
-
-github() {
-  local response header body status code
-  if response=$(gh api --include "repos/$GH_REPO/$1" 2>"$scratch/stderr"); then code=0; else code=$?; fi
-  response=${response//$'\r'/}
-  [[ $response == *$'\n\n'* ]] || fail 'GitHub returned an unreadable response'
-  header=${response%%$'\n\n'*} body=${response#*$'\n\n'}
-  [[ $header =~ ^HTTP/[0-9.]+\ ([0-9]{3}) ]] || fail 'GitHub returned an unreadable response'
-  status=${BASH_REMATCH[1]}
-  if [[ $status == 404 ]]; then printf 'null\n'; return; fi
-  [[ $status == 200 && $code == 0 ]] || fail 'GitHub lookup failed'
-  jq -ce 'if type == "object" then . else error("invalid GitHub object") end' <<<"$body" || fail 'invalid GitHub object'
-}
+# shellcheck source=.github/scripts/github-lib.sh
+source "$repository/.github/scripts/github-lib.sh"
 
 inspect() {
   local ref=$1 field=${2:-Manifest} optional=${3:-false} result error
@@ -130,26 +118,16 @@ index_entries() {
 }
 
 guard() {
-  local main tag target sha nested existing_release visited=' '
-  main=$(github git/ref/heads/main) || return 1
-  [[ $(jq -r '.object.sha // ""' <<<"$main") == "$revision" ]] || fail 'a newer or different main revision exists'
-  tag=$(github "git/ref/tags/$version") || return 1
-  if [[ $tag != null ]]; then
-    target=$(jq -c '.object' <<<"$tag") || fail 'invalid release tag'
-    while [[ $(jq -r '.type' <<<"$target") == tag ]]; do
-      sha=$(jq -r '.sha' <<<"$target") || fail 'invalid annotated release tag'
-      [[ $sha =~ ^[0-9a-f]{40}$ && $visited != *" $sha "* ]] || fail 'invalid annotated release tag'
-      visited="$visited$sha "
-      nested=$(github "git/tags/$sha") || return 1
-      target=$(jq -c '.object' <<<"$nested") || fail 'invalid annotated release tag'
-    done
-    jq -e --arg revision "$revision" '.type == "commit" and .sha == $revision' <<<"$target" >/dev/null ||
-      fail 'release version belongs to another revision'
-  fi
+  local owner existing_release
+  github_require_main_revision "$revision" || return 1
+  owner=$(github_tag_revision "$version" true) || return 1
+  [[ $owner == "$revision" ]] || fail 'release tag does not identify the checked-out revision'
   existing_release=$(github "releases/tags/$version") || return 1
   if [[ $existing_release != null ]]; then
-    jq -e --arg revision "$revision" '.target_commitish == $revision and (.draft | not) and (.prerelease | not)' \
-      <<<"$existing_release" >/dev/null || fail 'GitHub release belongs to another revision or is incomplete'
+    # When the tag exists GitHub ignores --target. The peeled tag owns the
+    # source identity; target_commitish may be a branch name.
+    jq -e --arg version "$version" '.tag_name == $version and (.draft | not) and (.prerelease | not)' \
+      <<<"$existing_release" >/dev/null || fail 'GitHub release is incomplete or has a different tag'
   fi
 }
 
@@ -292,31 +270,43 @@ publish_index() {
 }
 
 publish_release() {
-  local manifest pin existing_release latest latest_version compared latest_pin
+  local manifest pin existing_release latest latest_version compared latest_pin promote=true
+  local github_latest github_latest_version='' promote_github=true
   guard || return 1
   manifest=$(publish_index) || return 1
   pin=$(valid_digest "$(jq -r '.digest' <<<"$manifest")") || return 1
-  guard || return 1
-  existing_release=$(github "releases/tags/$version") || return 1
-  if [[ $existing_release == null ]]; then
-    mkdir -p -- "$records" || fail 'cannot create release result directory'
-    # shellcheck disable=SC2016
-    printf 'Controller base: `%s@%s`\n\nNative platforms: linux/amd64, linux/arm64.\n' "$image" "$pin" >"$records/release-notes.md" || fail 'cannot write release notes'
-    run_command gh release create "$version" --repo "$GH_REPO" --target "$revision" --title "$version" \
-      --notes-file "$records/release-notes.md" >/dev/null || return 1
-  fi
-  # Workflow concurrency serializes publishers; guard again before promotion.
   guard || return 1
   latest=$(inspect "$image:latest" Manifest true) || return 1
   latest_pin=''
   if [[ $latest != null ]]; then
     latest_version=$(prior_latest_version "$latest") || return 1
     compared=$(version_compare "$latest_version" "$version") || return 1
-    [[ $compared != 1 ]] || fail 'latest is newer or cannot be ordered safely'
+    [[ $compared != 1 ]] || promote=false
     latest_pin=$(jq -r '.digest' <<<"$latest") || fail 'invalid latest digest'
     [[ $compared != 0 || $latest_pin == "$pin" ]] || fail 'latest version has different immutable bytes'
   fi
-  if [[ $latest_pin != "$pin" ]]; then
+  # GitHub and the registry can differ after a partial failure. Compare each
+  # latest pointer independently so an intervening older tag cannot roll it back.
+  github_latest=$(github releases/latest) || return 1
+  if [[ $github_latest != null ]]; then
+    github_latest_version=$(jq -er .tag_name <<<"$github_latest") || fail 'GitHub latest release has no tag'
+    compared=$(version_compare "$github_latest_version" "$version") || return 1
+    [[ $compared != 1 ]] || promote_github=false
+  fi
+  existing_release=$(github "releases/tags/$version") || return 1
+  if [[ $existing_release == null ]]; then
+    mkdir -p -- "$records" || fail 'cannot create release result directory'
+    # shellcheck disable=SC2016
+    printf 'Controller base: `%s@%s`\n\nNative platforms: linux/amd64, linux/arm64.\n' "$image" "$pin" >"$records/release-notes.md" || fail 'cannot write release notes'
+    guard || return 1
+    run_command gh release create "$version" --repo "$GH_REPO" --target "$revision" --title "$version" \
+      --verify-tag --latest="$promote_github" --notes-file "$records/release-notes.md" >/dev/null || return 1
+  elif [[ $promote_github == true && $github_latest_version != "$version" ]]; then
+    guard || return 1
+    run_command gh release edit "$version" --repo "$GH_REPO" --latest >/dev/null || return 1
+  fi
+  # Workflow concurrency serializes publishers; older tags never move latest back.
+  if [[ $promote == true && $latest_pin != "$pin" ]]; then
     guard || return 1
     run_command docker buildx imagetools create --tag "$image:latest" "$image@$pin" >/dev/null || return 1
     latest=$(inspect "$image:latest") || return 1
@@ -332,7 +322,7 @@ case $release_command in
     manifest=$(published)
     is_published=false
     [[ $manifest == null ]] || is_published=true
-    result=$(jq -cnS --arg version "$version" --argjson published "$is_published" '{version:$version,published:$published}')
+    result=$(jq -cnS --arg version "$version" --arg revision "$revision" --argjson published "$is_published" '{version:$version,revision:$revision,published:$published}')
     ;;
   prepare-native) result=$(prepare_native) ;;
   record-native) result=$(record_native) ;;

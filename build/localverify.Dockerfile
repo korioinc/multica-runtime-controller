@@ -16,8 +16,7 @@ RUN seed=$(jq -r '.homeSeed // "/opt/multica/fixture/seed"' /opt/multica/runtime
       '.imageBuildID=$id | .homeSeed=$seed | .providers={pi:{path:"/opt/multica/fixture/pi",version:"0.85.0",sha256:$sha}} | .env.FIXTURE_CACHE="${WORKSPACE}/.cache" | .env.LOCALVERIFY_DISPOSABLE_CLUSTER="true"' \
       /opt/multica/runtime/image.json > /opt/multica/runtime/image.next.json \
  && mv /opt/multica/runtime/image.next.json /opt/multica/runtime/image.json \
- && chmod 0444 /opt/multica/runtime/image.json \
- && rm /opt/multica/runtime/verification.json
+ && chmod 0444 /opt/multica/runtime/image.json
 LABEL io.multica.image-build-id="${IMAGE_BUILD_ID}" \
       io.multica.local-fixture-source="${SOURCE_SHA256}" \
       io.multica.verification-fixture="true"
@@ -26,15 +25,16 @@ USER 65532:65532
 FROM prepared AS verify
 USER 0:0
 COPY --chmod=0555 verifyofficial /usr/local/bin/verifyofficial
-RUN mkdir -p /out /workspace /run/multica /home/multica/agents \
- && chown 65532:65532 /out /workspace /run/multica /home/multica/agents \
- && chmod 0700 /out /workspace /run/multica /home/multica/agents
+RUN mkdir -p /workspace /run/multica /home/multica/agents \
+ && chown 65532:65532 /workspace /run/multica /home/multica/agents \
+ && chmod 0700 /workspace /run/multica /home/multica/agents
 USER 65532:65532
 RUN LOCALVERIFY_DISPOSABLE_CONTAINER=true /usr/local/bin/verifyofficial --image \
-      --verification-output /out/verification.json --evidence /evidence/official
+      --evidence /evidence/official
 
 FROM prepared AS final
-COPY --from=verify --chown=0:0 --chmod=0444 /out/verification.json /opt/multica/runtime/verification.json
+# Preserve the successful integration evidence and the dependency on its checks.
+COPY --from=verify --chown=65532:65532 /evidence/official/result.json /evidence/official/result.json
 USER 65532:65532
 # Exercise the runtime image's real startup sequence in task-worker Pods.
 CMD ["controller"]

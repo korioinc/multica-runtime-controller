@@ -158,9 +158,8 @@ func ReadInstalled(root, controllerRoot, platform string) (Descriptor, string, e
 	return d, core.Digest(raw), nil
 }
 
-// CheckInstalled verifies the prepared image without consuming a verification
-// report. The build-time adapter harness uses this to probe actual versions.
-// Production admission uses Check and never skips its matching passed report.
+// CheckInstalled verifies installed files and probes the actual tool versions.
+// Local adapter integration checks use it before and after their scenarios.
 func CheckInstalled(ctx context.Context, root, controllerRoot, platform string) (Descriptor, string, error) {
 	d, digest, err := ReadInstalled(root, controllerRoot, platform)
 	if err != nil {
@@ -190,18 +189,7 @@ func Check(ctx context.Context, root, controllerRoot, platform string) (d Descri
 	if err := ctx.Err(); err != nil {
 		return d, digest, err
 	}
-	d, digest, err := ReadInstalled(root, controllerRoot, platform)
-	if err != nil {
-		return d, digest, err
-	}
-	var v Verification
-	if _, err = ReadJSON(filepath.Join(root, "verification.json"), &v); err != nil {
-		return d, digest, err
-	}
-	if v.SchemaVersion != 1 || !v.Passed || v.ImageBuildID != d.ImageBuildID || v.DescriptorDigest != digest || v.ControllerBuildID != d.Controller.BuildID || v.ControllerSHA256 != d.Controller.RuntimeSHA256 || v.DaemonSHA256 != d.Daemon.SHA256 || v.AdapterContract != d.Daemon.AdapterContract || v.Suite != VerificationSuite {
-		return d, digest, errors.New("runtime image has no matching successful adapter verification")
-	}
-	return d, digest, nil
+	return ReadInstalled(root, controllerRoot, platform)
 }
 
 func Match(d Descriptor, digest string, r Ref) error {
