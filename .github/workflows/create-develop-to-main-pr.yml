@@ -13,7 +13,7 @@ permissions: {}
 
 concurrency:
   group: develop-to-main-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   context:
@@ -86,15 +86,29 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Set up Go
+        id: go
         uses: actions/setup-go@v7
         with:
           go-version-file: src/go.mod
-          cache-dependency-path: src/go.sum
-      - name: Verify repository
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends ripgrep
-          make verify
+          cache: false
+      - name: Cache Go modules and compiled tests
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          # Save new build/race entries after source changes; restore the previous build first.
+          key: pr-go-${{ runner.os }}-${{ runner.arch }}-${{ steps.go.outputs.go-version }}-${{ hashFiles('src/go.mod', 'src/go.sum') }}-${{ hashFiles('src/**', 'Makefile') }}
+          restore-keys: |
+            pr-go-${{ runner.os }}-${{ runner.arch }}-${{ steps.go.outputs.go-version }}-${{ hashFiles('src/go.mod', 'src/go.sum') }}-
+      - name: Validate scripts, repository and workflows
+        run: make runtime-version-test repository-validate workflow-validate
+      - name: Run Go tests
+        run: make test
+      - name: Run Go race tests
+        run: make test-race
+      - name: Vet Go packages
+        run: make vet
 
   runtime-image:
     name: runtime-image
@@ -130,8 +144,16 @@ jobs:
         with:
           context: .
           platforms: linux/amd64
+          load: true
           push: false
+          tags: multica-runtime-controller:ci
           build-args: ${{ steps.args.outputs.value }}
+          cache-from: type=gha,scope=pr-runtime-image-amd64
+          cache-to: type=gha,scope=pr-runtime-image-amd64,mode=max
+      - name: Verify the native runtime image
+        env:
+          HEAD_SHA: ${{ needs.context.outputs.head_sha }}
+        run: .github/scripts/verify-base.sh multica-runtime-controller:ci linux/amd64 ci "$HEAD_SHA"
 
   promote:
     name: create-develop-to-main-pr
