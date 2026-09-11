@@ -155,14 +155,7 @@ func (v *verifier) bindObservedHome(fixture *nativeHomeFixture, observed homeObs
 	if err != nil || observed.Home != wire.Home || observed.CodexHome != filepath.Join(root, "codex-home") {
 		return wire.Request{}, errors.New("native provider HOME is outside its claimed task preparation")
 	}
-	claim, err := v.store.Lookup(observed.TaskID, nativeHomeTaskToken, workspaceID, agentID)
-	if err != nil {
-		return wire.Request{}, err
-	}
-	if claim.RuntimeRef == nil || !claim.RuntimeRef.Equal(fixture.ref) {
-		return wire.Request{}, errors.New("native HOME claim was not admitted with the selected configuration")
-	}
-	binding, err := v.store.Bind(claim, root, "", fixture.ref)
+	claim, binding, err := v.store.AuthorizeAndBind(observed.TaskID, nativeHomeTaskToken, workspaceID, agentID, root, "", fixture.ref)
 	if err != nil {
 		return wire.Request{}, err
 	}

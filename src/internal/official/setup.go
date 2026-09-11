@@ -22,14 +22,14 @@ import (
 var builtinIDs = strings.Fields("claude codex opencode codearts deveco openclaw hermes pi omp cursor copilot kimi reasonix dsh kiro codebuddy antigravity qoder qoderclicn traecli grok qwen qwenpaw dim mcode zeroclaw")
 
 type DaemonOptions struct {
-	CoreRoot, ImageRoot, Home, TokenFile, DaemonID, Name, BackendURL, ProxyURL string
-	Capacity                                                                   int
-	PollInterval, HeartbeatInterval                                            time.Duration
-	Providers                                                                  []string
-	RuntimeRef                                                                 runtimeimage.Ref
-	Env                                                                        []string
-	Stdin                                                                      io.Reader
-	Stdout, Stderr                                                             io.Writer
+	CoreRoot, Home, TokenFile, DaemonID, Name, BackendURL, ProxyURL string
+	Capacity                                                        int
+	PollInterval, HeartbeatInterval                                 time.Duration
+	Providers                                                       []string
+	RuntimeRef                                                      runtimeimage.Ref
+	Env                                                             []string
+	Stdin                                                           io.Reader
+	Stdout, Stderr                                                  io.Writer
 }
 
 func providerSet(providers []string) (map[string]bool, error) {
@@ -46,21 +46,11 @@ func providerSet(providers []string) (map[string]bool, error) {
 	return enabled, nil
 }
 
-// Setup verifies the injected binary then writes the official CLI's native
-// configuration. The resulting argv always disables binary update and reload.
-func Setup(options DaemonOptions) (DaemonProcess, error) {
+// Setup writes the official CLI configuration using the controller admission
+// result. The resulting argv always disables binary update and reload.
+func Setup(descriptor runtimeimage.Descriptor, options DaemonOptions) (DaemonProcess, error) {
 	var process DaemonProcess
 	if err := options.RuntimeRef.Validate(); err != nil {
-		return process, err
-	}
-	if options.ImageRoot == "" {
-		options.ImageRoot = runtimeimage.Root
-	}
-	descriptor, digest, err := runtimeimage.ReadInstalled(options.ImageRoot, options.CoreRoot, options.RuntimeRef.Platform)
-	if err != nil {
-		return process, err
-	}
-	if err := runtimeimage.Match(descriptor, digest, options.RuntimeRef); err != nil {
 		return process, err
 	}
 	enabled, err := providerSet(options.Providers)

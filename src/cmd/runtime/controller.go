@@ -80,7 +80,7 @@ func serveController(ctx context.Context, options controllerOptions, admitted ad
 			return err
 		}
 	}
-	process, err := official.Setup(official.DaemonOptions{
+	process, err := official.Setup(admitted.descriptor, official.DaemonOptions{
 		CoreRoot: wire.ControllerRoot, Home: wire.Home, TokenFile: options.tokenFile,
 		DaemonID: selection.OwnerID, Capacity: options.capacity, PollInterval: options.pollInterval,
 		HeartbeatInterval: options.heartbeatInterval, Name: options.name,

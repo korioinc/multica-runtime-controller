@@ -30,12 +30,13 @@ func (r *Runner) authorizeTask(request wire.Request) (preparedTask, error) {
 	if err != nil || canonical != root {
 		return empty, errors.New("task_authorization: noncanonical preparation root")
 	}
-	claim, err := r.store.Lookup(request.TaskID, wire.Value(request.Env, "MULTICA_TOKEN"), wire.Value(request.Env, "MULTICA_WORKSPACE_ID"), wire.Value(request.Env, "MULTICA_AGENT_ID"))
+	session, err := wire.PiSession(request)
 	if err != nil {
 		return empty, err
 	}
-	if claim.RuntimeRef == nil || !claim.RuntimeRef.Equal(r.selection.RuntimeRef) {
-		return empty, errors.New("task_authorization: claim runtime changed")
+	claim, binding, err := r.store.AuthorizeAndBind(request.TaskID, wire.Value(request.Env, "MULTICA_TOKEN"), wire.Value(request.Env, "MULTICA_WORKSPACE_ID"), wire.Value(request.Env, "MULTICA_AGENT_ID"), root, session, r.selection.RuntimeRef)
+	if err != nil {
+		return empty, err
 	}
 	request.Env = slices.DeleteFunc(request.Env, func(entry string) bool {
 		key, _, _ := strings.Cut(entry, "=")
@@ -50,14 +51,6 @@ func (r *Runner) authorizeTask(request wire.Request) (preparedTask, error) {
 	// after claim authorization instead of trusting a shim-supplied marker.
 	if r.selection.GitHubApp {
 		request.Env = append(request.Env, githubauth.EnabledEnv+"=true")
-	}
-	session, err := wire.PiSession(request)
-	if err != nil {
-		return empty, err
-	}
-	binding, err := r.store.Bind(claim, root, session, r.selection.RuntimeRef)
-	if err != nil {
-		return empty, err
 	}
 	request.WorkerSubPath = binding.WorkerSubPath
 	request.RepositoryURLs = claim.RepositoryURLs

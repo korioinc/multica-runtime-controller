@@ -172,11 +172,7 @@ func TestMigrationPreservesPrivateWorkAndRequiresFreshAuthority(t *testing.T) {
 	if decisions[0].ResetWorkDir || !decisions[0].ResetSession {
 		t.Fatal("migration must preserve authorized work but exclude archived session continuation")
 	}
-	claim, err := store.Lookup(f.task, f.token, "workspace", "agent")
-	if err != nil {
-		t.Fatal(err)
-	}
-	binding, err := store.Bind(claim, f.preparation, "", ref)
+	_, binding, err := store.AuthorizeAndBind(f.task, f.token, "workspace", "agent", f.preparation, "", ref)
 	if err != nil {
 		t.Fatal(err)
 	}

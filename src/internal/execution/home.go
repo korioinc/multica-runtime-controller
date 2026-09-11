@@ -10,6 +10,7 @@ import (
 
 	"github.com/korioinc/multica-runtime-controller/internal/configuration"
 	"github.com/korioinc/multica-runtime-controller/internal/core"
+	"github.com/korioinc/multica-runtime-controller/internal/diagnostics"
 	"github.com/korioinc/multica-runtime-controller/internal/runtimeimage"
 	"github.com/korioinc/multica-runtime-controller/internal/wire"
 )
@@ -60,32 +61,34 @@ func LayoutHome(ctx context.Context, options HomeOptions) error {
 		}
 	}
 	run, home := filepath.Join(private, "run"), filepath.Join(private, "agents")
+	if options.RequestPath != "" {
+		raw, err := os.ReadFile(options.RequestPath)
+		if err != nil {
+			return err
+		}
+		request, err := wire.Decode(raw)
+		if err != nil {
+			return err
+		}
+		finish := diagnostics.StartPhase("home_install", diagnostics.TaskAttributes(request.TaskID, request.AttemptID)...)
+		err = InstallTaskHome(home, wire.HomeArtifactPath, request)
+		finish(err)
+		return err
+	}
+	finish := diagnostics.StartPhase("controller_image_validation")
 	d, digest, err := runtimeimage.Check(ctx, runtimeimage.Root, core.Root, core.HostPlatform())
+	finish(err)
 	if err != nil {
 		return err
 	}
 	if err = runtimeimage.PublishReceipt(run, d, digest); err != nil {
 		return err
 	}
-	if options.RequestPath == "" {
-		bundle, err := configuration.CaptureOrRead(run, options.Copies, configuration.InputRoot)
-		if err != nil {
-			return err
-		}
-		return layoutBaseHome(home, d.HomeSeed, bundle)
-	}
-	raw, err := os.ReadFile(options.RequestPath)
+	bundle, err := configuration.CaptureOrRead(run, options.Copies, configuration.InputRoot)
 	if err != nil {
 		return err
 	}
-	request, err := wire.Decode(raw)
-	if err != nil {
-		return err
-	}
-	if err := runtimeimage.Match(d, digest, request.RuntimeRef); err != nil {
-		return err
-	}
-	return InstallTaskHome(home, wire.HomeArtifactPath, request)
+	return layoutBaseHome(home, d.HomeSeed, bundle)
 }
 
 func layoutBaseHome(home, seed string, bundle configuration.Bundle) error {
@@ -111,9 +114,6 @@ func layoutBaseHome(home, seed string, bundle configuration.Bundle) error {
 }
 
 func copyHomeSeed(home, seed string) error {
-	if err := runtimeimage.ValidateSeedContents(seed); err != nil {
-		return err
-	}
 	entries, err := os.ReadDir(seed)
 	if err != nil {
 		return err

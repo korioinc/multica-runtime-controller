@@ -12,7 +12,7 @@ concurrency:
 
 jobs:
   tag:
-    if: github.event.deleted == false
+    if: github.ref == 'refs/heads/main' && github.event.deleted == false
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -23,7 +23,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       BEFORE_REVISION: ${{ github.event.before }}
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0

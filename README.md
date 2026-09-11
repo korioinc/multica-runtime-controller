@@ -27,7 +27,7 @@ flowchart LR
 4. Worker init verifies and publishes the prepared HOME. The worker starts the installed provider in the task workdir, preserving its input, output and exit status.
 5. The controller reconciles task resources and interrupted attempts using durable records and Kubernetes resource identities.
 
-Controller and worker Pods use the same complete image. Workers keep the controller's admitted image digest even if a registry tag changes. A new image or configuration takes effect through a replacement controller Pod.
+Controller and worker Pods use the same complete image. Workers keep the controller's admitted image digest and platform even if a registry tag changes. At startup and restart, admission verifies installed contents and requires a non-root, unprivileged, read-only filesystem with no volume shadowing installed paths, including intermediate symlinks. Shims and workers then trust that admission: they read execution metadata without rehashing image binaries or rescanning the image seed. Request authorization, Pod identity, HOME archive digests and task HOME receipts remain enforced. A new image or configuration takes effect through a replacement controller Pod.
 
 ## Deployment
 
@@ -86,6 +86,14 @@ Supply provider configuration files through the chart's `operator.configVolumes`
 Controller init captures selected ConfigMap files into a committed configuration bundle. For each attempt, the controller combines that bundle with image defaults and task-specific provider inputs to prepare a complete HOME archive. Worker init validates the archive's contents and identity before publishing HOME. Operator files take precedence over image defaults.
 
 Configuration edits, authentication refreshes and package changes inside private HOME remain local to that Pod. Matching init retries preserve the prepared HOME. Task work and selected sessions persist on the workspace PVC; session reuse is checked against the task scope and selected runtime inputs. Operator environment values are selected at controller startup and carried to providers in the task request Secret; workers do not reread the original operator Secrets.
+
+## Startup diagnostics
+
+The existing diagnostic channel records bounded preparation phases: controller image validation and binding, shim selection and metadata, registry open and authorization, attempt recovery, task context and HOME archive preparation, worker resource creation and readiness, live execution authorization, and provider process start. Registry authorization and GC candidate diagnostics also report lock wait/hold time and relevant counts after releasing the lock. They do not record tokens, environment values, provider arguments, HOME contents or raw errors.
+
+`provider_start` measures only process creation; it does not prove that Codex has answered `initialize`. Nested phase durations must not be added together. Provider protocol streams remain separate from diagnostics; Linux shims and worker execution use the existing PID 1 diagnostic sink and discard diagnostics if it cannot be opened. A killed process can leave a start event without a finish event.
+
+Task authorization and binding use one current registry snapshot. Unchanged bindings skip the registry rewrite and file sync while still syncing the directory before success. HOME validation runs while writing the archive, and GC candidates are aggregated by storage once. Full HOME copying, mutable output validation, registry parsing, Pod scheduling and readiness remain startup costs; these changes do not guarantee a 30-second initialization bound.
 
 ## GitHub App authentication
 
@@ -167,7 +175,9 @@ scripts/verify-local.sh \
 
 Integration also requires Helm and native ORAS. The harness creates a disposable local registry, backend, Git origin and Kubernetes node to exercise real task Pods, checkout, HOME preparation, session reuse, authorization and recovery. It uses its own cluster context and prints the evidence directory. Local execution verifies the host's native platform.
 
-The develop promotion workflow maintains a PR into main. The separate [develop image workflow](.github/workflows/develop-image.yml) runs on pushes to `develop`, including merges, and can be dispatched manually on that branch. It validates the exact source, builds and verifies both native Linux platforms, and publishes only `ghcr.io/<repository-owner>/multica-runtime-controller:develop`. It does not create per-build tags, GitHub Releases, or update `latest` or [`VERSION`](VERSION).
+The [PR workflow](.github/workflows/create-develop-to-main-pr.yml) runs source checks on PRs into `develop` and `main`, and maintains the develop-to-main promotion PR. The [image workflow](.github/workflows/develop-image.yml) builds and verifies both native Linux platforms when `develop` changes, then publishes only `ghcr.io/<repository-owner>/multica-runtime-controller:develop`. It can also be dispatched manually on that branch. It does not create per-build tags, GitHub Releases, or update `latest` or [`VERSION`](VERSION).
+
+Main keeps the required checks `verify` and `runtime-image`. The latter is the image workflow's final verification result for that exact commit, not another PR image build. It fails when source verification or either native image build fails, is cancelled, or is skipped; registry publication is a separate step after image verification. A same-repository `develop` PR emits only an informational `develop-image-reused` check and relies on its head commit's develop build. A new PR head needs its own successful result. Other PRs into `main`, including fork branches named `develop`, receive separate amd64 and arm64 image checks with read-only repository access and no registry publication. PRs into `develop` run source checks; image verification follows after merging into develop.
 
 Develop runs are serialized through publication, with only the newest pending run retained. Publication rechecks the current branch HEAD and the run number recorded on the existing image index, so a superseded branch revision or an older run retried at the same commit cannot replace a newer published build. Platform images are staged by digest without tags; only the verified pair receives the `develop` tag. Failed or superseded builds leave the existing tag in place. Registry manifests without tags may remain; the workflow does not delete manifests that an image index may still reference.
 
@@ -175,4 +185,8 @@ This workflow publishes the controller **base** image. Consuming it in a complet
 
 To release, explicitly increase VERSION (for example, `1.2.3`) and merge it into `main`. The [tag workflow](.github/workflows/tag-version.yml) creates the matching tag (`1.2.3`, without a `v` prefix) at that exact commit and requests the [release workflow](.github/workflows/release.yml). A main push with an unchanged VERSION does not request a release.
 
-The release workflow accepts version tag pushes or a manual dispatch on an existing tag with its original full commit SHA. The tag must match the committed VERSION and identify a commit in main's history. It validates the source, builds and verifies both native Linux platforms, then publishes the controller base to GHCR and creates a GitHub Release. Retries retain the verified image bytes; completing an older release never moves the GHCR or GitHub latest pointer backwards.
+The release workflow runs only through a dispatch on `main`, with an existing tag and its original full commit SHA supplied as inputs. Tag pushes do not start this workflow. The workflow and release control scripts are pinned to the main commit selected for that run; the tagged source is checked out separately after its tag and main ancestry are verified. Jobs with write permissions execute the control scripts from main, including the native image verifier. The source test job has read-only repository permissions.
+
+For a manual retry, run `gh workflow run release.yml --ref main -f tag=1.2.3 -f expected_revision=<full-commit-sha>`. The tag must match the committed VERSION and identify a commit in main's history. The workflow validates the source, builds and verifies both native Linux platforms, then publishes the controller base to GHCR and creates a GitHub Release. Retries retain the verified image bytes; completing an older release never moves the GHCR or GitHub latest pointer backwards.
+
+The automatic tagger uses the job's `GITHUB_TOKEN`. Repository writers remain trusted to manage workflows and create tags; these workflow checks do not enforce a separate release identity.

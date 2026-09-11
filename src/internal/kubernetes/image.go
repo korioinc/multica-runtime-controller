@@ -19,10 +19,10 @@ type ImageBinding struct {
 	Image string
 }
 
-// BindImage uses only the current Pod API object. A registry's current tag is
+// BindImage uses the current Pod API object and the checked installation. A registry's current tag is
 // not evidence for the bytes executing in this Pod, including after a restart.
 // The caller must verify its immutable private receipt before entering here.
-func (c *Client) BindImage(ctx context.Context, name, uid, container, node, platform string) (ImageBinding, error) {
+func (c *Client) BindImage(ctx context.Context, name, uid, container, node, platform string, descriptor runtimeimage.Descriptor) (ImageBinding, error) {
 	var binding ImageBinding
 	if name == "" || uid == "" || container == "" || !core.SupportedPlatform(platform) || platform != core.HostPlatform() {
 		return binding, errors.New("controller image binding requires current Pod identity/platform")
@@ -38,6 +38,9 @@ func (c *Client) BindImage(ctx context.Context, name, uid, container, node, plat
 		}
 		if pending {
 			return false, nil
+		}
+		if err = admitImageEnvironment(pod, descriptor); err != nil {
+			return false, err
 		}
 		binding = ImageBinding{Owner: Owner{Name: pod.Name, UID: string(pod.UID)}, Image: image}
 		return true, nil

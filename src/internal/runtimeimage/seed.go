@@ -38,8 +38,8 @@ func ValidateSeed(d Descriptor) error {
 	return ValidateSeedContents(root)
 }
 
-// ValidateSeedContents is also used immediately before HOME publication. The
-// image descriptor is responsible for binding this tree to immutable storage.
+// ValidateSeedContents verifies the source tree during image admission. Tasks
+// trust that immutable source; newly composed HOME data has its own validation.
 func ValidateSeedContents(root string) error {
 	resolved, err := filepath.EvalSymlinks(root)
 	if err != nil {

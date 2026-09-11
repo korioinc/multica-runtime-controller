@@ -6,6 +6,7 @@ import (
 	"net"
 	"time"
 
+	"github.com/korioinc/multica-runtime-controller/internal/diagnostics"
 	"github.com/korioinc/multica-runtime-controller/internal/kubernetes"
 	"github.com/korioinc/multica-runtime-controller/internal/runtimeimage"
 	"github.com/korioinc/multica-runtime-controller/internal/wire"
@@ -74,7 +75,10 @@ func (r *Runner) Run(ctx context.Context, request wire.Request, streams kubernet
 		return fail(err)
 	}
 	defer release()
-	if err := r.recoverStorage(ctx, task.storageID); err != nil {
+	finishRecovery := diagnostics.StartPhase("attempt_recovery", diagnostics.TaskAttributes(task.request.TaskID, task.request.AttemptID)...)
+	err = r.recoverStorage(ctx, task.storageID)
+	finishRecovery(err)
+	if err != nil {
 		return fail(err)
 	}
 	task.request = r.selectAttempt(task.request)
@@ -85,7 +89,10 @@ func (r *Runner) Run(ctx context.Context, request wire.Request, streams kubernet
 			result.CleanupError = errors.Join(result.CleanupError, removeTaskHomeArchive(wire.WorkspaceRoot, task.storageID, generatedAttempt))
 		}
 	}()
-	if err := r.prepareTaskContext(&task); err != nil {
+	finishContext := diagnostics.StartPhase("task_context", diagnostics.TaskAttributes(task.request.TaskID, task.request.AttemptID)...)
+	err = r.prepareTaskContext(&task)
+	finishContext(err)
+	if err != nil {
 		return fail(err)
 	}
 	port, token, closeBroker, err := startBroker(task.request)
@@ -112,22 +119,26 @@ func (r *Runner) Run(ctx context.Context, request wire.Request, streams kubernet
 }
 
 func Launch(ctx context.Context, provider string, args, env []string, directory string, streams ProcessStreams) error {
+	finishSelection := diagnostics.StartPhase("shim_selection", diagnostics.TaskAttributes(wire.Value(env, "MULTICA_TASK_ID"), "")...)
 	s, err := LoadSelection()
+	finishSelection(err)
 	if err != nil {
 		return err
 	}
-	manifest, digest, err := runtimeimage.Check(ctx, runtimeimage.Root, wire.ControllerRoot, s.RuntimeRef.Platform)
+	finishMetadata := diagnostics.StartPhase("shim_metadata", diagnostics.TaskAttributes(wire.Value(env, "MULTICA_TASK_ID"), "")...)
+	manifest, err := runtimeimage.ReadMetadata()
+	finishMetadata(err)
 	if err != nil {
 		return err
 	}
-	if err := runtimeimage.Match(manifest, digest, s.RuntimeRef); err != nil {
-		return err
-	}
-	path, err := runtimeimage.ProviderPath(manifest, provider)
-	if err != nil {
-		return err
+	if _, ok := manifest.Providers[provider]; !ok {
+		return errors.New("provider is not enabled")
 	}
 	if wire.Value(env, "MULTICA_TASK_ID") == "" {
+		path, err := runtimeimage.ProviderPath(manifest, provider)
+		if err != nil {
+			return err
+		}
 		// The daemon already received the selected image/manifest/operator layer.
 		// Applying manifest defaults again here would erase operator overrides.
 		return ResultError(RunProcess(ctx, path, args, env, directory, time.Duration(s.Worker.TerminationGraceSeconds)*time.Second, streams))
@@ -137,7 +148,9 @@ func Launch(ctx context.Context, provider string, args, env []string, directory 
 	if err != nil {
 		return err
 	}
+	finishOpen := diagnostics.StartPhase("registry_open", diagnostics.TaskAttributes(request.TaskID, "")...)
 	store, err := OpenWorkspace(s.OwnerID)
+	finishOpen(err)
 	if err != nil {
 		return err
 	}

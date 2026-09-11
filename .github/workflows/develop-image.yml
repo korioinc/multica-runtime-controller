@@ -1,72 +1,99 @@
-name: Publish develop image
+name: Verify images and publish develop
 
 on:
   push:
     branches: [develop]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 permissions: {}
 
 # Serialize the complete run, including registry publication. Keep only the
-# newest pending run; never cancel an in-flight registry write to start another.
+# newest pending develop run; PR checks can cancel superseded read-only builds.
 concurrency:
   group: controller-develop-image-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  SOURCE_REVISION: ${{ github.event.pull_request.head.sha || github.sha }}
+  IMAGE_VERSION: ${{ github.event_name == 'pull_request' && 'ci' || 'develop' }}
 
 jobs:
   verify:
-    name: verify-develop
-    if: github.ref == 'refs/heads/develop' && github.event.deleted != true
+    name: verify-image-source
+    # Same-repository develop PRs reuse the check emitted by their push build.
+    # A fork branch named develop must still receive its own read-only build.
+    if: >-
+      (github.event_name != 'pull_request' &&
+       github.ref == 'refs/heads/develop' && github.event.deleted != true) ||
+      (github.event_name == 'pull_request' &&
+       (github.event.pull_request.head.repo.full_name != github.repository ||
+        github.event.pull_request.head.ref != 'develop'))
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
       contents: read
     outputs:
       current: ${{ steps.head.outputs.current }}
+      revision: ${{ steps.head.outputs.revision }}
       image: ${{ steps.head.outputs.image }}
       build_args: ${{ steps.args.outputs.value }}
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
-      - name: Skip a superseded develop revision
+      - name: Resolve the current source revision
         id: head
         run: |
           set -euo pipefail
-          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
-          head=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/develop" --jq .object.sha)
-          [[ "$head" =~ ^[0-9a-f]{40}$ ]]
-          if [[ "$head" != "$GITHUB_SHA" ]]; then
-            echo 'current=false' >>"$GITHUB_OUTPUT"
-            echo 'Skipping a revision superseded on develop.' >>"$GITHUB_STEP_SUMMARY"
-            exit 0
+          [[ "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]
+          if [[ "$GITHUB_EVENT_NAME" == pull_request ]]; then
+            number=$(jq -er '.number' "$GITHUB_EVENT_PATH")
+            [[ "$number" =~ ^[1-9][0-9]*$ ]]
+            pr=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$number")
+            jq -e --arg revision "$SOURCE_REVISION" \
+              '.state == "open" and .base.ref == "main" and .head.sha == $revision' \
+              <<<"$pr" >/dev/null || {
+                echo 'PR source changed or no longer targets main.' >&2
+                exit 1
+              }
+          else
+            head=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/develop" --jq .object.sha)
+            [[ "$head" =~ ^[0-9a-f]{40}$ ]]
+            if [[ "$head" != "$SOURCE_REVISION" ]]; then
+              echo 'current=false' >>"$GITHUB_OUTPUT"
+              echo 'Skipping a revision superseded on develop.' >>"$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
           fi
           {
             echo 'current=true'
+            echo "revision=$SOURCE_REVISION"
             echo "image=ghcr.io/${GITHUB_REPOSITORY,,}"
           } >>"$GITHUB_OUTPUT"
-      - name: Check out the exact develop revision
+      - name: Check out the exact image source
         if: steps.head.outputs.current == 'true'
         uses: actions/checkout@v7.0.1
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ env.SOURCE_REVISION }}
           fetch-depth: 0
           persist-credentials: false
       - name: Set up Go
-        if: steps.head.outputs.current == 'true'
+        if: github.event_name != 'pull_request' && steps.head.outputs.current == 'true'
         uses: actions/setup-go@v7
         with:
           go-version-file: src/go.mod
           cache-dependency-path: src/go.sum
       - name: Verify controller source and workflows
-        if: steps.head.outputs.current == 'true'
+        if: github.event_name != 'pull_request' && steps.head.outputs.current == 'true'
         run: make runtime-version-test repository-validate workflow-validate test test-race vet
-      - name: Resolve develop build arguments
+      - name: Resolve image build arguments
         if: steps.head.outputs.current == 'true'
         id: args
         run: |
           set -euo pipefail
           scripts/runtime-versions.sh --root "$GITHUB_WORKSPACE" build-args \
-            --revision "$GITHUB_SHA" --version develop \
+            --revision "$SOURCE_REVISION" --version "$IMAGE_VERSION" \
             | jq -r 'to_entries[] | "\(.key)=\(.value)"' >"$RUNNER_TEMP/build-args"
           {
             echo 'value<<EOF'
@@ -77,7 +104,7 @@ jobs:
   build:
     name: build-${{ matrix.architecture }}
     needs: verify
-    if: needs.verify.outputs.current == 'true'
+    if: github.event_name != 'pull_request' && needs.verify.outputs.current == 'true'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     strategy:
@@ -150,9 +177,105 @@ jobs:
           overwrite: true
           retention-days: 1
 
+  pr-build:
+    name: verify-pr-image-${{ matrix.architecture }}
+    needs: verify
+    if: github.event_name == 'pull_request' && needs.verify.outputs.current == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: amd64
+            runner: ubuntu-24.04
+            platform: linux/amd64
+          - architecture: arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+    permissions:
+      contents: read
+    env:
+      PLATFORM: ${{ matrix.platform }}
+    steps:
+      - name: Check out the exact PR source
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ needs.verify.outputs.revision }}
+          persist-credentials: false
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4.3.0
+      - name: Build the PR image locally
+        uses: docker/build-push-action@v7.3.0
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          load: true
+          push: false
+          tags: multica-runtime-controller:ci
+          build-args: ${{ needs.verify.outputs.build_args }}
+          cache-from: type=gha,scope=pr-runtime-image-${{ matrix.architecture }}
+          cache-to: type=gha,scope=pr-runtime-image-${{ matrix.architecture }},mode=max
+      - name: Verify the native PR image
+        run: .github/scripts/verify-base.sh multica-runtime-controller:ci "$PLATFORM" ci "$SOURCE_REVISION"
+
+  image-verified:
+    # Preserve the existing required check name. Reuse-only PR runs must not
+    # publish a skipped/successful runtime-image check over the real push proof.
+    name: >-
+      ${{ github.event_name == 'pull_request' &&
+          github.event.pull_request.head.repo.full_name == github.repository &&
+          github.event.pull_request.head.ref == 'develop' &&
+          'develop-image-reused' || 'runtime-image' }}
+    needs: [verify, build, pr-build]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    env:
+      REUSE_DEVELOP: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref == 'develop' }}
+      SOURCE_RESULT: ${{ needs.verify.result }}
+      SOURCE_CURRENT: ${{ needs.verify.outputs.current }}
+      VERIFIED_REVISION: ${{ needs.verify.outputs.revision }}
+      DEVELOP_BUILD_RESULT: ${{ needs.build.result }}
+      PR_BUILD_RESULT: ${{ needs.pr-build.result }}
+    steps:
+      - name: Require successful native verification for this source
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]
+          if [[ "$REUSE_DEVELOP" == true ]]; then
+            printf 'The required runtime-image check comes from the develop build of %s.\n' \
+              "$SOURCE_REVISION" >>"$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          [[ "$SOURCE_RESULT" == success && "$SOURCE_CURRENT" == true &&
+             "$VERIFIED_REVISION" == "$SOURCE_REVISION" ]] || {
+            echo 'The requested image source was not successfully verified.' >&2
+            exit 1
+          }
+          if [[ "$GITHUB_EVENT_NAME" == pull_request ]]; then
+            result=$PR_BUILD_RESULT
+          else
+            [[ "$GITHUB_REF" == refs/heads/develop ]]
+            result=$DEVELOP_BUILD_RESULT
+          fi
+          [[ "$result" == success ]] || {
+            echo 'Both native image builds and execution checks must succeed.' >&2
+            exit 1
+          }
+          printf 'Native image verification passed for %s.\n' \
+            "$SOURCE_REVISION" >>"$GITHUB_STEP_SUMMARY"
+
   publish:
     name: publish-develop
-    needs: [verify, build]
+    needs: [verify, build, image-verified]
+    # The read-only PR build is a skipped ancestor on develop runs. Use the
+    # required results explicitly instead of an implicit success() over skips.
+    if: >-
+      !cancelled() && github.event_name != 'pull_request' &&
+      needs.verify.result == 'success' && needs.build.result == 'success' &&
+      needs.image-verified.result == 'success'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:

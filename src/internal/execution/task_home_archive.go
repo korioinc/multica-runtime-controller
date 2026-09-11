@@ -12,9 +12,13 @@ import (
 	"path/filepath"
 
 	"github.com/google/uuid"
+	"github.com/korioinc/multica-runtime-controller/internal/diagnostics"
+	"github.com/korioinc/multica-runtime-controller/internal/runtimeimage"
 )
 
-func publishTaskHomeArchive(artifacts *os.Root, stage string, identity taskHomeIdentity) (string, error) {
+func publishTaskHomeArchive(artifacts *os.Root, stage string, identity taskHomeIdentity) (digest string, returnErr error) {
+	finish := diagnostics.StartPhase("home_archive", diagnostics.TaskAttributes(identity.TaskID, identity.AttemptID)...)
+	defer func() { finish(returnErr) }()
 	home, err := artifacts.OpenRoot(stage)
 	if err != nil {
 		return "", err
@@ -79,6 +83,9 @@ func writeTaskHomeEntry(archive *tar.Writer, home *os.Root, path string) error {
 	case info.Mode().IsRegular():
 		header.Typeflag, header.Size = tar.TypeReg, info.Size()
 	case info.Mode()&os.ModeSymlink != 0 && npmCommandPath(path):
+		if err := runtimeimage.ValidateNPMCommandLink(filepath.Join(home.Name(), runtimeimage.PiNPMDirectory), filepath.Join(home.Name(), path)); err != nil {
+			return err
+		}
 		header.Typeflag = tar.TypeSymlink
 		header.Linkname, err = home.Readlink(path)
 		if err != nil {
