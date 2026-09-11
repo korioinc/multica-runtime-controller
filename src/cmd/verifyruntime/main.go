@@ -20,6 +20,9 @@ import (
 )
 
 type runRequest struct {
+	Provider      string `json:"provider,omitempty"`
+	Prompt        string `json:"prompt,omitempty"`
+	CodexMode     string `json:"codexMode,omitempty"`
 	Case          string `json:"case"`
 	TaskID        string `json:"taskID,omitempty"`
 	PriorTaskID   string `json:"priorTaskID,omitempty"`
@@ -59,16 +62,21 @@ type providerResult struct {
 }
 
 type taskRecord struct {
-	Epoch      string          `json:"epoch"`
-	Input      runRequest      `json:"input"`
-	Claim      map[string]any  `json:"claim"`
-	Transport  string          `json:"transport,omitempty"`
-	Injected   bool            `json:"injected,omitempty"`
-	Released   bool            `json:"released,omitempty"`
-	Provider   *providerResult `json:"provider,omitempty"`
-	Checkpoint *providerResult `json:"checkpoint,omitempty"`
-	Completion map[string]any  `json:"completion,omitempty"`
-	Failure    map[string]any  `json:"failure,omitempty"`
+	Status     string           `json:"status,omitempty"`
+	CancelAck  map[string]any   `json:"cancelAck"`
+	Events     []taskEvent      `json:"events,omitempty"`
+	Codex      *codexEvidence   `json:"codex,omitempty"`
+	Messages   []map[string]any `json:"messages,omitempty"`
+	Epoch      string           `json:"epoch"`
+	Input      runRequest       `json:"input"`
+	Claim      map[string]any   `json:"claim"`
+	Transport  string           `json:"transport,omitempty"`
+	Injected   bool             `json:"injected,omitempty"`
+	Released   bool             `json:"released,omitempty"`
+	Provider   *providerResult  `json:"provider,omitempty"`
+	Checkpoint *providerResult  `json:"checkpoint,omitempty"`
+	Completion map[string]any   `json:"completion,omitempty"`
+	Failure    map[string]any   `json:"failure,omitempty"`
 }
 
 type backendState struct {
@@ -104,6 +112,8 @@ func main() {
 		evidence := flags.String("evidence", "/evidence", "fixture evidence directory")
 		_ = flags.Parse(os.Args[2:])
 		err = runBackend(ctx, *listen, *origin, *evidence)
+	case "codex":
+		err = runCodexProvider(ctx, os.Args[2:])
 	case "provider":
 		err = runProvider(ctx, os.Args[2:])
 	case "drive":

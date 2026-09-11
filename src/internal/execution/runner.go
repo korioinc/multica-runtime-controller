@@ -66,19 +66,33 @@ func (r *Runner) Run(ctx context.Context, request wire.Request, streams kubernet
 		}
 	}()
 	fail := func(err error) Result { return Result{Code: 1, ExecutionError: err} }
+	if err := ctx.Err(); err != nil {
+		return fail(err)
+	}
 	task, err := r.authorizeTask(request)
 	if err != nil {
 		return fail(err)
 	}
-	release, err := r.store.AcquireLease(task.storageID)
+	release, err := r.acquireExecutionLease(ctx, task)
 	if err != nil {
 		return fail(err)
 	}
 	defer release()
-	finishRecovery := diagnostics.StartPhase("attempt_recovery", diagnostics.TaskAttributes(task.request.TaskID, task.request.AttemptID)...)
+	verified, err := r.prepareAuthorizedTask(request, &task)
+	if err != nil {
+		return fail(&diagnostics.Error{Reason: "storage_authority_changed", StorageID: task.storageID, Cause: err})
+	}
+	task = verified
+	if err := ctx.Err(); err != nil {
+		return fail(err)
+	}
+	finishRecovery := diagnostics.StartPhase("attempt_recovery", append(diagnostics.TaskAttributes(task.request.TaskID, task.request.AttemptID), "storage", task.storageID)...)
 	err = r.recoverStorage(ctx, task.storageID)
 	finishRecovery(err)
 	if err != nil {
+		return fail(&diagnostics.Error{Reason: "storage_recovery_failed", StorageID: task.storageID, Cause: err})
+	}
+	if err := ctx.Err(); err != nil {
 		return fail(err)
 	}
 	task.request = r.selectAttempt(task.request)
@@ -93,6 +107,9 @@ func (r *Runner) Run(ctx context.Context, request wire.Request, streams kubernet
 	err = r.prepareTaskContext(&task)
 	finishContext(err)
 	if err != nil {
+		return fail(err)
+	}
+	if err := ctx.Err(); err != nil {
 		return fail(err)
 	}
 	port, token, closeBroker, err := startBroker(task.request)

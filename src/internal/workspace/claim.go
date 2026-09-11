@@ -1,7 +1,6 @@
 package workspace
 
 import (
-	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -156,19 +155,9 @@ func (s *Store) AuthorizeAndBind(taskID, token, workspaceID, agentID, root, piSe
 		if !sameRef(*claim.RuntimeRef, ref) {
 			return errors.New("claim runtime changed before storage binding")
 		}
-		if err := realDirectory(root); err != nil {
+		rootTask, err := validateRootOwner(root, claim)
+		if err != nil {
 			return err
-		}
-		if err := realDirectory(filepath.Join(root, "workdir")); err != nil {
-			return err
-		}
-		var owner struct {
-			WorkspaceID string `json:"workspace_id"`
-			TaskID      string `json:"task_id"`
-		}
-		raw, err := os.ReadFile(filepath.Join(root, ".task_owner"))
-		if err != nil || json.Unmarshal(raw, &owner) != nil || owner.WorkspaceID != claim.WorkspaceID || (owner.TaskID != claim.ID && filepath.Join(root, "workdir") != claim.PriorWorkDir) {
-			return errors.New("official root is not owned or authorized by this claim")
 		}
 		binding, exists := state.Bindings[root]
 		if exists {
@@ -187,7 +176,8 @@ func (s *Store) AuthorizeAndBind(taskID, token, workspaceID, agentID, root, piSe
 		}
 		if !exists {
 			dirty = true
-			if owner.TaskID != claim.ID {
+			// A prior root may only reuse its durable binding, never recreate it.
+			if rootTask != claim.ID {
 				return errors.New("prior root lost its durable storage binding")
 			}
 			binding = Binding{Root: root, Identity: uuid.NewString(), Grant: claim.Grant, WorkerSubPath: filepath.Join(StoragePrefix, uuid.NewString()), Sessions: map[string]SessionRecord{}}
