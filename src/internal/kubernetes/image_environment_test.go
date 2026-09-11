@@ -43,6 +43,12 @@ func TestAlteredWorkerCannotAcquireExecutionAuthority(t *testing.T) {
 		"writable image":    func(p *corev1.Pod) { p.Spec.Containers[0].SecurityContext.ReadOnlyRootFilesystem = ptr.To(false) },
 		"image replaced":    func(p *corev1.Pod) { p.Spec.Containers[0].Image = "registry.example/other:latest" },
 		"platform replaced": func(p *corev1.Pod) { p.Spec.NodeSelector["kubernetes.io/arch"] = "arm64" },
+		"worker seccomp replaced": func(p *corev1.Pod) {
+			p.Spec.Containers[0].SecurityContext.SeccompProfile = &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeLocalhost, LocalhostProfile: ptr.To("unauthorized-profile.json")}
+		},
+		"init seccomp replaced": func(p *corev1.Pod) {
+			p.Spec.InitContainers[0].SecurityContext.SeccompProfile = &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeLocalhost, LocalhostProfile: ptr.To("unauthorized-profile.json")}
+		},
 		"image shadowed": func(p *corev1.Pod) {
 			p.Spec.InitContainers[0].VolumeMounts = append(p.Spec.InitContainers[0].VolumeMounts, corev1.VolumeMount{Name: "runtime-private", MountPath: "/opt/multica/controller", ReadOnly: true})
 		},

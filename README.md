@@ -54,6 +54,12 @@ Set the backend URL, Secret and PVC names for your installation. Both `linux/amd
 
 The chart configures controller capacity, polling, worker resources, task deadlines, scheduling and network policies. Refer to its [values](https://github.com/korioinc/helm/blob/main/charts/multica-runtime-controller/values.yaml) for the complete configuration.
 
+Task-worker Pods use `RuntimeDefault` seccomp at Pod level, which the `home-layout` init container inherits. Only the `worker` container explicitly uses `Unconfined`; the controller's seccomp policy is unchanged. This fixed worker policy applies to every complete runtime image admitted by the controller and to all programs in the worker, including agent commands and package scripts. UID/GID `65532`, non-root execution, no privilege escalation, a read-only root filesystem, dropped capabilities and disabled service-account token automount remain enforced.
+
+For Chrome, use a complete runtime that enables its internal sandbox by default. The matching Multica Runtime launcher adds `--disable-dev-shm-usage` without adding `--no-sandbox`. Nodes must support unprivileged user namespaces, and AppArmor, SELinux or an outer container's restrictions may still prevent browser startup. Kubernetes Pod Security Baseline and Restricted reject explicit `Unconfined`, so those enforced policies prevent worker creation. Admission mutations of worker or init seccomp do not bypass the recorded Pod identity check.
+
+Removing the worker's runtime seccomp filter broadens the shared kernel's attack surface; it neither grants host privileges automatically nor guarantees containment. Chrome's internal sandbox protects its sandboxed browser processes and does not protect other worker programs. A generated Pod or a passing controller integration check alone does not establish Chrome sandbox activation or browser functionality; verify both separately in the target environment.
+
 ## Images
 
 | Component | Responsibility |
@@ -79,7 +85,7 @@ The workspace PVC stores task work, selected native sessions and controller reco
 
 Workers run as the `multica` user with UID/GID `65532`, a read-only root filesystem and private writable HOME, temporary and control directories. Providers and interactive worker shells start in `/workspace/<workspace>/<task>/workdir`; HOME is `/home/multica/agents`.
 
-Each worker mounts a separate memory-backed `emptyDir` at `/dev/shm`, with a `256Mi` size limit. This is a capacity limit, not a memory reservation; actual usage counts toward the worker's memory limit. HOME, `/tmp` and control directories remain on the ordinary `runtime-private` emptyDir. Browsers launched with `--disable-dev-shm-usage` use temporary storage instead of this mount, so the `256Mi` limit does not cap their total shared-memory or RAM usage. Account for worker memory, temporary storage and concurrent task load when sizing the deployment.
+Each worker mounts a separate memory-backed `emptyDir` at `/dev/shm`, with a `512Mi` size limit. This is a capacity limit, not a memory reservation or a guarantee that all 512Mi can be used; actual usage counts toward the worker's memory limit alongside its other processes. The larger mount does not increase worker memory requests or limits. HOME, `/tmp` and control directories remain on the ordinary `runtime-private` emptyDir. Browsers launched with `--disable-dev-shm-usage` use temporary storage instead of this mount, so the `512Mi` limit does not cap their total shared-memory or RAM usage. Account for worker memory, temporary storage and concurrent task load when sizing the deployment.
 
 Supply provider configuration files through the chart's `operator.configVolumes` and `operator.configMounts`, and environment values through `operator.env` and `operator.envFrom`. Controller tokens and task requests use dedicated Secrets.
 

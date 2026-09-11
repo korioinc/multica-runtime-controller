@@ -84,7 +84,7 @@ func podObject(cfg Config, ref Reference, request wire.Request, gateway string) 
 	}
 	volumes := []corev1.Volume{
 		{Name: "runtime-private", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
-		{Name: "runtime-shm", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory, SizeLimit: ptr.To(resource.MustParse("256Mi"))}}},
+		{Name: "runtime-shm", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory, SizeLimit: ptr.To(resource.MustParse("512Mi"))}}},
 		{Name: "runtime-request", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: ref.SecretName, DefaultMode: ptr.To[int32](0400)}}},
 		{Name: "runtime-workspace", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: cfg.WorkspaceClaim}}},
 	}
@@ -107,6 +107,10 @@ func podObject(cfg Config, ref Reference, request wire.Request, gateway string) 
 	env = append(env, corev1.EnvVar{Name: "HOME", Value: wire.Home}, corev1.EnvVar{Name: "TMPDIR", Value: "/tmp"}, corev1.EnvVar{Name: "MULTICA_TASK_ID", Value: ref.TaskID}, corev1.EnvVar{Name: "MULTICA_REQUEST_SECRET_NAME", Value: ref.SecretName}, corev1.EnvVar{Name: "MULTICA_REQUEST_DIGEST", Value: ref.RequestDigest}, corev1.EnvVar{Name: "MULTICA_DAEMON_PROXY_URL", Value: gateway}, corev1.EnvVar{Name: "POD_UID", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.uid"}}})
 	env = append(env, corev1.EnvVar{Name: "MULTICA_RUNTIME_IMAGE_BUILD_ID", Value: ref.RuntimeRef.ImageBuildID}, corev1.EnvVar{Name: "MULTICA_ATTEMPT_ID", Value: ref.AttemptID})
 	security := &corev1.SecurityContext{AllowPrivilegeEscalation: ptr.To(false), ReadOnlyRootFilesystem: ptr.To(true), RunAsNonRoot: ptr.To(true), RunAsUser: ptr.To[int64](65532), RunAsGroup: ptr.To[int64](65532), Capabilities: &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}}}
+	// Keep init on the Pod's default while allowing worker tools to create
+	// their own process sandboxes without changing the other restrictions.
+	workerSecurity := security.DeepCopy()
+	workerSecurity.SeccompProfile = &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeUnconfined}
 	selector := maps.Clone(cfg.NodeSelector)
 	if selector == nil {
 		selector = map[string]string{}
@@ -122,7 +126,7 @@ func podObject(cfg Config, ref Reference, request wire.Request, gateway string) 
 		return nil, errors.New("official daemon port required")
 	}
 	pod := &corev1.Pod{ObjectMeta: ref.metadata(ref.PodName), Spec: corev1.PodSpec{RestartPolicy: corev1.RestartPolicyNever, AutomountServiceAccountToken: ptr.To(false), ServiceAccountName: cfg.ServiceAccount, ActiveDeadlineSeconds: ptr.To(cfg.TaskDeadlineSeconds), TerminationGracePeriodSeconds: ptr.To(cfg.TerminationGraceSeconds + 5), NodeSelector: selector, Affinity: affinity, Tolerations: cfg.Tolerations, ImagePullSecrets: cfg.ImagePullSecrets, SecurityContext: &corev1.PodSecurityContext{RunAsNonRoot: ptr.To(true), RunAsUser: ptr.To[int64](65532), RunAsGroup: ptr.To[int64](65532), FSGroup: ptr.To[int64](65532), FSGroupChangePolicy: ptr.To(corev1.FSGroupChangeOnRootMismatch), SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault}}, Volumes: volumes,
-		Containers: []corev1.Container{{Name: "worker", Image: ref.RuntimeRef.Image, ImagePullPolicy: cfg.ImagePullPolicy, Args: []string{"worker", "serve"}, WorkingDir: request.WorkDir, Env: env, VolumeMounts: mounts, Resources: cfg.Resources, SecurityContext: security, ReadinessProbe: &corev1.Probe{ProbeHandler: corev1.ProbeHandler{Exec: &corev1.ExecAction{Command: []string{wire.ControllerRoot + "/runtime", "worker", "ready"}}}, PeriodSeconds: 2, FailureThreshold: 30}, Ports: []corev1.ContainerPort{{Name: "daemon", ContainerPort: int32(port)}}}},
+		Containers: []corev1.Container{{Name: "worker", Image: ref.RuntimeRef.Image, ImagePullPolicy: cfg.ImagePullPolicy, Args: []string{"worker", "serve"}, WorkingDir: request.WorkDir, Env: env, VolumeMounts: mounts, Resources: cfg.Resources, SecurityContext: workerSecurity, ReadinessProbe: &corev1.Probe{ProbeHandler: corev1.ProbeHandler{Exec: &corev1.ExecAction{Command: []string{wire.ControllerRoot + "/runtime", "worker", "ready"}}}, PeriodSeconds: 2, FailureThreshold: 30}, Ports: []corev1.ContainerPort{{Name: "daemon", ContainerPort: int32(port)}}}},
 	}}
 	homeCommand := []string{wire.ControllerRoot + "/runtime", "home", "layout", "--private-root=" + wire.PrivateRoot, "--request=" + wire.RequestPath}
 	homeMounts := []corev1.VolumeMount{
