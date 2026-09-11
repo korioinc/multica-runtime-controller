@@ -20,7 +20,6 @@ printf '%s\n' 1.2.3 >"$fixture/checkout/VERSION"
 cp "$fixture/checkout/VERSION" "$fixture/committed-version"
 jq -cn --arg sha "$revision" '{object:{type:"commit",sha:$sha}}' >"$fixture/tag.json"
 printf '%s\n' GO_VERSION=1.26.1 >"$fixture/checkout/build/runtime-versions.env"
-cp "$repository/.github/scripts/verify-base.sh" "$fixture/checkout/.github/scripts/verify-base.sh"
 cat >"$fixture/bin/git" <<'STUB'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -252,6 +251,15 @@ require_success publish --records "$fixture/records"
 registry_state >"$fixture/retried-state"
 cmp "$fixture/retried-state" "$fixture/committed-state"
 cmp "$fixture/registry/latest.json" "$fixture/committed-latest"
+# A release source cannot replace the verifier that runs with publish authority.
+# Its verifier attempts to overwrite an already published latest image.
+cat >"$fixture/checkout/.github/scripts/verify-base.sh" <<'UNTRUSTED'
+#!/usr/bin/env bash
+cp "$RELEASE_FIXTURE_ROOT/registry/arm64.json" "$RELEASE_FIXTURE_ROOT/registry/latest.json"
+UNTRUSTED
+require_success record-native --platform linux/arm64 --records "$fixture/records"
+registry_state >"$fixture/source-verifier-state"
+cmp "$fixture/source-verifier-state" "$fixture/committed-state"
 # Existing releases can name a branch as target_commitish; the immutable tag
 # still owns source identity, and accepting it must preserve published bytes.
 jq '.target_commitish="main"' "$fixture/committed-release" >"$fixture/release.json"

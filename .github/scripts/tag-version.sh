@@ -58,10 +58,10 @@ fi
 owner=$(github_tag_revision "$version" true)
 [[ $owner == "$revision" ]] || fail 'release tag already identifies another commit'
 
-# GITHUB_TOKEN tag pushes do not start another workflow. Re-dispatch even when
-# the matching tag exists, so retries recover from tag creation/dispatch gaps.
+# Run release control from protected main, keeping the tag/SHA as source data.
+# Re-dispatch even when the matching tag exists to recover creation/dispatch gaps.
 jq -n --arg tag "$version" --arg revision "$revision" \
-  '{ref:$tag,inputs:{tag:$tag,expected_revision:$revision}}' > "$scratch/dispatch.json"
+  '{ref:"main",inputs:{tag:$tag,expected_revision:$revision}}' > "$scratch/dispatch.json"
 run_command gh api --method POST \
   "repos/$GH_REPO/actions/workflows/release.yml/dispatches" --input "$scratch/dispatch.json" >/dev/null
 printf 'Requested controller release %s at %s.\n' "$version" "$revision"

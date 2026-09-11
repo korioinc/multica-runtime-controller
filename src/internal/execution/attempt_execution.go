@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/korioinc/multica-runtime-controller/internal/diagnostics"
 	"github.com/korioinc/multica-runtime-controller/internal/kubernetes"
 	"github.com/korioinc/multica-runtime-controller/internal/wire"
 )
@@ -39,11 +40,17 @@ func (r *Runner) executeAttempt(ctx context.Context, request wire.Request, a *at
 			slog.Warn("task resources await recovery", "phase", "cleanup", "error_class", "cleanup_pending", "imageBuildID", r.selection.RuntimeRef.ImageBuildID, "task", request.TaskID, "attempt", request.AttemptID)
 		}
 	}()
-	if err := r.createAttemptSecret(ctx, a, request); err != nil {
+	finishSecret := diagnostics.StartPhase("worker_secret_create", diagnostics.TaskAttributes(request.TaskID, request.AttemptID)...)
+	err := r.createAttemptSecret(ctx, a, request)
+	finishSecret(err)
+	if err != nil {
 		result.ExecutionError = err
 		return
 	}
-	if err := r.createAttemptPod(ctx, a, request); err != nil {
+	finishPod := diagnostics.StartPhase("worker_pod_create", diagnostics.TaskAttributes(request.TaskID, request.AttemptID)...)
+	err = r.createAttemptPod(ctx, a, request)
+	finishPod(err)
+	if err != nil {
 		result.ExecutionError = err
 		return
 	}

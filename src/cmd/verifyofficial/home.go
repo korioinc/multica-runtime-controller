@@ -196,7 +196,7 @@ func (v *verifier) observeTaskHome(parent context.Context, fixture *nativeHomeFi
 		return homeObservation{}, err
 	}
 	env = append(env, "MULTICA_GC_ENABLED=false", "OPENAI_API_KEY=sk-disposable-home-fixture", "OPENAI_BASE_URL="+backend.URL+"/v1")
-	process, err := official.Setup(official.DaemonOptions{CoreRoot: wire.ControllerRoot, Home: home, TokenFile: filepath.Join(wire.ControlRoot, "verifyofficial-token"), DaemonID: v.selection.OwnerID, Name: "Task HOME fixture", BackendURL: backend.URL, ProxyURL: "http://" + listener.Addr().String(), Capacity: 1, PollInterval: time.Second, HeartbeatInterval: time.Second, Providers: enabledProviders(v.descriptor), RuntimeRef: fixture.ref, Env: env})
+	process, err := official.Setup(v.descriptor, official.DaemonOptions{CoreRoot: wire.ControllerRoot, Home: home, TokenFile: filepath.Join(wire.ControlRoot, "verifyofficial-token"), DaemonID: v.selection.OwnerID, Name: "Task HOME fixture", BackendURL: backend.URL, ProxyURL: "http://" + listener.Addr().String(), Capacity: 1, PollInterval: time.Second, HeartbeatInterval: time.Second, Providers: enabledProviders(v.descriptor), RuntimeRef: fixture.ref, Env: env})
 	if err != nil {
 		return homeObservation{}, err
 	}

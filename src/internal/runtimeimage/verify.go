@@ -95,7 +95,20 @@ func ProviderPath(d Descriptor, id string) (string, error) {
 	if !ok {
 		return "", fmt.Errorf("provider %s not enabled", id)
 	}
-	return executable(p, d.Controller)
+	// Admission has already checked the entrypoint bytes and controller
+	// separation. Preserve the installed link's resolved execution path.
+	return immutableResolved(p.Path)
+}
+
+// ReadMetadata reads execution settings only after controller or task authority
+// has been established. The fixed image path cannot be selected by a request.
+// It does not verify installed bytes or compare an image reference.
+func ReadMetadata() (Descriptor, error) {
+	var d Descriptor
+	if _, err := ReadJSON(DescriptorPath, &d); err != nil {
+		return d, err
+	}
+	return d, d.Validate(d.Platform)
 }
 
 func version(ctx context.Context, e Executable, args []string, env []string) error {

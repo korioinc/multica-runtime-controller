@@ -220,7 +220,8 @@ prepare_native() {
 record_native() {
   local ref local_image existing pin manifest record
   ref=$(native_ref "$platform")
-  run_command bash "$root/.github/scripts/verify-base.sh" "$ref" "$platform" "$version" "$revision" >/dev/null || return 1
+  # The source checkout supplies build data, never host-side release authority.
+  run_command bash "$repository/.github/scripts/verify-base.sh" "$ref" "$platform" "$version" "$revision" >/dev/null || return 1
   local_image=$(run_command docker image inspect "$ref") || return 1
   existing=$(inspect "$ref" Manifest true) || return 1
   if [[ $existing != null ]]; then

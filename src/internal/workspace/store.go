@@ -153,16 +153,35 @@ func emptyInstallation(root string) error {
 	})
 }
 
+type lockTiming struct{ wait, hold time.Duration }
+
 func (s *Store) locked(fn func() error) error {
+	return s.withLock(nil, fn)
+}
+
+func (s *Store) withLock(timing *lockTiming, fn func() error) error {
 	file, err := openLock(filepath.Join(s.options.Directory, "registry.lock"))
 	if err != nil {
 		return err
 	}
 	defer file.Close()
+	waiting := time.Now()
 	if err := unix.Flock(int(file.Fd()), unix.LOCK_EX); err != nil {
+		if timing != nil {
+			timing.wait = time.Since(waiting)
+		}
 		return err
 	}
-	defer unix.Flock(int(file.Fd()), unix.LOCK_UN)
+	acquired := time.Now()
+	if timing != nil {
+		timing.wait = acquired.Sub(waiting)
+	}
+	defer func() {
+		unix.Flock(int(file.Fd()), unix.LOCK_UN)
+		if timing != nil {
+			timing.hold = time.Since(acquired)
+		}
+	}()
 	return fn()
 }
 

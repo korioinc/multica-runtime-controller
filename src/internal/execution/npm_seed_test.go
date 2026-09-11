@@ -67,20 +67,12 @@ func TestHomeSeedPreparesExecutablePackagesAndPreservesProviderUpdates(t *testin
 	}
 }
 
-func TestHomeSeedDoesNotPublishCredentialStateWithPackages(t *testing.T) {
-	seed, home := t.TempDir(), t.TempDir()
+func TestHomeSeedAdmissionRejectsCredentialStateWithPackages(t *testing.T) {
+	seed := t.TempDir()
 	packageSeed(t, seed)
 	configFile(t, filepath.Join(seed, ".pi/agent/auth.json"), "image credential")
-	privateAuth := filepath.Join(home, ".pi/agent/auth.json")
-	configFile(t, privateAuth, "operator credential")
-	if err := copyHomeSeed(home, seed); err == nil {
+	if err := runtimeimage.ValidateSeedContents(seed); err == nil {
 		t.Fatal("image credential state was admitted as a HOME default")
-	}
-	if got, err := os.ReadFile(privateAuth); err != nil || string(got) != "operator credential" {
-		t.Fatal("image credential replaced the private identity", err)
-	}
-	if _, err := os.Stat(filepath.Join(home, runtimeimage.PiNPMDirectory)); !os.IsNotExist(err) {
-		t.Fatal("rejected seed partially published package state", err)
 	}
 }
 

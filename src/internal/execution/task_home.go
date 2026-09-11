@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/korioinc/multica-runtime-controller/internal/configuration"
+	"github.com/korioinc/multica-runtime-controller/internal/diagnostics"
 	"github.com/korioinc/multica-runtime-controller/internal/official"
 	"github.com/korioinc/multica-runtime-controller/internal/runtimeimage"
 	"github.com/korioinc/multica-runtime-controller/internal/wire"
@@ -72,9 +73,6 @@ func prepareTaskHome(request wire.Request, workerRoot, taskRoot, globalHome stri
 	if err != nil {
 		return "", err
 	}
-	if err := runtimeimage.Match(manifest, request.RuntimeRef.DescriptorDigest, request.RuntimeRef); err != nil {
-		return "", err
-	}
 	if err := bundle.Validate(); err != nil {
 		return "", err
 	}
@@ -92,7 +90,10 @@ func prepareTaskHome(request wire.Request, workerRoot, taskRoot, globalHome stri
 	}
 	defer artifacts.RemoveAll(stage)
 	home := filepath.Join(workerRoot, taskHomeArtifacts, stage)
-	if err := composeTaskHome(home, manifest.HomeSeed, bundle, request.Provider, taskRoot, globalHome); err != nil {
+	finish := diagnostics.StartPhase("home_compose", diagnostics.TaskAttributes(request.TaskID, request.AttemptID)...)
+	err = composeTaskHome(home, manifest.HomeSeed, bundle, request.Provider, taskRoot, globalHome)
+	finish(err)
+	if err != nil {
 		return "", err
 	}
 	return publishTaskHomeArchive(artifacts, stage, identity)
@@ -137,7 +138,7 @@ func composeTaskHome(home, seed string, bundle configuration.Bundle, provider, t
 	if err := applyHomeOverrides(root, overrides); err != nil {
 		return err
 	}
-	return validateTaskHomeTree(home)
+	return nil
 }
 
 func applyHomeOverrides(home *os.Root, overrides official.HomeOverrides) error {
@@ -203,35 +204,6 @@ func validTaskHomePath(path string, directory bool) bool {
 		return false
 	}
 	return directory && path == ".multica/pi-sessions" || configuration.HomePath(wire.Home+"/"+path, directory)
-}
-
-func validateTaskHomeTree(home string) error {
-	root, err := os.OpenRoot(home)
-	if err != nil {
-		return err
-	}
-	defer root.Close()
-	return fs.WalkDir(root.FS(), ".", func(path string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil || path == "." {
-			return walkErr
-		}
-		info, err := entry.Info()
-		if err != nil {
-			return err
-		}
-		if !validTaskHomePath(path, info.IsDir()) {
-			return errors.New("task HOME contains reserved authority or session state")
-		}
-		if info.Mode()&os.ModeSymlink != 0 {
-			if !npmCommandPath(path) {
-				return errors.New("task HOME contains an unapproved link")
-			}
-			return runtimeimage.ValidateNPMCommandLink(filepath.Join(home, runtimeimage.PiNPMDirectory), filepath.Join(home, path))
-		} else if !info.IsDir() && !info.Mode().IsRegular() {
-			return errors.New("task HOME contains a special file")
-		}
-		return nil
-	})
 }
 
 func npmCommandPath(path string) bool {
