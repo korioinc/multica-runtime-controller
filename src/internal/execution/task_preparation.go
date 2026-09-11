@@ -13,6 +13,7 @@ import (
 	"github.com/korioinc/multica-runtime-controller/internal/githubauth"
 	"github.com/korioinc/multica-runtime-controller/internal/official"
 	"github.com/korioinc/multica-runtime-controller/internal/wire"
+	"github.com/korioinc/multica-runtime-controller/internal/workspace"
 )
 
 type preparedTask struct {
@@ -21,6 +22,10 @@ type preparedTask struct {
 }
 
 func (r *Runner) authorizeTask(request wire.Request) (preparedTask, error) {
+	return r.prepareAuthorizedTask(request, nil)
+}
+
+func (r *Runner) prepareAuthorizedTask(request wire.Request, prior *preparedTask) (preparedTask, error) {
 	var empty preparedTask
 	root, err := wire.StorageRoot(request)
 	if err != nil {
@@ -34,10 +39,22 @@ func (r *Runner) authorizeTask(request wire.Request) (preparedTask, error) {
 	if err != nil {
 		return empty, err
 	}
-	claim, binding, err := r.store.AuthorizeAndBind(request.TaskID, wire.Value(request.Env, "MULTICA_TOKEN"), wire.Value(request.Env, "MULTICA_WORKSPACE_ID"), wire.Value(request.Env, "MULTICA_AGENT_ID"), root, session, r.selection.RuntimeRef)
+	var claim workspace.Claim
+	var binding workspace.Binding
+	if prior == nil {
+		claim, binding, err = r.store.AuthorizeAndBind(request.TaskID, wire.Value(request.Env, "MULTICA_TOKEN"), wire.Value(request.Env, "MULTICA_WORKSPACE_ID"), wire.Value(request.Env, "MULTICA_AGENT_ID"), root, session, r.selection.RuntimeRef)
+	} else {
+		if root != prior.root || !r.selection.RuntimeRef.Equal(prior.request.RuntimeRef) {
+			return empty, errors.New("task execution authority changed")
+		}
+		claim, binding, err = r.store.ReauthorizeBinding(request.TaskID, wire.Value(request.Env, "MULTICA_TOKEN"), wire.Value(request.Env, "MULTICA_WORKSPACE_ID"), wire.Value(request.Env, "MULTICA_AGENT_ID"), root, session, prior.request.WorkerSubPath, prior.request.RuntimeRef)
+	}
 	if err != nil {
 		return empty, err
 	}
+	// Filtering/selectAttempt must not mutate the original request used for
+	// reauthorization, or another caller sharing its environment backing array.
+	request.Env = slices.Clone(request.Env)
 	request.Env = slices.DeleteFunc(request.Env, func(entry string) bool {
 		key, _, _ := strings.Cut(entry, "=")
 		if key == githubauth.EnabledEnv || githubapp.ControllerEnvironmentKey(key) {
@@ -53,6 +70,7 @@ func (r *Runner) authorizeTask(request wire.Request) (preparedTask, error) {
 		request.Env = append(request.Env, githubauth.EnabledEnv+"=true")
 	}
 	request.WorkerSubPath = binding.WorkerSubPath
+	request.RuntimeRef = r.selection.RuntimeRef
 	request.RepositoryURLs = claim.RepositoryURLs
 	return preparedTask{request: request, root: root, workerRoot: filepath.Join(wire.WorkspaceRoot, binding.WorkerSubPath), storageID: filepath.Base(binding.WorkerSubPath)}, nil
 }

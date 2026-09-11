@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -48,6 +49,9 @@ func drive(ctx context.Context, origin, phase string) error {
 		return err
 	}
 	client := fixtureClient{origin: origin, http: &http.Client{Timeout: 15 * time.Second}}
+	if strings.HasPrefix(phase, "handoff-") {
+		return client.verifyCodexHandoff(ctx, phase)
+	}
 	switch phase {
 	case "baseline":
 		return client.verifyBaseline(ctx)
