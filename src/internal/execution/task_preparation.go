@@ -9,6 +9,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/korioinc/multica-runtime-controller/internal/checkout"
 	"github.com/korioinc/multica-runtime-controller/internal/configuration"
+	"github.com/korioinc/multica-runtime-controller/internal/githubapp"
+	"github.com/korioinc/multica-runtime-controller/internal/githubauth"
 	"github.com/korioinc/multica-runtime-controller/internal/official"
 	"github.com/korioinc/multica-runtime-controller/internal/wire"
 )
@@ -37,9 +39,18 @@ func (r *Runner) authorizeTask(request wire.Request) (preparedTask, error) {
 	}
 	request.Env = slices.DeleteFunc(request.Env, func(entry string) bool {
 		key, _, _ := strings.Cut(entry, "=")
+		if key == githubauth.EnabledEnv || githubapp.ControllerEnvironmentKey(key) {
+			return true
+		}
 		_, inherited := r.manifest.Env[key]
 		return inherited && !slices.Contains(r.selection.OperatorKeys, key) && !slices.Contains(claim.TaskEnvKeys, key)
 	})
+	// The official provider boundary drops inherited MULTICA_* variables. The
+	// App mode belongs to the admitted controller, so restore it from selection
+	// after claim authorization instead of trusting a shim-supplied marker.
+	if r.selection.GitHubApp {
+		request.Env = append(request.Env, githubauth.EnabledEnv+"=true")
+	}
 	session, err := wire.PiSession(request)
 	if err != nil {
 		return empty, err

@@ -87,6 +87,7 @@ func admitController(ctx context.Context, options controllerOptions) (admittedCo
 		return admittedController{}, err
 	}
 	selection := execution.Selection{SchemaVersion: execution.SelectionSchemaVersion, OwnerID: options.ownerID, Controller: binding.Owner, Namespace: resources.Namespace, Gateway: options.gatewayURL, Backend: backend, RuntimeRef: ref, Worker: installed.worker, OperatorKeys: execution.OperatorNames(options.environment)}
+	selection.GitHubApp = wire.Value(vars, "GITHUB_APP_ID") != "" || wire.Value(vars, "GITHUB_APP_PRIVATE_KEY") != ""
 	if err := validateControllerRestart(selection); err != nil {
 		return admittedController{}, err
 	}

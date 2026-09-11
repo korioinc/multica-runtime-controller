@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/korioinc/multica-runtime-controller/internal/core"
+	"github.com/korioinc/multica-runtime-controller/internal/githubauth"
 	"github.com/korioinc/multica-runtime-controller/internal/runtimeimage"
 	"github.com/korioinc/multica-runtime-controller/internal/wire"
 	"golang.org/x/sys/unix"
@@ -204,11 +205,21 @@ func WorkerExecute(ctx context.Context, digest, uid string, streams ProcessStrea
 	if request.Provider == "codex" {
 		values["CODEX_HOME"] = wire.Home + "/.codex"
 	}
+	providerEnvironment := githubauth.WithoutAppCredentials(wire.Environment(values))
+	if wire.Value(request.Env, githubauth.EnabledEnv) == "true" {
+		providerEnvironment, err = githubauth.GitEnvironment(providerEnvironment)
+		if err != nil {
+			return err
+		}
+		if err := installGitHubCLIWrapper(bin, manifest); err != nil {
+			return err
+		}
+	}
 	path, err := runtimeimage.ProviderPath(manifest, request.Provider)
 	if err != nil {
 		return err
 	}
-	result := RunProcess(ctx, path, request.Args, wire.Environment(values), request.WorkDir, time.Duration(request.TerminationGraceSeconds)*time.Second, streams)
+	result := RunProcess(ctx, path, request.Args, providerEnvironment, request.WorkDir, time.Duration(request.TerminationGraceSeconds)*time.Second, streams)
 	if result.Err != nil && !result.Exited {
 		return fmt.Errorf("provider_start: %w", result.Err)
 	}
