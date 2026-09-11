@@ -12,6 +12,8 @@ import (
 	"github.com/korioinc/multica-runtime-controller/internal/workspace"
 )
 
+var errCreateOutcomePending = errors.New("create outcome may still arrive; owner restart required before storage reuse")
+
 func (r *Runner) cleanup(ctx context.Context, a *attempt) error {
 	// Persist any UIDs learned after failed create bookkeeping before deletion.
 	recordErr := r.journal.save(a)
@@ -53,7 +55,7 @@ func (r *Runner) cleanup(ctx context.Context, a *attempt) error {
 			return errors.Join(recordErr, err)
 		}
 		if alive {
-			return errors.Join(recordErr, errors.New("create outcome may still arrive; owner restart required before storage reuse"))
+			return errors.Join(recordErr, errCreateOutcomePending)
 		}
 	}
 	if recordErr != nil {
@@ -86,31 +88,38 @@ func (r *Runner) Reconcile(ctx context.Context) (map[string]bool, error) {
 	active := map[string]bool{}
 	var failures []error
 	for _, entry := range all {
-		release, err := r.store.AcquireLease(entry.Ref.StorageID)
+		err := r.reconcileAttempt(ctx, entry)
 		if err != nil {
 			active[entry.Ref.StorageID] = true
 			if !errors.Is(err, workspace.ErrStorageBusy) {
-				failures = append(failures, &diagnostics.Error{Reason: "recovery_lease_failed", AttemptID: entry.Ref.AttemptID, StorageID: entry.Ref.StorageID, Cause: err})
-			}
-			continue
-		}
-		func() {
-			defer release()
-			a, err := r.journal.read(entry.Ref.AttemptID)
-			if errors.Is(err, os.ErrNotExist) {
-				return
-			}
-			if err == nil {
-				err = r.cleanup(ctx, a)
-			}
-			if err != nil {
-				active[entry.Ref.StorageID] = true
 				failures = append(failures, err)
 			}
-		}()
+		}
 	}
 	return active, errors.Join(failures...)
 }
+
+// Both periodic recovery and a disconnected shim must acquire the same lease
+// and reread durable authority before touching any resources.
+func (r *Runner) reconcileAttempt(ctx context.Context, entry attempt) error {
+	release, err := r.store.AcquireLease(entry.Ref.StorageID)
+	if err != nil {
+		return &diagnostics.Error{Reason: "recovery_lease_failed", AttemptID: entry.Ref.AttemptID, StorageID: entry.Ref.StorageID, Cause: err}
+	}
+	defer release()
+	a, err := r.journal.read(entry.Ref.AttemptID)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if a.Ref.StorageID != entry.Ref.StorageID {
+		return errors.New("attempt storage changed during recovery")
+	}
+	return r.cleanup(ctx, a)
+}
+
 func (r *Runner) Collect(ctx context.Context) error {
 	active, err := r.Reconcile(ctx)
 	if err != nil {

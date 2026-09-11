@@ -3,6 +3,7 @@ package execution
 import (
 	"context"
 	"errors"
+	"net"
 	"time"
 
 	"github.com/korioinc/multica-runtime-controller/internal/kubernetes"
@@ -50,6 +51,13 @@ func NewRunner(s Selection, resources *kubernetes.Client, store *workspace.Store
 // cleanup. Preparation cannot race a previous consumer of the same storage.
 func (r *Runner) Run(ctx context.Context, request wire.Request, streams kubernetes.Streams) (result Result) {
 	result.Code = 1
+	var monitor net.Conn
+	// Registered first, so normal cleanup and lease release finish before EOF.
+	defer func() {
+		if monitor != nil {
+			_ = monitor.Close()
+		}
+	}()
 	generatedAttempt := ""
 	defer func() {
 		if result.ExecutionError != nil {
@@ -91,6 +99,15 @@ func (r *Runner) Run(ctx context.Context, request wire.Request, streams kubernet
 		return fail(err)
 	}
 	recorded = true
+	monitor, err = (&net.Dialer{Timeout: 10 * time.Second}).DialContext(ctx, "unix", AttemptMonitorPath)
+	if err == nil {
+		err = registerAttempt(ctx, monitor, a.Ref.AttemptID)
+	}
+	if err != nil {
+		cleanup, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+		defer cancel()
+		return Result{Code: 1, ExecutionError: err, CleanupError: r.cleanup(cleanup, a)}
+	}
 	return r.executeAttempt(ctx, task.request, a, streams)
 }
 

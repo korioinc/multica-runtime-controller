@@ -185,7 +185,7 @@ lv_drive() {
 }
 lv_rendered_pod() {
   # kubectl owns YAML decoding; jq collects its stream of native JSON objects.
-  helm template verify "$lv_chart" --namespace "$lv_namespace" --values "$lv_work/values-A.json" |
+  helm template verify "$lv_chart" --kubeconfig "$lv_kubeconfig" --dry-run=server --namespace "$lv_namespace" --values "$lv_work/values-A.json" |
     lv_kube create --dry-run=client -f - -o json |
     jq -s '[.[] | if .kind == "List" then .items[] else . end] | map(select(.kind == "Deployment")) | if length == 1 then .[0].spec.template else error("one controller template required") end'
 }

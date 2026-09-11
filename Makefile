@@ -20,6 +20,7 @@ ACTIONLINT_VERSION := v1.7.12
 ACTIONLINT_FLAGS := -ignore '^unexpected key "queue" for "concurrency" section\.'
 ACTIONLINT_WORKFLOWS := \
 	../.github/workflows/create-develop-to-main-pr.yml \
+	../.github/workflows/develop-image.yml \
 	../.github/workflows/tag-version.yml \
 	../.github/workflows/release.yml
 

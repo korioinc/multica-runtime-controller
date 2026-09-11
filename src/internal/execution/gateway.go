@@ -22,13 +22,14 @@ import (
 	"time"
 
 	"github.com/korioinc/multica-runtime-controller/internal/checkout"
+	"github.com/korioinc/multica-runtime-controller/internal/githubauth"
 	"github.com/korioinc/multica-runtime-controller/internal/kubernetes"
 	"github.com/korioinc/multica-runtime-controller/internal/official"
 	"github.com/korioinc/multica-runtime-controller/internal/wire"
 )
 
 func taskRoute(r *http.Request) bool {
-	return r.URL.RawPath == "" && r.URL.Opaque == "" && r.URL.RawQuery == "" && (r.Method == http.MethodPost && r.URL.Path == "/repo/checkout" || r.Method == http.MethodGet && r.URL.Path == "/health")
+	return r.URL.RawPath == "" && r.URL.Opaque == "" && r.URL.RawQuery == "" && (r.Method == http.MethodPost && (r.URL.Path == "/repo/checkout" || r.URL.Path == githubauth.Route) || r.Method == http.MethodGet && r.URL.Path == "/health")
 }
 func startBroker(request wire.Request) (int, string, func(), error) {
 	port, err := strconv.Atoi(wire.Value(request.Env, "MULTICA_DAEMON_PORT"))
@@ -49,9 +50,22 @@ func startBroker(request wire.Request) (int, string, func(), error) {
 		return 0, "", nil, err
 	}
 	token := base64.RawURLEncoding.EncodeToString(tokenBytes)
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := taskBrokerHandler(request, token, client, githubauth.PrivateToken)
+	server := &http.Server{Handler: handler, ReadHeaderTimeout: 10 * time.Second}
+	go func() { _ = server.Serve(listener) }()
+	return listener.Addr().(*net.TCPAddr).Port, token, func() { _ = server.Close(); client.CloseIdleConnections() }, nil
+}
+
+// taskBrokerHandler owns the capability and repository authority checks,
+// independently of the broker listener and checkout transport lifetime.
+func taskBrokerHandler(request wire.Request, token string, client *official.CheckoutClient, source taskTokenSource) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !taskRoute(r) || r.Method != http.MethodPost || subtle.ConstantTimeCompare([]byte(r.Header.Get(wire.CapabilityHeader)), []byte(token)) != 1 {
 			http.Error(w, "task checkout unauthorized", http.StatusForbidden)
+			return
+		}
+		if r.URL.Path == githubauth.Route {
+			serveTaskGitHubToken(request, source, w, r)
 			return
 		}
 		var plan wire.Plan
@@ -96,9 +110,6 @@ func startBroker(request wire.Request) (int, string, func(), error) {
 			panic(http.ErrAbortHandler)
 		}
 	})
-	server := &http.Server{Handler: handler, ReadHeaderTimeout: 10 * time.Second}
-	go func() { _ = server.Serve(listener) }()
-	return listener.Addr().(*net.TCPAddr).Port, token, func() { _ = server.Close(); client.CloseIdleConnections() }, nil
 }
 
 func ControllerGateway(resources *kubernetes.Client) http.Handler {
@@ -127,7 +138,7 @@ func ControllerGateway(resources *kubernetes.Client) http.Handler {
 			return
 		}
 		logger := slog.Default().With("phase", "controller_gateway", "task", request.TaskID, "attempt", request.AttemptID, "provider", request.Provider)
-		logger.Info("worker checkout request received")
+		logger.Info("worker runtime request received", "operation", r.URL.Path)
 		target := &url.URL{Scheme: "http", Host: "127.0.0.1:" + strconv.Itoa(request.BrokerPort)}
 		proxy := &httputil.ReverseProxy{Rewrite: func(p *httputil.ProxyRequest) {
 			p.SetURL(target)
@@ -136,7 +147,7 @@ func ControllerGateway(resources *kubernetes.Client) http.Handler {
 			p.Out.Header.Del(wire.TokenHeader)
 			p.Out.Header.Set(wire.CapabilityHeader, request.BrokerToken)
 		}, ModifyResponse: func(response *http.Response) error {
-			logger.Info("worker checkout response received", "status", response.StatusCode)
+			logger.Info("worker runtime response received", "operation", r.URL.Path, "status", response.StatusCode)
 			return nil
 		}, ErrorHandler: func(w http.ResponseWriter, _ *http.Request, _ error) {
 			logger.Warn("worker checkout transport failed", "error_class", "transport")
@@ -165,6 +176,10 @@ func WorkerGateway(request wire.Request, origin, secret string) (http.Handler, e
 		if r.URL.Path == "/health" {
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = io.WriteString(w, `{"status":"ok"}`)
+			return
+		}
+		if r.URL.Path == githubauth.Route {
+			forwardGitHubToken(request, origin, secret, client, w, r)
 			return
 		}
 		raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
