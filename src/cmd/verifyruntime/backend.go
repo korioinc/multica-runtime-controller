@@ -21,6 +21,7 @@ import (
 
 const fixtureWorkspace = "52000000-0000-4000-8000-000000000001"
 const fixtureAgent = "52000000-0000-4000-8000-000000000002"
+const fixtureCodexRuntime = "52000000-0000-4000-8000-000000000010"
 const fixtureRuntime = "52000000-0000-4000-8000-000000000003"
 const fixtureChatA = "52000000-0000-4000-8000-000000000004"
 const fixtureChatB = "52000000-0000-4000-8000-000000000005"
@@ -117,6 +118,9 @@ func (f *runtimeBackend) control(w http.ResponseWriter, r *http.Request) {
 	}
 	f.mutex.Lock()
 	defer f.mutex.Unlock()
+	if f.codexControl(w, r) {
+		return
+	}
 	switch {
 	case r.URL.Path == "/fixture/health":
 		writeJSON(w, map[string]any{"ready": true})
@@ -204,7 +208,7 @@ func (f *runtimeBackend) schedule(input runRequest) (*taskRecord, error) {
 	if f.state.Pending != "" {
 		return nil, errors.New("another fixture task is awaiting its official claim")
 	}
-	if input.Scope != "a" && input.Scope != "b" && input.Scope != "cleanup" && input.Scope != "interrupted" && input.Scope != "journal" {
+	if input.Scope != "a" && input.Scope != "b" && input.Scope != "cleanup" && input.Scope != "interrupted" && input.Scope != "journal" && !strings.HasPrefix(input.Scope, "codex-") {
 		return nil, errors.New("unsupported fixture scope")
 	}
 	switch input.Transport {
@@ -230,6 +234,12 @@ func (f *runtimeBackend) schedule(input runRequest) (*taskRecord, error) {
 	if input.Scope == "journal" {
 		chat = journalChat
 	}
+	if strings.HasPrefix(input.Scope, "codex-") {
+		chat = uuid.NewSHA1(uuid.NameSpaceOID, []byte(input.Scope)).String()
+	}
+	if input.Provider != "" && input.Provider != "pi" && input.Provider != "codex" {
+		return nil, errors.New("unsupported fixture provider")
+	}
 	customEnv := map[string]string{"VERIFYRUNTIME_BACKEND": f.origin, "VERIFYRUNTIME_CASE": input.Case, "LOCALVERIFY_DISPOSABLE_CLUSTER": "true"}
 	if input.CacheOverride != "" {
 		customEnv["FIXTURE_CACHE"] = input.CacheOverride
@@ -250,18 +260,32 @@ func (f *runtimeBackend) schedule(input runRequest) (*taskRecord, error) {
 		f.state.JournalTask = input.TaskID
 	}
 	task := map[string]any{"id": input.TaskID, "agent_id": fixtureAgent, "runtime_id": fixtureRuntime, "workspace_id": fixtureWorkspace, "workspace_slug": "runtime-fixture", "issue_id": fixtureIssue, "issue_identifier": "VERIFY-1", "auth_token": "mat_fixture_" + input.TaskID, "chat_session_id": chat, "chat_message": "Verify the local runtime repository while preserving unfinished work.", "agent": map[string]any{"id": fixtureAgent, "name": "Runtime fixture", "instructions": "Verify the local runtime repository.", "custom_env": customEnv}, "repos": []any{map[string]any{"url": f.origin + "/git/repository.git"}}}
+	if input.Provider == "codex" {
+		task["runtime_id"] = fixtureCodexRuntime
+		task["chat_message"] = input.Prompt
+		task["issue_id"] = nil
+		task["issue_identifier"] = ""
+		customEnv["VERIFYRUNTIME_CODEX_MODE"] = input.CodexMode
+	}
 	if input.PriorTaskID != "" {
 		prior := f.state.Tasks[input.PriorTaskID]
-		if prior == nil || prior.Completion == nil || prior.Provider == nil {
-			return nil, errors.New("prior task has no completed official result")
+		if prior == nil || prior.Provider == nil || (prior.Completion == nil && prior.Status != "cancelled") {
+			return nil, errors.New("prior task has no completed or cancelled official result")
 		}
-		task["prior_work_dir"] = prior.Completion["work_dir"]
-		task["prior_session_id"] = prior.Completion["session_id"]
+		if prior.Completion != nil {
+			task["prior_work_dir"] = prior.Completion["work_dir"]
+			task["prior_session_id"] = prior.Completion["session_id"]
+		} else {
+			// The real server can claim a cancelled task's recorded directory
+			// before cancel-ack. Use the directory observed from its live worker.
+			task["prior_work_dir"] = prior.Provider.WorkDir
+			task["prior_session_id"] = prior.Provider.Session
+		}
 		if input.Scope != prior.Input.Scope {
 			customEnv["VERIFYRUNTIME_FORBIDDEN_ROOT"] = filepath.Dir(prior.Provider.WorkDir)
 		}
 	}
-	record := &taskRecord{Epoch: uuid.NewString(), Input: input, Claim: task}
+	record := &taskRecord{Status: "queued", Epoch: uuid.NewString(), Input: input, Claim: task}
 	if previous := f.state.Tasks[input.TaskID]; previous != nil {
 		record.Checkpoint = previous.Checkpoint
 	}
@@ -288,6 +312,9 @@ func (f *runtimeBackend) official(w http.ResponseWriter, r *http.Request) {
 	f.mutex.Lock()
 	defer f.mutex.Unlock()
 	output := any(map[string]any{})
+	if f.codexOfficial(w, r, body) {
+		return
+	}
 	switch {
 	case r.URL.Path == "/api/daemon/workspaces":
 		output = []any{map[string]any{"id": fixtureWorkspace, "slug": "runtime-fixture", "name": "Runtime fixture"}}
@@ -301,12 +328,16 @@ func (f *runtimeBackend) official(w http.ResponseWriter, r *http.Request) {
 		runtimes := []any{}
 		for _, raw := range entries {
 			entry, ok := raw.(map[string]any)
-			if !ok || entry["type"] != "pi" || entry["profile_id"] != nil && entry["profile_id"] != "" {
+			if !ok || (entry["type"] != "pi" && entry["type"] != "codex") || entry["profile_id"] != nil && entry["profile_id"] != "" {
 				f.fail(errors.New("registration attempted unsupported runtime"))
 				http.Error(w, "unsupported runtime", 403)
 				return
 			}
-			runtimes = append(runtimes, map[string]any{"id": fixtureRuntime, "provider": entry["type"], "name": "Runtime fixture", "status": "online"})
+			runtimeID := fixtureRuntime
+			if entry["type"] == "codex" {
+				runtimeID = fixtureCodexRuntime
+			}
+			runtimes = append(runtimes, map[string]any{"id": runtimeID, "provider": entry["type"], "name": "Runtime fixture", "status": "online"})
 		}
 		output = map[string]any{"runtimes": runtimes, "repos": []any{map[string]any{"url": f.origin + "/git/repository.git"}}}
 		raw, _ := json.MarshalIndent(body, "", "  ")
@@ -356,6 +387,8 @@ func (f *runtimeBackend) claim(transport string) any {
 	}
 	f.state.Pending = ""
 	record.Transport = transport
+	record.Status = "dispatched"
+	record.Events = append(record.Events, taskEvent{Phase: "claimed", At: time.Now().UTC(), Transport: transport})
 	_ = f.persist()
 	return map[string]any{"tasks": []any{record.Claim}}
 }

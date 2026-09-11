@@ -17,10 +17,10 @@ func TestEnvironmentChangePreservesWorkButCannotResumeOldSession(t *testing.T) {
 	store, options := testStore(t)
 	a, b := testEnvironment("a"), testEnvironment("b")
 	first := testObservation(a)
-	claim := approve(t, store, first)
+	approve(t, store, first)
 	root := prepareRoot(t, options.WorkspaceRoot, first)
 	session := prepareSession(t, options.SessionRoot)
-	binding, err := store.Bind(claim, root, session, a)
+	_, binding, err := store.AuthorizeAndBind(first.ID, first.AuthToken, first.WorkspaceID, first.AgentID, root, session, a)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -30,7 +30,8 @@ func TestEnvironmentChangePreservesWorkButCannotResumeOldSession(t *testing.T) {
 	same := testObservation(a)
 	same.PriorWorkDir = filepath.Join(root, "workdir")
 	same.PriorSession = session
-	if _, err := store.Bind(approve(t, store, same), root, session, a); err != nil {
+	approve(t, store, same)
+	if _, _, err := store.AuthorizeAndBind(same.ID, same.AuthToken, same.WorkspaceID, same.AgentID, root, session, a); err != nil {
 		t.Fatalf("authorized same-environment continuation: %v", err)
 	}
 	store, err = Open(options)
@@ -40,12 +41,12 @@ func TestEnvironmentChangePreservesWorkButCannotResumeOldSession(t *testing.T) {
 	next := testObservation(b)
 	next.PriorWorkDir = filepath.Join(root, "workdir")
 	next.PriorSession = session
-	nextClaim := approve(t, store, next)
-	if _, err := store.Bind(nextClaim, root, session, b); err == nil {
+	approve(t, store, next)
+	if _, _, err := store.AuthorizeAndBind(next.ID, next.AuthToken, next.WorkspaceID, next.AgentID, root, session, b); err == nil {
 		t.Fatal("new environment acquired old provider session")
 	}
 	fresh := prepareSession(t, options.SessionRoot)
-	continued, err := store.Bind(nextClaim, root, fresh, b)
+	_, continued, err := store.AuthorizeAndBind(next.ID, next.AuthToken, next.WorkspaceID, next.AgentID, root, fresh, b)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,7 +58,8 @@ func TestEnvironmentChangePreservesWorkButCannotResumeOldSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	retryRoot := prepareRoot(t, options.WorkspaceRoot, next)
-	retried, err := store.Bind(approve(t, store, next), retryRoot, fresh, b)
+	approve(t, store, next)
+	_, retried, err := store.AuthorizeAndBind(next.ID, next.AuthToken, next.WorkspaceID, next.AgentID, retryRoot, fresh, b)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,26 +73,35 @@ func TestScopeAndCredentialCannotAuthorizeAnotherStorage(t *testing.T) {
 	if _, err := store.Lookup(first.ID, first.AuthToken, first.WorkspaceID, first.AgentID); err == nil {
 		t.Fatal("unobserved task authorized")
 	}
-	claim := approve(t, store, first)
+	approve(t, store, first)
 	root := prepareRoot(t, options.WorkspaceRoot, first)
 	session := prepareSession(t, options.SessionRoot)
-	if _, err := store.Bind(claim, root, session, ref); err != nil {
+	if _, _, err := store.AuthorizeAndBind(first.ID, first.AuthToken, first.WorkspaceID, first.AgentID, root, session, ref); err != nil {
 		t.Fatal(err)
 	}
 	writeFile(t, session, []byte("repository A history"))
-	if _, err := store.Lookup(first.ID, "mat_wrong", first.WorkspaceID, first.AgentID); err == nil {
-		t.Fatal("wrong credential authorized")
+	if _, _, err := store.AuthorizeAndBind(first.ID, "mat_wrong", first.WorkspaceID, first.AgentID, root, session, ref); err == nil {
+		t.Fatal("wrong credential acquired bound work")
+	}
+	if _, _, err := store.AuthorizeAndBind(first.ID, first.AuthToken, "another-workspace", first.AgentID, root, session, ref); err == nil {
+		t.Fatal("another workspace acquired bound work")
+	}
+	if _, _, err := store.AuthorizeAndBind(first.ID, first.AuthToken, first.WorkspaceID, "another-agent", root, session, ref); err == nil {
+		t.Fatal("another agent acquired bound work")
+	}
+	if _, _, err := store.AuthorizeAndBind(first.ID, first.AuthToken, first.WorkspaceID, first.AgentID, root, session, testEnvironment("another-runtime")); err == nil {
+		t.Fatal("unobserved runtime acquired bound work")
 	}
 	other := testObservation(ref)
 	other.RepositoryURLs = []string{"https://example.invalid/private-other.git"}
 	other.PriorWorkDir = filepath.Join(root, "workdir")
 	other.PriorSession = session
-	otherClaim := approve(t, store, other)
-	if _, err := store.Bind(otherClaim, root, session, ref); err == nil {
+	approve(t, store, other)
+	if _, _, err := store.AuthorizeAndBind(other.ID, other.AuthToken, other.WorkspaceID, other.AgentID, root, session, ref); err == nil {
 		t.Fatal("another repository acquired prior root")
 	}
 	otherRoot := prepareRoot(t, options.WorkspaceRoot, other)
-	if _, err := store.Bind(otherClaim, otherRoot, session, ref); err == nil {
+	if _, _, err := store.AuthorizeAndBind(other.ID, other.AuthToken, other.WorkspaceID, other.AgentID, otherRoot, session, ref); err == nil {
 		t.Fatal("another repository acquired prior session through a new root")
 	}
 	changed := first
@@ -170,9 +181,9 @@ func TestMissingRegistryDoesNotAdoptExistingWorkerFiles(t *testing.T) {
 func TestLeaseAndActiveAttemptProtectRetirement(t *testing.T) {
 	store, options := testStore(t)
 	task := testObservation(testEnvironment("a"))
-	claim := approve(t, store, task)
+	approve(t, store, task)
 	root := prepareRoot(t, options.WorkspaceRoot, task)
-	binding, err := store.Bind(claim, root, "", task.RuntimeRef)
+	_, binding, err := store.AuthorizeAndBind(task.ID, task.AuthToken, task.WorkspaceID, task.AgentID, root, "", task.RuntimeRef)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -259,16 +270,11 @@ func testObservation(ref runtimeimage.Ref) Observation {
 	id := uuid.NewString()
 	return Observation{ID: id, WorkspaceID: "workspace", AgentID: "agent", IssueID: "issue", AuthToken: "mat_" + id, RepositoryURLs: []string{"https://example.invalid/private.git"}, RuntimeRef: ref}
 }
-func approve(t *testing.T, store *Store, task Observation) Claim {
+func approve(t *testing.T, store *Store, task Observation) {
 	t.Helper()
 	if _, err := store.ObserveBatch([]Observation{task}); err != nil {
 		t.Fatal(err)
 	}
-	claim, err := store.Lookup(task.ID, task.AuthToken, task.WorkspaceID, task.AgentID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return claim
 }
 func prepareRoot(t *testing.T, workspace string, task Observation) string {
 	t.Helper()

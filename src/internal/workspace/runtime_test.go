@@ -9,10 +9,10 @@ func TestArchivedEmptySessionCannotBeReactivated(t *testing.T) {
 	store, options := testStore(t)
 	ref := testEnvironment("archive")
 	task := testObservation(ref)
-	claim := approve(t, store, task)
+	approve(t, store, task)
 	root := prepareRoot(t, options.WorkspaceRoot, task)
 	session := prepareSession(t, options.SessionRoot)
-	if _, err := store.Bind(claim, root, session, ref); err != nil {
+	if _, _, err := store.AuthorizeAndBind(task.ID, task.AuthToken, task.WorkspaceID, task.AgentID, root, session, ref); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.locked(func() error {
@@ -36,15 +36,12 @@ func TestArchivedEmptySessionCannotBeReactivated(t *testing.T) {
 	if decisions[0].ResetWorkDir || !decisions[0].ResetSession {
 		t.Fatal("archived session was offered for continuation")
 	}
-	claim, err = store.Lookup(task.ID, task.AuthToken, task.WorkspaceID, task.AgentID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store.Bind(claim, root, session, ref); err == nil {
+
+	if _, _, err := store.AuthorizeAndBind(task.ID, task.AuthToken, task.WorkspaceID, task.AgentID, root, session, ref); err == nil {
 		t.Fatal("an empty archived session acquired new execution authority")
 	}
 	fresh := prepareSession(t, options.SessionRoot)
-	if _, err := store.Bind(claim, root, fresh, ref); err != nil {
+	if _, _, err := store.AuthorizeAndBind(task.ID, task.AuthToken, task.WorkspaceID, task.AgentID, root, fresh, ref); err != nil {
 		t.Fatal("fresh session could not use the preserved work", err)
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/korioinc/multica-runtime-controller/internal/diagnostics"
 )
 
 type retirement struct{ storage, tombstone string }
@@ -42,34 +43,68 @@ func (s *Store) Collect(root string, olderThan time.Time, active map[string]bool
 	return retired, nil
 }
 
-func (s *Store) retirementCandidates(olderThan time.Time, active map[string]bool) ([]string, error) {
-	var result []string
-	err := s.locked(func() error {
+func (s *Store) retirementCandidates(olderThan time.Time, active map[string]bool) (result []string, err error) {
+	finish := diagnostics.StartPhase("registry_gc_candidates")
+	var timing lockTiming
+	var claims, bindings, storages int
+	defer func() {
+		finish(err, "lock_wait", timing.wait, "lock_hold", timing.hold, "claims", claims, "bindings", bindings, "storages", storages, "candidates", len(result))
+	}()
+	err = s.withLock(&timing, func() error {
 		state, err := s.read()
 		if err != nil {
 			return err
 		}
-		candidates := map[string]bool{}
+		claims, bindings = len(state.Claims), len(state.Bindings)
+		type candidate struct {
+			known, recent, committed bool
+			roots                    []string
+		}
+		candidates := make(map[string]*candidate)
+		get := func(storage string) *candidate {
+			value := candidates[storage]
+			if value == nil {
+				value = &candidate{}
+				candidates[storage] = value
+			}
+			return value
+		}
 		for _, b := range state.Bindings {
-			candidates[b.WorkerSubPath] = true
+			value := get(b.WorkerSubPath)
+			value.roots = append(value.roots, b.Root)
 		}
 		for _, c := range state.Claims {
 			if c.WorkerSubPath != "" {
-				candidates[c.WorkerSubPath] = true
+				value := get(c.WorkerSubPath)
+				value.known = true
+				value.recent = value.recent || !c.ObservedAt.Before(olderThan)
 			}
 		}
 		for storage := range state.Retired {
-			candidates[storage] = true
+			get(storage).committed = true
 		}
-		for storage := range candidates {
+		storages = len(candidates)
+		for storage, value := range candidates {
 			if active[filepath.Base(storage)] {
 				continue
 			}
-			eligible, err := retirementEligible(state, storage, olderThan)
-			if err != nil {
-				return err
+			if value.committed {
+				result = append(result, storage)
+				continue
 			}
-			if eligible {
+			if value.recent {
+				continue
+			}
+			rootExists := false
+			for _, root := range value.roots {
+				if _, err := os.Lstat(root); err == nil {
+					rootExists = true
+					break
+				} else if !errors.Is(err, os.ErrNotExist) {
+					return err
+				}
+			}
+			if !rootExists && value.known {
 				result = append(result, storage)
 			}
 		}

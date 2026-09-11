@@ -94,6 +94,12 @@ func verify(priorPath, priorImage, evidence string) error {
 	}
 	uid := uuid.NewString()
 	pod := corev1.Pod{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Pod"}, ObjectMeta: metav1.ObjectMeta{Name: "controller", Namespace: "fixture", UID: types.UID(uid)}, Spec: corev1.PodSpec{NodeName: "fixture-node", NodeSelector: map[string]string{"kubernetes.io/os": "linux", "kubernetes.io/arch": strings.TrimPrefix(current.Platform, "linux/")}, Containers: []corev1.Container{{Name: "controller", Image: priorImage}}, InitContainers: []corev1.Container{{Name: "home-layout", Image: priorImage}}}, Status: corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{{Name: "controller", ImageID: priorImage}}, InitContainerStatuses: []corev1.ContainerStatus{{Name: "home-layout", ImageID: priorImage}}}}
+	nonRoot, readOnly, escalation := true, true, false
+	uid65532 := int64(65532)
+	pod.Spec.SecurityContext = &corev1.PodSecurityContext{RunAsNonRoot: &nonRoot, RunAsUser: &uid65532}
+	security := &corev1.SecurityContext{ReadOnlyRootFilesystem: &readOnly, AllowPrivilegeEscalation: &escalation, Capabilities: &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}}}
+	pod.Spec.Containers[0].SecurityContext = security
+	pod.Spec.InitContainers[0].SecurityContext = security
 	var reads, mutations, backendCalls atomic.Int64
 	api := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet && r.URL.Path == "/api/v1/namespaces/fixture/pods/controller" {
@@ -134,12 +140,15 @@ func verify(priorPath, priorImage, evidence string) error {
 	}
 	// A live positive control proves the stale fixture serves a valid pullable
 	// index/manifest and platform through the same production binding client.
-	bound, err := client.BindImage(ctx, "controller", uid, "controller", "fixture-node", current.Platform)
+	bound, err := client.BindImage(ctx, "controller", uid, "controller", "fixture-node", current.Platform, current)
 	if err != nil {
 		return err
 	}
 	if bound.Image != priorImage {
 		return errors.New("binding changed the reported repository digest")
+	}
+	if err = verifyImmutableAdmission(ctx, client, &pod, current); err != nil {
+		return err
 	}
 	beforeReads := reads.Load()
 	owner := uuid.NewString()
@@ -183,7 +192,7 @@ func verify(priorPath, priorImage, evidence string) error {
 	if err = runtimeimage.CheckReceipt(wire.ControlRoot, current, currentDigest); err == nil {
 		return errors.New("fixture failed to distinguish the old receipt")
 	}
-	result := map[string]any{"passed": true, "platform": current.Platform, "priorImage": priorImage, "priorBuildID": prior.ImageBuildID, "currentBuildID": current.ImageBuildID, "liveAPIBinding": true, "staleStatusRejectedBeforeAPI": true, "daemonCalls": backendCalls.Load(), "workspacePreserved": true, "receiptPreserved": true}
+	result := map[string]any{"passed": true, "platform": current.Platform, "priorImage": priorImage, "priorBuildID": prior.ImageBuildID, "currentBuildID": current.ImageBuildID, "liveAPIBinding": true, "immutableAdmission": true, "staleStatusRejectedBeforeAPI": true, "daemonCalls": backendCalls.Load(), "workspacePreserved": true, "receiptPreserved": true}
 	raw, err = json.MarshalIndent(result, "", "  ")
 	if err != nil {
 		return err

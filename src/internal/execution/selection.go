@@ -28,6 +28,7 @@ type Selection struct {
 	RuntimeRef    runtimeimage.Ref  `json:"runtimeRef"`
 	Worker        kubernetes.Config `json:"worker"`
 	OperatorKeys  []string          `json:"operatorKeys"`
+	GitHubApp     bool              `json:"githubApp"`
 }
 
 func (s Selection) Validate() error {

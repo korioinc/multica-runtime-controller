@@ -1,7 +1,6 @@
 package workspace
 
 import (
-	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -10,6 +9,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/korioinc/multica-runtime-controller/internal/diagnostics"
 	"github.com/korioinc/multica-runtime-controller/internal/runtimeimage"
 )
 
@@ -117,46 +117,47 @@ func (s *Store) Lookup(taskID, token, workspaceID, agentID string) (Claim, error
 		if err != nil {
 			return err
 		}
-		value, ok := state.Claims[taskID]
-		if !ok || value.Denied || state.Retired[value.WorkerSubPath] != "" || value.ExecutionState != "observed" || value.RuntimeRef == nil || token == "" || value.TokenHash != digest(token) || value.WorkspaceID != workspaceID || value.AgentID != agentID {
-			return errors.New("provider does not match an observed task claim")
-		}
-		claim = value
-		return nil
+		claim, err = authorizeClaim(state, taskID, token, workspaceID, agentID)
+		return err
 	})
 	return claim, err
 }
 
-// Bind connects a freshly validated official root to independent worker data.
-// Root preparation and session files remain owned by the official daemon.
-func (s *Store) Bind(claim Claim, root, piSession string, ref runtimeimage.Ref) (Binding, error) {
-	var result Binding
+// authorizeClaim reads only the current locked registry snapshot.
+func authorizeClaim(state Registry, taskID, token, workspaceID, agentID string) (Claim, error) {
+	value, ok := state.Claims[taskID]
+	if !ok || value.Denied || state.Retired[value.WorkerSubPath] != "" || value.ExecutionState != "observed" || value.RuntimeRef == nil || token == "" || value.TokenHash != digest(token) || value.WorkspaceID != workspaceID || value.AgentID != agentID {
+		return Claim{}, errors.New("provider does not match an observed task claim")
+	}
+	return value, nil
+}
+
+// AuthorizeAndBind connects an authorized official root to independent worker
+// data using one current authority snapshot. Root and session preparation remain
+// owned by the official daemon; successful retries complete durable publication.
+func (s *Store) AuthorizeAndBind(taskID, token, workspaceID, agentID, root, piSession string, ref runtimeimage.Ref) (authorized Claim, result Binding, err error) {
+	finish := diagnostics.StartPhase("registry_authorize_bind", diagnostics.TaskAttributes(taskID, "")...)
+	var timing lockTiming
+	dirty := false
+	defer func() { finish(err, "lock_wait", timing.wait, "lock_hold", timing.hold, "changed", dirty) }()
 	if !s.preparationRoot(root) || !validRef(ref) {
-		return result, errors.New("invalid official preparation root or runtime")
+		return authorized, result, errors.New("invalid official preparation root or runtime")
 	}
-	if err := realDirectory(root); err != nil {
-		return result, err
-	}
-	if err := realDirectory(filepath.Join(root, "workdir")); err != nil {
-		return result, err
-	}
-	err := s.locked(func() error {
+	err = s.withLock(&timing, func() error {
 		state, err := s.read()
 		if err != nil {
 			return err
 		}
-		current, ok := state.Claims[claim.ID]
-		if !ok || current.Denied || current.ExecutionState != "observed" || current.RuntimeRef == nil || current.Grant != claim.Grant || current.TokenHash == "" || current.TokenHash != claim.TokenHash || !sameRef(*current.RuntimeRef, ref) {
-			return errors.New("claim changed before storage binding")
+		claim, err := authorizeClaim(state, taskID, token, workspaceID, agentID)
+		if err != nil {
+			return err
 		}
-		claim = current
-		var owner struct {
-			WorkspaceID string `json:"workspace_id"`
-			TaskID      string `json:"task_id"`
+		if !sameRef(*claim.RuntimeRef, ref) {
+			return errors.New("claim runtime changed before storage binding")
 		}
-		raw, err := os.ReadFile(filepath.Join(root, ".task_owner"))
-		if err != nil || json.Unmarshal(raw, &owner) != nil || owner.WorkspaceID != claim.WorkspaceID || (owner.TaskID != claim.ID && filepath.Join(root, "workdir") != claim.PriorWorkDir) {
-			return errors.New("official root is not owned or authorized by this claim")
+		rootTask, err := validateRootOwner(root, claim)
+		if err != nil {
+			return err
 		}
 		binding, exists := state.Bindings[root]
 		if exists {
@@ -174,7 +175,9 @@ func (s *Store) Bind(claim Claim, root, piSession string, ref runtimeimage.Ref) 
 			return errors.New("root conflicts with the task's bound storage")
 		}
 		if !exists {
-			if owner.TaskID != claim.ID {
+			dirty = true
+			// A prior root may only reuse its durable binding, never recreate it.
+			if rootTask != claim.ID {
 				return errors.New("prior root lost its durable storage binding")
 			}
 			binding = Binding{Root: root, Identity: uuid.NewString(), Grant: claim.Grant, WorkerSubPath: filepath.Join(StoragePrefix, uuid.NewString()), Sessions: map[string]SessionRecord{}}
@@ -213,6 +216,7 @@ func (s *Store) Bind(claim Claim, root, piSession string, ref runtimeimage.Ref) 
 				if info.Size() != 0 {
 					return errors.New("unapproved nonempty Pi session")
 				}
+				dirty = true
 				binding.Sessions[piSession] = SessionRecord{State: "active", RuntimeRef: new(ref)}
 			}
 		}
@@ -228,16 +232,25 @@ func (s *Store) Bind(claim Claim, root, piSession string, ref runtimeimage.Ref) 
 				return err
 			}
 		}
-		state.Bindings[root] = binding
+		if claim.BoundRoot != root || claim.WorkerSubPath != binding.WorkerSubPath {
+			dirty = true
+		}
 		claim.BoundRoot, claim.WorkerSubPath = root, binding.WorkerSubPath
-		state.Claims[claim.ID] = claim
-		if err := s.write(state); err != nil {
+		if dirty {
+			state.Bindings[root] = binding
+			state.Claims[claim.ID] = claim
+			if err := s.write(state); err != nil {
+				return err
+			}
+		} else if err := syncDirectory(s.options.Directory); err != nil {
+			// A previous rename may have succeeded before its directory sync
+			// failed. Visible identical state alone does not prove durability.
 			return err
 		}
-		result = binding
+		authorized, result = claim, binding
 		return nil
 	})
-	return result, err
+	return authorized, result, err
 }
 
 func (s *Store) liveBinding(binding Binding) error {

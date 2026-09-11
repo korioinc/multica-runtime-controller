@@ -8,6 +8,7 @@ import (
 
 	"github.com/korioinc/multica-runtime-controller/internal/configuration"
 	"github.com/korioinc/multica-runtime-controller/internal/core"
+	"github.com/korioinc/multica-runtime-controller/internal/diagnostics"
 	"github.com/korioinc/multica-runtime-controller/internal/execution"
 	"github.com/korioinc/multica-runtime-controller/internal/kubernetes"
 	"github.com/korioinc/multica-runtime-controller/internal/official"
@@ -30,7 +31,9 @@ type admittedController struct {
 }
 
 func inspectControllerInstallation(ctx context.Context, options controllerOptions) (installedController, error) {
+	finishValidation := diagnostics.StartPhase("controller_image_validation")
 	descriptor, descriptorDigest, err := runtimeimage.Check(ctx, runtimeimage.Root, core.Root, core.HostPlatform())
+	finishValidation(err)
 	if err != nil {
 		return installedController{}, err
 	}
@@ -70,7 +73,9 @@ func admitController(ctx context.Context, options controllerOptions) (admittedCo
 	}
 	startup, stopStartup := context.WithTimeout(ctx, options.startupTimeout)
 	defer stopStartup()
-	binding, err := resources.BindImage(startup, options.podName, options.podUID, options.containerName, options.nodeName, installed.descriptor.Platform)
+	finishBinding := diagnostics.StartPhase("controller_image_binding")
+	binding, err := resources.BindImage(startup, options.podName, options.podUID, options.containerName, options.nodeName, installed.descriptor.Platform, installed.descriptor)
+	finishBinding(err)
 	if err != nil {
 		return admittedController{}, err
 	}
@@ -87,6 +92,7 @@ func admitController(ctx context.Context, options controllerOptions) (admittedCo
 		return admittedController{}, err
 	}
 	selection := execution.Selection{SchemaVersion: execution.SelectionSchemaVersion, OwnerID: options.ownerID, Controller: binding.Owner, Namespace: resources.Namespace, Gateway: options.gatewayURL, Backend: backend, RuntimeRef: ref, Worker: installed.worker, OperatorKeys: execution.OperatorNames(options.environment)}
+	selection.GitHubApp = wire.Value(vars, "GITHUB_APP_ID") != "" || wire.Value(vars, "GITHUB_APP_PRIVATE_KEY") != ""
 	if err := validateControllerRestart(selection); err != nil {
 		return admittedController{}, err
 	}

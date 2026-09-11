@@ -10,6 +10,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/korioinc/multica-runtime-controller/internal/diagnostics"
+	"github.com/korioinc/multica-runtime-controller/internal/wire"
 	"golang.org/x/sys/unix"
 )
 
@@ -71,8 +73,11 @@ func RunProcess(ctx context.Context, executable string, args, env []string, dire
 		result.Err = ctx.Err()
 		return
 	}
-	if err := command.Start(); err != nil {
-		result.Err = fmt.Errorf("%w: %w", ErrProviderStart, err)
+	finishStart := diagnostics.StartPhase("provider_start", diagnostics.TaskAttributes(wire.Value(env, "MULTICA_TASK_ID"), wire.Value(env, "MULTICA_ATTEMPT_ID"))...)
+	startErr := command.Start()
+	finishStart(startErr)
+	if startErr != nil {
+		result.Err = fmt.Errorf("%w: %w", ErrProviderStart, startErr)
 		return
 	}
 	pid := command.Process.Pid

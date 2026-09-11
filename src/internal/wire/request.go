@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/korioinc/multica-runtime-controller/internal/configuration"
 	"github.com/korioinc/multica-runtime-controller/internal/core"
+	"github.com/korioinc/multica-runtime-controller/internal/githubapp"
 	"github.com/korioinc/multica-runtime-controller/internal/runtimeimage"
 )
 
@@ -115,6 +116,9 @@ func TaskEnvironment(input []string) []string {
 	return Environment(values)
 }
 func reservedTaskKey(key string) bool {
+	if githubapp.ControllerEnvironmentKey(key) {
+		return true
+	}
 	if strings.HasPrefix(key, "KUBERNETES_") || strings.HasPrefix(key, "POD_") || strings.HasPrefix(key, "ENV_") {
 		return true
 	}
@@ -127,7 +131,7 @@ func reservedTaskKey(key string) bool {
 		return true
 	}
 	switch key {
-	case "MULTICA_DAEMON_ID", "MULTICA_DAEMON_PROXY_URL", "MULTICA_REQUEST_SECRET_NAME", "MULTICA_WORKSPACE_PVC_NAME", "MULTICA_TASK_DEADLINE", "CODEX_HOME", "PI_CODING_AGENT_DIR":
+	case "MULTICA_DAEMON_ID", "MULTICA_DAEMON_PROXY_URL", "MULTICA_REQUEST_SECRET_NAME", "MULTICA_WORKSPACE_PVC_NAME", "MULTICA_TASK_DEADLINE", "MULTICA_GITHUB_APP_AUTH", "CODEX_HOME", "PI_CODING_AGENT_DIR":
 		return true
 	}
 	return false

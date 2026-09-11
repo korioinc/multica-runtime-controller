@@ -14,54 +14,45 @@ import (
 	"time"
 
 	"github.com/korioinc/multica-runtime-controller/internal/core"
+	"github.com/korioinc/multica-runtime-controller/internal/diagnostics"
+	"github.com/korioinc/multica-runtime-controller/internal/githubauth"
 	"github.com/korioinc/multica-runtime-controller/internal/runtimeimage"
 	"github.com/korioinc/multica-runtime-controller/internal/wire"
 	"golang.org/x/sys/unix"
 )
 
-func readWorkerRequest(digest, uid string) (wire.Request, runtimeimage.Descriptor, error) {
-	var empty runtimeimage.Descriptor
+func readWorkerRequest(digest, uid string) (wire.Request, error) {
 	if !core.ValidSHA(digest) || uid == "" || uid != os.Getenv("POD_UID") {
-		return wire.Request{}, empty, errors.New("worker Pod UID or request digest mismatch")
+		return wire.Request{}, errors.New("worker Pod UID or request digest mismatch")
 	}
 	raw, err := os.ReadFile(wire.RequestPath)
 	if err != nil {
-		return wire.Request{}, empty, err
+		return wire.Request{}, err
 	}
 	if wire.Digest(raw) != digest {
-		return wire.Request{}, empty, errors.New("mounted request differs from the execution attempt")
+		return wire.Request{}, errors.New("mounted request differs from the execution attempt")
 	}
 	request, err := wire.Decode(raw)
 	if err != nil {
-		return request, empty, err
+		return request, err
 	}
 	if request.TaskID != os.Getenv("MULTICA_TASK_ID") || request.RuntimeRef.Platform != core.HostPlatform() {
-		return request, empty, errors.New("worker task or platform mismatch")
-	}
-	manifest, imageDigest, err := runtimeimage.Check(context.Background(), runtimeimage.Root, wire.ControllerRoot, core.HostPlatform())
-	if err != nil {
-		return request, empty, err
-	}
-	if err := runtimeimage.Match(manifest, imageDigest, request.RuntimeRef); err != nil {
-		return request, empty, err
-	}
-	if err := runtimeimage.CheckReceipt(wire.ControlRoot, manifest, imageDigest); err != nil {
-		return request, empty, err
+		return request, errors.New("worker task or platform mismatch")
 	}
 	if err := CheckPrivate(); err != nil {
-		return request, empty, err
+		return request, err
 	}
 	if err := CheckTaskHome(wire.Home, request); err != nil {
-		return request, empty, err
+		return request, err
 	}
-	return request, manifest, nil
+	return request, nil
 }
 
 func WorkerServe(ctx context.Context) error {
 	if os.Getpid() != 1 {
 		return errors.New("worker serve must own container PID 1")
 	}
-	request, _, err := readWorkerRequest(os.Getenv("MULTICA_REQUEST_DIGEST"), os.Getenv("POD_UID"))
+	request, err := readWorkerRequest(os.Getenv("MULTICA_REQUEST_DIGEST"), os.Getenv("POD_UID"))
 	if err != nil {
 		return err
 	}
@@ -74,7 +65,7 @@ func WorkerServe(ctx context.Context) error {
 }
 
 func WorkerProxy(ctx context.Context) error {
-	request, _, err := readWorkerRequest(os.Getenv("MULTICA_REQUEST_DIGEST"), os.Getenv("POD_UID"))
+	request, err := readWorkerRequest(os.Getenv("MULTICA_REQUEST_DIGEST"), os.Getenv("POD_UID"))
 	if err != nil {
 		return err
 	}
@@ -135,7 +126,13 @@ func WorkerReady() error {
 }
 
 func WorkerExecute(ctx context.Context, digest, uid string, streams ProcessStreams) error {
-	request, manifest, err := readWorkerRequest(digest, uid)
+	request, err := readWorkerRequest(digest, uid)
+	if err != nil {
+		return err
+	}
+	finishMetadata := diagnostics.StartPhase("worker_metadata", diagnostics.TaskAttributes(request.TaskID, request.AttemptID)...)
+	manifest, err := runtimeimage.ReadMetadata()
+	finishMetadata(err)
 	if err != nil {
 		return err
 	}
@@ -159,9 +156,24 @@ func WorkerExecute(ctx context.Context, digest, uid string, streams ProcessStrea
 	if err := f.Close(); err != nil {
 		return err
 	}
-	vars, err := SelectedEnvironment(manifest, os.Environ(), runtimeimage.Locations{Home: wire.Home, TmpDir: "/tmp", Workspace: request.WorkDir})
+	finishEnvironment := diagnostics.StartPhase("worker_environment", diagnostics.TaskAttributes(request.TaskID, request.AttemptID)...)
+	path, providerEnvironment, err := workerProvider(request, manifest)
+	finishEnvironment(err)
 	if err != nil {
 		return err
+	}
+	result := RunProcess(ctx, path, request.Args, providerEnvironment, request.WorkDir, time.Duration(request.TerminationGraceSeconds)*time.Second, streams)
+	if result.Err != nil && !result.Exited {
+		return fmt.Errorf("provider_start: %w", result.Err)
+	}
+	return ResultError(result)
+}
+
+// workerProvider prepares aliases and environment from the admitted image.
+func workerProvider(request wire.Request, manifest runtimeimage.Descriptor) (string, []string, error) {
+	vars, err := SelectedEnvironment(manifest, os.Environ(), runtimeimage.Locations{Home: wire.Home, TmpDir: "/tmp", Workspace: request.WorkDir})
+	if err != nil {
+		return "", nil, err
 	}
 	values := map[string]string{}
 	for _, entry := range append(vars, request.Env...) {
@@ -174,16 +186,16 @@ func WorkerExecute(ctx context.Context, digest, uid string, streams ProcessStrea
 	// path contains the controller's core hardlink shims.
 	bin := wire.ControlRoot + "/providers"
 	if err := os.MkdirAll(bin, 0700); err != nil {
-		return err
+		return "", nil, err
 	}
 	for id := range manifest.Providers {
 		path, err := runtimeimage.ProviderPath(manifest, id)
 		if err != nil {
-			return err
+			return "", nil, err
 		}
 		target := filepath.Join(bin, wire.Alias(id))
 		if err := os.Symlink(path, target); err != nil && !errors.Is(err, os.ErrExist) {
-			return err
+			return "", nil, err
 		}
 	}
 	basePath := wire.Value(vars, "PATH")
@@ -204,13 +216,19 @@ func WorkerExecute(ctx context.Context, digest, uid string, streams ProcessStrea
 	if request.Provider == "codex" {
 		values["CODEX_HOME"] = wire.Home + "/.codex"
 	}
+	providerEnvironment := githubauth.WithoutAppCredentials(wire.Environment(values))
+	if wire.Value(request.Env, githubauth.EnabledEnv) == "true" {
+		providerEnvironment, err = githubauth.GitEnvironment(providerEnvironment)
+		if err != nil {
+			return "", nil, err
+		}
+		if err := installGitHubCLIWrapper(bin, manifest); err != nil {
+			return "", nil, err
+		}
+	}
 	path, err := runtimeimage.ProviderPath(manifest, request.Provider)
 	if err != nil {
-		return err
+		return "", nil, err
 	}
-	result := RunProcess(ctx, path, request.Args, wire.Environment(values), request.WorkDir, time.Duration(request.TerminationGraceSeconds)*time.Second, streams)
-	if result.Err != nil && !result.Exited {
-		return fmt.Errorf("provider_start: %w", result.Err)
-	}
-	return ResultError(result)
+	return path, providerEnvironment, nil
 }

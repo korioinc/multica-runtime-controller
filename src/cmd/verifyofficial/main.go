@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -71,6 +72,9 @@ func main() {
 		os.Exit(providerHelper(os.Args[1], os.Args[2:]))
 	}
 	if len(os.Args) > 1 && os.Args[1] == "shim" {
+		// This fixture bypasses runtime main; isolate library diagnostics just
+		// as production configureDiagnostics isolates provider protocol pipes.
+		slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
 		helper, err := os.Executable()
 		if err != nil {
 			os.Exit(1)
@@ -355,7 +359,7 @@ func (v *verifier) stage(ctx context.Context, name string, versionFail, inject b
 	}
 	defer listener.Close()
 	env := []string{"HOME=" + wire.Home, "PATH=/tmp/verifyofficial-path:/usr/local/bin:/usr/bin:/bin", "SHELL=/bin/bash", "TMPDIR=/tmp", "MULTICA_GC_ENABLED=false", "MULTICA_DAEMON_WS_CLAIM_POLL_INTERVAL=1s", "MULTICA_CODEX_PATH=/tmp/verifyofficial-path/codex"}
-	process, err := official.Setup(official.DaemonOptions{CoreRoot: wire.ControllerRoot, Home: wire.Home, TokenFile: filepath.Join(wire.ControlRoot, "verifyofficial-token"), DaemonID: v.selection.OwnerID, Name: "Official fixture", BackendURL: v.server.URL, ProxyURL: "http://" + listener.Addr().String(), Capacity: 1, PollInterval: time.Second, HeartbeatInterval: time.Second, Providers: enabledProviders(v.descriptor), RuntimeRef: v.selection.RuntimeRef, Env: env})
+	process, err := official.Setup(v.descriptor, official.DaemonOptions{CoreRoot: wire.ControllerRoot, Home: wire.Home, TokenFile: filepath.Join(wire.ControlRoot, "verifyofficial-token"), DaemonID: v.selection.OwnerID, Name: "Official fixture", BackendURL: v.server.URL, ProxyURL: "http://" + listener.Addr().String(), Capacity: 1, PollInterval: time.Second, HeartbeatInterval: time.Second, Providers: enabledProviders(v.descriptor), RuntimeRef: v.selection.RuntimeRef, Env: env})
 	if err != nil {
 		return err
 	}

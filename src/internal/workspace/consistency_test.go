@@ -13,7 +13,8 @@ func TestCorruptBindingCannotTransferAnotherScopesPrivateWork(t *testing.T) {
 	a := testObservation(ref)
 	rootA := prepareRoot(t, options.WorkspaceRoot, a)
 	sessionA := prepareSession(t, options.SessionRoot)
-	bindingA, err := store.Bind(approve(t, store, a), rootA, sessionA, ref)
+	approve(t, store, a)
+	_, bindingA, err := store.AuthorizeAndBind(a.ID, a.AuthToken, a.WorkspaceID, a.AgentID, rootA, sessionA, ref)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -21,7 +22,8 @@ func TestCorruptBindingCannotTransferAnotherScopesPrivateWork(t *testing.T) {
 	b.RepositoryURLs = []string{"https://example.invalid/other-private.git"}
 	rootB := prepareRoot(t, options.WorkspaceRoot, b)
 	sessionB := prepareSession(t, options.SessionRoot)
-	bindingB, err := store.Bind(approve(t, store, b), rootB, sessionB, ref)
+	approve(t, store, b)
+	_, bindingB, err := store.AuthorizeAndBind(b.ID, b.AuthToken, b.WorkspaceID, b.AgentID, rootB, sessionB, ref)
 	if err != nil {
 		t.Fatal(err)
 	}

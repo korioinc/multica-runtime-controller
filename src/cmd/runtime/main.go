@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
 	"github.com/go-logr/logr"
 	"io"
 	"k8s.io/klog/v2"
@@ -14,10 +15,12 @@ import (
 	"path/filepath"
 	"runtime"
 	"syscall"
+	"time"
 
 	"github.com/korioinc/multica-runtime-controller/internal/core"
 	"github.com/korioinc/multica-runtime-controller/internal/diagnostics"
 	"github.com/korioinc/multica-runtime-controller/internal/execution"
+	"github.com/korioinc/multica-runtime-controller/internal/githubauth"
 	"github.com/korioinc/multica-runtime-controller/internal/kubernetes"
 	"github.com/korioinc/multica-runtime-controller/internal/migration"
 	"github.com/korioinc/multica-runtime-controller/internal/runtimeimage"
@@ -37,6 +40,12 @@ func main() {
 		var providerExit *execution.ExitError
 		if errors.As(err, &providerExit) {
 			os.Exit(providerExit.Code)
+		}
+		if phase == "github" {
+			// Authentication helpers only construct redacted errors. Git reserves
+			// stdout for credentials; actionable diagnostics belong on stderr.
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
 		}
 		logger := slog.Default()
 		id := os.Getenv("MULTICA_RUNTIME_IMAGE_BUILD_ID")
@@ -112,7 +121,7 @@ func configureDiagnostics(args []string) (string, func()) {
 		phase = "provider"
 	} else if len(args) > 1 {
 		switch args[1] {
-		case "version", "image", "workspace", "controller", "worker", "home":
+		case "version", "image", "workspace", "controller", "worker", "home", "github":
 			phase = args[1]
 		}
 	}
@@ -147,6 +156,8 @@ func dispatch(ctx context.Context, args []string) error {
 		return errors.New("runtime role required")
 	}
 	switch args[1] {
+	case "github":
+		return githubCommand(ctx, args[2:])
 	case "version":
 		if len(args) != 2 {
 			return errors.New("usage: runtime version")
@@ -210,6 +221,30 @@ func dispatch(ctx context.Context, args []string) error {
 		}
 	}
 	return errors.New("unsupported runtime operation")
+}
+
+func githubCommand(ctx context.Context, args []string) error {
+	if len(args) == 2 && args[0] == "credential" {
+		return githubauth.Credential(ctx, args[1], os.Stdin, os.Stdout)
+	}
+	if len(args) < 2 || args[0] != "gh" {
+		return errors.New("usage: runtime github credential <get|store|erase> | github gh <executable> [arguments]")
+	}
+	executable := args[1]
+	if !runtimeimage.ImmutablePath(executable) || filepath.Base(executable) != "gh" {
+		return errors.New("GitHub CLI wrapper requires its installed immutable executable")
+	}
+	directory, err := os.Getwd()
+	if err != nil {
+		return errors.New("GitHub CLI working directory unavailable")
+	}
+	env := githubauth.WithoutAppCredentials(os.Environ())
+	env, err = githubauth.PrepareGH(ctx, args[2:], env, directory)
+	if err != nil {
+		return err
+	}
+	result := execution.RunProcess(ctx, executable, args[2:], env, directory, 5*time.Second, execution.ProcessStreams{Stdin: os.Stdin, Stdout: os.Stdout, Stderr: os.Stderr})
+	return execution.ResultError(result)
 }
 
 func errorClass(phase string) string {

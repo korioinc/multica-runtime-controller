@@ -19,7 +19,6 @@ import (
 type retirementFixture struct {
 	Options Options
 	Task    Observation
-	Claim   Claim
 	Binding Binding
 	Cutoff  time.Time
 }
@@ -28,9 +27,9 @@ func prepareRetirementFixture(t *testing.T) (*Store, retirementFixture) {
 	t.Helper()
 	store, options := testStore(t)
 	task := testObservation(testEnvironment("retirement"))
-	claim := approve(t, store, task)
+	approve(t, store, task)
 	root := prepareRoot(t, options.WorkspaceRoot, task)
-	binding, err := store.Bind(claim, root, "", task.RuntimeRef)
+	_, binding, err := store.AuthorizeAndBind(task.ID, task.AuthToken, task.WorkspaceID, task.AgentID, root, "", task.RuntimeRef)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -50,7 +49,7 @@ func prepareRetirementFixture(t *testing.T) (*Store, retirementFixture) {
 	if err := os.RemoveAll(root); err != nil {
 		t.Fatal(err)
 	}
-	return store, retirementFixture{options, task, claim, binding, time.Now().Add(-60 * 24 * time.Hour)}
+	return store, retirementFixture{options, task, binding, time.Now().Add(-60 * 24 * time.Hour)}
 }
 
 func TestRetirementDoesNotOverwriteAuthorityCommittedDuringDeletion(t *testing.T) {
@@ -76,12 +75,13 @@ func TestRetirementDoesNotOverwriteAuthorityCommittedDuringDeletion(t *testing.T
 		t.Fatal("reobservation revived a retiring task")
 	}
 	root := prepareRoot(t, fixture.Options.WorkspaceRoot, fixture.Task)
-	if _, err := store.Bind(fixture.Claim, root, "", fixture.Task.RuntimeRef); err == nil {
-		t.Fatal("a claim read before retirement rebound retiring storage")
+	if _, _, err := store.AuthorizeAndBind(fixture.Task.ID, fixture.Task.AuthToken, fixture.Task.WorkspaceID, fixture.Task.AgentID, root, "", fixture.Task.RuntimeRef); err == nil {
+		t.Fatal("credentials read before retirement rebound retiring storage")
 	}
 	next := testObservation(fixture.Task.RuntimeRef)
 	nextRoot := prepareRoot(t, fixture.Options.WorkspaceRoot, next)
-	nextBinding, err := store.Bind(approve(t, store, next), nextRoot, "", next.RuntimeRef)
+	approve(t, store, next)
+	_, nextBinding, err := store.AuthorizeAndBind(next.ID, next.AuthToken, next.WorkspaceID, next.AgentID, nextRoot, "", next.RuntimeRef)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,12 +129,13 @@ func TestRetirementResumesAfterProcessDeathWithoutRevivingAuthority(t *testing.T
 				t.Fatal("process death allowed the retired task to be observed again")
 			}
 			root := prepareRoot(t, fixture.Options.WorkspaceRoot, fixture.Task)
-			if _, err := store.Bind(fixture.Claim, root, "", fixture.Task.RuntimeRef); err == nil {
-				t.Fatal("a stale claim restored retiring storage after process death")
+			if _, _, err := store.AuthorizeAndBind(fixture.Task.ID, fixture.Task.AuthToken, fixture.Task.WorkspaceID, fixture.Task.AgentID, root, "", fixture.Task.RuntimeRef); err == nil {
+				t.Fatal("retired credentials restored storage after process death")
 			}
 			next := testObservation(fixture.Task.RuntimeRef)
 			nextRoot := prepareRoot(t, fixture.Options.WorkspaceRoot, next)
-			binding, err := store.Bind(approve(t, store, next), nextRoot, "", next.RuntimeRef)
+			approve(t, store, next)
+			_, binding, err := store.AuthorizeAndBind(next.ID, next.AuthToken, next.WorkspaceID, next.AgentID, nextRoot, "", next.RuntimeRef)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -179,8 +180,8 @@ func TestExistingRetirementCannotRegainAuthorityBeforeCollection(t *testing.T) {
 		t.Fatal("an existing retirement accepted a renewed task claim")
 	}
 	root := prepareRoot(t, fixture.Options.WorkspaceRoot, fixture.Task)
-	if _, err := store.Bind(fixture.Claim, root, "", fixture.Task.RuntimeRef); err == nil {
-		t.Fatal("an existing retirement accepted a stale claim binding")
+	if _, _, err := store.AuthorizeAndBind(fixture.Task.ID, fixture.Task.AuthToken, fixture.Task.WorkspaceID, fixture.Task.AgentID, root, "", fixture.Task.RuntimeRef); err == nil {
+		t.Fatal("an existing retirement accepted a credential binding")
 	}
 	if _, err := store.Collect(fixture.Options.WorkspaceRoot, fixture.Cutoff, map[string]bool{}); err != nil {
 		t.Fatal(err)

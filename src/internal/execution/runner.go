@@ -3,8 +3,10 @@ package execution
 import (
 	"context"
 	"errors"
+	"net"
 	"time"
 
+	"github.com/korioinc/multica-runtime-controller/internal/diagnostics"
 	"github.com/korioinc/multica-runtime-controller/internal/kubernetes"
 	"github.com/korioinc/multica-runtime-controller/internal/runtimeimage"
 	"github.com/korioinc/multica-runtime-controller/internal/wire"
@@ -50,6 +52,13 @@ func NewRunner(s Selection, resources *kubernetes.Client, store *workspace.Store
 // cleanup. Preparation cannot race a previous consumer of the same storage.
 func (r *Runner) Run(ctx context.Context, request wire.Request, streams kubernetes.Streams) (result Result) {
 	result.Code = 1
+	var monitor net.Conn
+	// Registered first, so normal cleanup and lease release finish before EOF.
+	defer func() {
+		if monitor != nil {
+			_ = monitor.Close()
+		}
+	}()
 	generatedAttempt := ""
 	defer func() {
 		if result.ExecutionError != nil {
@@ -57,16 +66,33 @@ func (r *Runner) Run(ctx context.Context, request wire.Request, streams kubernet
 		}
 	}()
 	fail := func(err error) Result { return Result{Code: 1, ExecutionError: err} }
+	if err := ctx.Err(); err != nil {
+		return fail(err)
+	}
 	task, err := r.authorizeTask(request)
 	if err != nil {
 		return fail(err)
 	}
-	release, err := r.store.AcquireLease(task.storageID)
+	release, err := r.acquireExecutionLease(ctx, task)
 	if err != nil {
 		return fail(err)
 	}
 	defer release()
-	if err := r.recoverStorage(ctx, task.storageID); err != nil {
+	verified, err := r.prepareAuthorizedTask(request, &task)
+	if err != nil {
+		return fail(&diagnostics.Error{Reason: "storage_authority_changed", StorageID: task.storageID, Cause: err})
+	}
+	task = verified
+	if err := ctx.Err(); err != nil {
+		return fail(err)
+	}
+	finishRecovery := diagnostics.StartPhase("attempt_recovery", append(diagnostics.TaskAttributes(task.request.TaskID, task.request.AttemptID), "storage", task.storageID)...)
+	err = r.recoverStorage(ctx, task.storageID)
+	finishRecovery(err)
+	if err != nil {
+		return fail(&diagnostics.Error{Reason: "storage_recovery_failed", StorageID: task.storageID, Cause: err})
+	}
+	if err := ctx.Err(); err != nil {
 		return fail(err)
 	}
 	task.request = r.selectAttempt(task.request)
@@ -77,7 +103,13 @@ func (r *Runner) Run(ctx context.Context, request wire.Request, streams kubernet
 			result.CleanupError = errors.Join(result.CleanupError, removeTaskHomeArchive(wire.WorkspaceRoot, task.storageID, generatedAttempt))
 		}
 	}()
-	if err := r.prepareTaskContext(&task); err != nil {
+	finishContext := diagnostics.StartPhase("task_context", diagnostics.TaskAttributes(task.request.TaskID, task.request.AttemptID)...)
+	err = r.prepareTaskContext(&task)
+	finishContext(err)
+	if err != nil {
+		return fail(err)
+	}
+	if err := ctx.Err(); err != nil {
 		return fail(err)
 	}
 	port, token, closeBroker, err := startBroker(task.request)
@@ -91,26 +123,39 @@ func (r *Runner) Run(ctx context.Context, request wire.Request, streams kubernet
 		return fail(err)
 	}
 	recorded = true
+	monitor, err = (&net.Dialer{Timeout: 10 * time.Second}).DialContext(ctx, "unix", AttemptMonitorPath)
+	if err == nil {
+		err = registerAttempt(ctx, monitor, a.Ref.AttemptID)
+	}
+	if err != nil {
+		cleanup, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+		defer cancel()
+		return Result{Code: 1, ExecutionError: err, CleanupError: r.cleanup(cleanup, a)}
+	}
 	return r.executeAttempt(ctx, task.request, a, streams)
 }
 
 func Launch(ctx context.Context, provider string, args, env []string, directory string, streams ProcessStreams) error {
+	finishSelection := diagnostics.StartPhase("shim_selection", diagnostics.TaskAttributes(wire.Value(env, "MULTICA_TASK_ID"), "")...)
 	s, err := LoadSelection()
+	finishSelection(err)
 	if err != nil {
 		return err
 	}
-	manifest, digest, err := runtimeimage.Check(ctx, runtimeimage.Root, wire.ControllerRoot, s.RuntimeRef.Platform)
+	finishMetadata := diagnostics.StartPhase("shim_metadata", diagnostics.TaskAttributes(wire.Value(env, "MULTICA_TASK_ID"), "")...)
+	manifest, err := runtimeimage.ReadMetadata()
+	finishMetadata(err)
 	if err != nil {
 		return err
 	}
-	if err := runtimeimage.Match(manifest, digest, s.RuntimeRef); err != nil {
-		return err
-	}
-	path, err := runtimeimage.ProviderPath(manifest, provider)
-	if err != nil {
-		return err
+	if _, ok := manifest.Providers[provider]; !ok {
+		return errors.New("provider is not enabled")
 	}
 	if wire.Value(env, "MULTICA_TASK_ID") == "" {
+		path, err := runtimeimage.ProviderPath(manifest, provider)
+		if err != nil {
+			return err
+		}
 		// The daemon already received the selected image/manifest/operator layer.
 		// Applying manifest defaults again here would erase operator overrides.
 		return ResultError(RunProcess(ctx, path, args, env, directory, time.Duration(s.Worker.TerminationGraceSeconds)*time.Second, streams))
@@ -120,7 +165,9 @@ func Launch(ctx context.Context, provider string, args, env []string, directory 
 	if err != nil {
 		return err
 	}
+	finishOpen := diagnostics.StartPhase("registry_open", diagnostics.TaskAttributes(request.TaskID, "")...)
 	store, err := OpenWorkspace(s.OwnerID)
+	finishOpen(err)
 	if err != nil {
 		return err
 	}

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/korioinc/multica-runtime-controller/internal/diagnostics"
 	"github.com/korioinc/multica-runtime-controller/internal/wire"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -16,10 +17,16 @@ func (c *Client) Execute(ctx context.Context, r Reference, deadline time.Duratio
 	if r.PodUID == "" || r.SecretUID == "" {
 		return errors.New("execution UIDs are unresolved")
 	}
-	if err := c.waitWorkerReady(ctx, r, deadline); err != nil {
+	finishReady := diagnostics.StartPhase("worker_ready_wait", diagnostics.TaskAttributes(r.TaskID, r.AttemptID)...)
+	err := c.waitWorkerReady(ctx, r, deadline)
+	finishReady(err)
+	if err != nil {
 		return err
 	}
-	if err := c.authorizeExecution(ctx, r); err != nil {
+	finishAuthorization := diagnostics.StartPhase("worker_live_authorization", diagnostics.TaskAttributes(r.TaskID, r.AttemptID)...)
+	err = c.authorizeExecution(ctx, r)
+	finishAuthorization(err)
+	if err != nil {
 		return err
 	}
 	endpoint := c.API.CoreV1().RESTClient().Post().Resource("pods").Namespace(c.Namespace).Name(r.PodName).SubResource("exec").VersionedParams(workerExecOptions(r, streams), scheme.ParameterCodec).URL()

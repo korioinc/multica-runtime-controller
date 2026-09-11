@@ -1,8 +1,6 @@
 name: Release
 
 on:
-  push:
-    tags: ['[0-9]*.[0-9]*.[0-9]*']
   workflow_dispatch:
     inputs:
       tag:
@@ -27,7 +25,9 @@ env:
 jobs:
   plan:
     name: plan-release
-    if: github.event_name == 'workflow_dispatch' || github.event.deleted == false
+    # The workflow and its control scripts must come from protected main.
+    # The requested tag is source data, never the workflow execution ref.
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -40,16 +40,36 @@ jobs:
     env:
       GH_REPO: ${{ github.repository }}
       GH_TOKEN: ${{ github.token }}
-      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+      RELEASE_TAG: ${{ inputs.tag }}
       EXPECTED_REVISION: ${{ inputs.expected_revision }}
-      RELEASE_EVENT: ${{ github.event_name }}
-      RELEASE_REF_TYPE: ${{ github.ref_type }}
-      RELEASE_REF_NAME: ${{ github.ref_name }}
     steps:
-      - name: Check out the release event revision
+      - name: Check out trusted release control from the main event revision
         uses: actions/checkout@v7.0.1
         with:
           ref: ${{ github.sha }}
+          path: control
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Authorize the requested source before checking it out
+        run: |
+          set -euo pipefail
+          fail() { printf 'release blocked: %s\n' "$*" >&2; exit 1; }
+          [[ "$EXPECTED_REVISION" =~ ^[0-9a-f]{40}$ ]] || fail 'a full source commit SHA is required'
+          # shellcheck source=scripts/lib/version.sh
+          source "$GITHUB_WORKSPACE/control/scripts/lib/version.sh"
+          version_stable "$RELEASE_TAG"
+          scratch=$(mktemp -d "$RUNNER_TEMP/release-authority.XXXXXX")
+          trap 'rm -rf -- "$scratch"' EXIT
+          # shellcheck source=.github/scripts/github-lib.sh
+          source "$GITHUB_WORKSPACE/control/.github/scripts/github-lib.sh"
+          github_require_main_revision "$EXPECTED_REVISION"
+          owner=$(github_tag_revision "$RELEASE_TAG" true)
+          [[ "$owner" == "$EXPECTED_REVISION" ]] || fail 'release tag identifies another commit'
+      - name: Check out the authorized release source as data
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ inputs.expected_revision }}
+          path: source
           fetch-depth: 0
           persist-credentials: false
       - name: Set up Docker Buildx
@@ -62,18 +82,9 @@ jobs:
           password: ${{ github.token }}
       - name: Validate the tag, VERSION, source revision and existing release bytes
         id: plan
-        run: |
-          set -euo pipefail
-          revision=$(git rev-parse 'HEAD^{commit}')
-          if [[ "$RELEASE_EVENT" == workflow_dispatch ]]; then
-            if [[ "$RELEASE_REF_TYPE" != tag || "$RELEASE_REF_NAME" != "$RELEASE_TAG" ]]; then
-              echo 'Release dispatch must run on the requested tag ref' >&2
-              exit 1
-            fi
-            revision=$EXPECTED_REVISION
-          fi
-          .github/scripts/release.sh --root "$GITHUB_WORKSPACE" \
-            --image "$IMAGE" --revision "$revision" --version "$RELEASE_TAG" plan
+        run: >-
+          control/.github/scripts/release.sh --root "$GITHUB_WORKSPACE/source"
+          --image "$IMAGE" --revision "$EXPECTED_REVISION" --version "$RELEASE_TAG" plan
 
   verify:
     name: verify-release-source
@@ -122,10 +133,18 @@ jobs:
       contents: read
       packages: write
     steps:
+      - name: Check out trusted release control from the main event revision
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: control
+          fetch-depth: 0
+          persist-credentials: false
       - name: Check out the exact release source
         uses: actions/checkout@v7.0.1
         with:
           ref: ${{ needs.plan.outputs.revision }}
+          path: source
           fetch-depth: 0
           persist-credentials: false
       - name: Set up Docker Buildx
@@ -139,7 +158,7 @@ jobs:
       - name: Reuse the matching native candidate when retrying
         id: candidate
         run: >-
-          .github/scripts/release.sh --root "$GITHUB_WORKSPACE"
+          control/.github/scripts/release.sh --root "$GITHUB_WORKSPACE/source"
           --image "$IMAGE" --revision "$RELEASE_REVISION" --version "$RELEASE_VERSION"
           prepare-native --platform '${{ matrix.platform }}'
       - name: Resolve controller-only build arguments
@@ -147,7 +166,7 @@ jobs:
         id: args
         run: |
           set -euo pipefail
-          scripts/runtime-versions.sh --root "$GITHUB_WORKSPACE" build-args \
+          control/scripts/runtime-versions.sh --root "$GITHUB_WORKSPACE/source" build-args \
             --revision "$RELEASE_REVISION" --version "$RELEASE_VERSION" \
             | jq -r 'to_entries[] | "\(.key)=\(.value)"' >"$RUNNER_TEMP/build-args"
           {
@@ -159,7 +178,7 @@ jobs:
         if: steps.candidate.outputs.reuse != 'true'
         uses: docker/build-push-action@v7.3.0
         with:
-          context: .
+          context: ./source
           platforms: ${{ matrix.platform }}
           load: true
           push: false
@@ -169,7 +188,7 @@ jobs:
           sbom: false
       - name: Execute the native base check and push only verified candidate bytes
         run: >-
-          .github/scripts/release.sh --root "$GITHUB_WORKSPACE"
+          control/.github/scripts/release.sh --root "$GITHUB_WORKSPACE/source"
           --image "$IMAGE" --revision "$RELEASE_REVISION" --version "$RELEASE_VERSION"
           record-native --platform '${{ matrix.platform }}'
           --records "$RUNNER_TEMP/native-results"
@@ -200,10 +219,18 @@ jobs:
       RELEASE_REVISION: ${{ needs.plan.outputs.revision }}
       RELEASE_VERSION: ${{ needs.plan.outputs.version }}
     steps:
+      - name: Check out trusted release control from the main event revision
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: control
+          fetch-depth: 0
+          persist-credentials: false
       - name: Check out the exact release source
         uses: actions/checkout@v7.0.1
         with:
           ref: ${{ needs.plan.outputs.revision }}
+          path: source
           fetch-depth: 0
           persist-credentials: false
       - name: Download native results
@@ -223,6 +250,6 @@ jobs:
           password: ${{ github.token }}
       - name: Publish the immutable version, GitHub Release and current latest
         run: >-
-          .github/scripts/release.sh --root "$GITHUB_WORKSPACE"
+          control/.github/scripts/release.sh --root "$GITHUB_WORKSPACE/source"
           --image "$IMAGE" --revision "$RELEASE_REVISION" --version "$RELEASE_VERSION"
           publish --records "$RUNNER_TEMP/native-results"

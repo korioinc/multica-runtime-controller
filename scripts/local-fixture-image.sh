@@ -62,9 +62,10 @@ go -C "$repo_root/src" build -trimpath -buildvcs=false -ldflags '-s -w' -o "$con
 for binary in verifyofficial verifyruntime verifykube verifystream verifybinding; do
   go -C "$repo_root/src" build -trimpath -buildvcs=false -ldflags '-s -w' -o "$context/$binary" "./cmd/$binary"
 done
+go -C "$repo_root/src" test -c -tags=handoffintegration -trimpath -buildvcs=false -ldflags '-s -w' -o "$context/verifyhandoff" ./internal/execution
 hash_file() { if command -v sha256sum >/dev/null; then sha256sum "$1"; else shasum -a 256 "$1"; fi | cut -d ' ' -f 1; }
 [[ $(hash_file "$context/runtime") == "$(jq -er .runtimeSHA256 "$context/controller-build.json")" ]] || fail 'input image does not reproduce this controller checkout'
-source_hash=$(printf '%s\n' "$image_id" "$(hash_file "$context/runtime")" "$(hash_file "$context/verifyruntime")" "$(hash_file "$context/verifyofficial")" "$(hash_file "$repo_root/build/localverify.Dockerfile")" "$(hash_file "${BASH_SOURCE[0]}")" > "$context/source-inputs"; hash_file "$context/source-inputs")
+source_hash=$(printf '%s\n' "$image_id" "$(hash_file "$context/runtime")" "$(hash_file "$context/verifyruntime")" "$(hash_file "$context/verifyofficial")" "$(hash_file "$context/verifyhandoff")" "$(hash_file "$repo_root/build/localverify.Dockerfile")" "$(hash_file "${BASH_SOURCE[0]}")" > "$context/source-inputs"; hash_file "$context/source-inputs")
 cp "$repo_root/build/localverify.Dockerfile" "$context/Dockerfile"
 if docker image inspect "$tag" > "$context/existing.json" 2>/dev/null; then
   jq -e --arg id "$build_id" --arg source "$source_hash" '.[0].Config.Labels | .["io.multica.image-build-id"]==$id and .["io.multica.local-fixture-source"]==$source and .["io.multica.verification-fixture"]=="true"' "$context/existing.json" >/dev/null || fail 'existing fixture tag belongs to different inputs'

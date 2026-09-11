@@ -399,6 +399,7 @@ lv_transport_checks() {
 }
 lv_runtime_scenarios() {
   lv_step admission-native lv_verify_binding
+  lv_step handoff-native lv_handoff_native
   lv_step install-a lv_install A
   lv_step baseline lv_drive baseline
   lv_step mixed-image lv_mixed_image
@@ -416,4 +417,243 @@ lv_runtime_scenarios() {
   lv_step kubernetes lv_kubernetes_checks
   lv_step equivalent-controller lv_equivalent_configuration
   lv_step transport lv_transport_checks
+  lv_step handoff-default-1 lv_handoff_capture handoff-default-1 lv_handoff_default 1
+  lv_step handoff-default-2 lv_handoff_capture handoff-default-2 lv_handoff_default 2
+  lv_step handoff-repeat lv_handoff_capture handoff-repeat lv_handoff_repeat
+  lv_step handoff-pending lv_handoff_capture handoff-pending lv_handoff_pending
+  lv_step handoff-timeout lv_handoff_capture handoff-timeout lv_handoff_timeout
+}
+
+lv_handoff_install() {
+  local capacity=$1 timeout=${2:-} label="handoff-$1-${2:-default}"
+  lv_stage "Selecting actual official daemon capacity $capacity and handshake ${timeout:-default}"
+  jq --argjson capacity "$capacity" '.runtime.capacity=$capacity' "$lv_work/values-B.json" >"$lv_work/values-$label.json"
+  lv_run "helm-$label.log" helm upgrade verify "$lv_chart" --kubeconfig "$lv_kubeconfig" --namespace "$lv_namespace" --values "$lv_work/values-$label.json" --wait --timeout 5m
+  lv_handoff_daemon_environment "$timeout"
+  lv_export_selection
+  lv_kube -n "$lv_namespace" logs "$(lv_controller)" -c controller >"$lv_evidence/$label-startup.log"
+  cp "$lv_evidence/selection.json" "$lv_evidence/$label-selection.json"
+}
+lv_handoff_daemon_environment() {
+  local timeout=$1 controller parent replica reference deployment name patch actual
+  # The chart reserves MULTICA_* in operator.env. Exercise the existing native
+  # daemon setting through the trusted Pod environment of this disposable
+  # controller, without weakening chart/core operator guards or image defaults.
+  controller=$(lv_controller) || return
+  parent=$(lv_kube -n "$lv_namespace" get pod "$controller" -o json | jq -cer '.metadata.ownerReferences[] | select(.controller == true and .kind == "ReplicaSet")') || return
+  replica=$(lv_kube -n "$lv_namespace" get replicaset "$(jq -er .name <<<"$parent")" -o json) || return
+  [[ $(jq -r .metadata.uid <<<"$replica") == "$(jq -er .uid <<<"$parent")" ]] || { lv_fail 'controller ReplicaSet identity changed'; return 1; }
+  reference=$(jq -cer '.metadata.ownerReferences[] | select(.controller == true and .kind == "Deployment")' <<<"$replica") || return
+  name=$(jq -er .name <<<"$reference") || return
+  deployment=$(lv_kube -n "$lv_namespace" get deployment "$name" -o json) || return
+  [[ $(jq -r .metadata.uid <<<"$deployment") == "$(jq -er .uid <<<"$reference")" ]] || { lv_fail 'controller Deployment identity changed'; return 1; }
+  patch=$(jq -c --arg timeout "$timeout" '[
+    {op:"test",path:"/metadata/uid",value:.metadata.uid},
+    {op:"test",path:"/metadata/resourceVersion",value:.metadata.resourceVersion},
+    {op:"replace",path:"/spec/template/spec/containers",value:(.spec.template.spec.containers | map(
+      if .name == "controller" then .env=((.env // [] | map(select(.name != "MULTICA_CODEX_HANDSHAKE_TIMEOUT"))) +
+        if $timeout == "" then [] else [{name:"MULTICA_CODEX_HANDSHAKE_TIMEOUT",value:$timeout}] end)
+      else . end))}
+  ]' <<<"$deployment") || return
+  lv_kube -n "$lv_namespace" patch deployment "$name" --type=json -p "$patch" >/dev/null || return
+  lv_kube -n "$lv_namespace" rollout status "deployment/$name" --timeout=180s || return
+  controller=$(lv_controller) || return
+  actual=$(lv_kube -n "$lv_namespace" exec "$controller" -c controller -- python3 -c 'import os; print(os.environ.get("MULTICA_CODEX_HANDSHAKE_TIMEOUT", ""))') || return
+  [[ $actual == "$timeout" ]] || { lv_fail 'native daemon handshake input differs after rollout'; return 1; }
+  jq -cn --arg controller "$controller" --arg value "$actual" '{controller:$controller,nativeHandshakeTimeout:$value}' >"$lv_evidence/handoff-native-timeout-${timeout:-default}.json"
+}
+lv_handoff_absent() {
+  local task kind tasks
+  # A failed task inventory cannot authorize releasing a scheduling/deletion
+  # barrier. Process substitution would hide that failure as an empty loop.
+  tasks=$(lv_backend_state | jq -er '[.tasks[] | select(.input.provider == "codex") | .input.taskID] | if length > 0 then .[] else error("Codex task inventory is empty") end') || return
+  while IFS= read -r task; do
+    for kind in pods secrets; do
+      lv_kube -n "$lv_namespace" get "$kind" -l "multica.ai/task-id=$task" -o json | jq -e '.items | length == 0' >/dev/null || return 1
+    done
+  done <<<"$tasks"
+}
+lv_handoff_default() {
+  local capacity=$1
+  lv_handoff_install "$capacity"
+  lv_drive "handoff-default-$capacity"
+  lv_wait 'all completed/cancelled Codex workers and request credentials reclaimed' 90 lv_handoff_absent
+  lv_kube -n "$lv_namespace" logs "$(lv_controller)" -c controller >"$lv_evidence/handoff-default-$capacity-controller.log"
+  lv_backend_state >"$lv_evidence/handoff-default-$capacity-tasks.json"
+  lv_pass "actual Codex task handoff with capacity $capacity: interrupt/EOF, initialize cancellation, ignored interrupt, HTTP/WS and file continuity"
+}
+lv_handoff_waiting_b() {
+  local task controller
+  task=$(lv_backend_state | jq -er '.tasks[] | select(.input.case == "handoff-repeat-B") | .input.taskID') || return
+  controller=$(lv_controller)
+  lv_kube -n "$lv_namespace" logs "$controller" -c controller >"$lv_evidence/handoff-repeat-blocked.log"
+  # A finalizer keeps old cleanup unresolved. These are actual execution phases
+  # before new attempt/HOME allocation, independent of which cleanup contender won.
+  rg 'runtime phase started.*phase=(storage_lease_wait|attempt_recovery)' "$lv_evidence/handoff-repeat-blocked.log" | rg -q "task=$task" || return
+  lv_kube -n "$lv_namespace" get pods -l "multica.ai/task-id=$task" -o json | jq -e '.items | length == 0' >/dev/null || return
+  lv_backend -X POST -H 'Content-Type: application/json' --data '{}' "http://127.0.0.1:18080/fixture/release/$task" >/dev/null
+}
+lv_handoff_c_claimed() {
+  local state task controller
+  state=$(lv_backend_state) || return
+  jq -e 'any(.tasks[]; .input.case == "handoff-repeat-C" and .transport != null) and any(.tasks[]; .input.case == "handoff-repeat-B" and .cancelAck != null)' <<<"$state" >/dev/null || return
+  task=$(jq -er '.tasks[] | select(.input.case == "handoff-repeat-B") | .input.taskID' <<<"$state") || return
+  controller=$(lv_controller) || return
+  # This is only the injected deletion barrier's release condition. The daemon
+  # can acknowledge local drain before its SDK kills B's initializing shim.
+  # Confirm that task process has actually stopped before allowing old cleanup
+  # to finish. Read only the task identity match, never emit process credentials.
+  lv_kube -n "$lv_namespace" exec -i "$controller" -c controller -- python3 - "$task" <<'PY'
+import os, pathlib, sys
+identity = ("MULTICA_TASK_ID=" + sys.argv[1]).encode()
+for process in pathlib.Path("/proc").iterdir():
+    if not process.name.isdigit():
+        continue
+    try:
+        if process.stat().st_uid != os.geteuid():
+            continue
+        if identity in (process / "environ").read_bytes().split(b"\0"):
+            sys.exit(1)
+    except (FileNotFoundError, ProcessLookupError):
+        continue
+PY
+}
+lv_handoff_unblock() {
+  local pod=$1 uid=$2 current patch
+  current=$(lv_kube -n "$lv_namespace" get pod "$pod" -o json --ignore-not-found) || return
+  [[ -n $current ]] || return 0
+  [[ $(jq -r .metadata.uid <<<"$current") == "$uid" ]] || { lv_fail 'handoff Pod identity changed; refusing finalizer mutation'; return 125; }
+  patch=$(jq -c '[{op:"test",path:"/metadata/uid",value:.metadata.uid},{op:"test",path:"/metadata/resourceVersion",value:.metadata.resourceVersion},{op:"add",path:"/metadata/finalizers",value:((.metadata.finalizers // []) | map(select(. != "fixture.multica.ai/handoff")))}]' <<<"$current")
+  lv_kube -n "$lv_namespace" patch pod "$pod" --type=json -p "$patch" >/dev/null
+}
+lv_handoff_repeat() {
+  local task pod uid driver patch current result=0
+  lv_drive handoff-repeat-start
+  task=$(lv_backend_state | jq -er '.tasks[] | select(.input.case == "handoff-repeat-start") | .input.taskID')
+  pod=$(lv_task_pod "$task")
+  current=$(lv_kube -n "$lv_namespace" get pod "$pod" -o json)
+  printf '%s\n' "$current" >"$lv_evidence/handoff-repeat-original-pod.json"
+  uid=$(jq -er .metadata.uid <<<"$current")
+  patch=$(jq -c '[{op:"test",path:"/metadata/uid",value:.metadata.uid},{op:"test",path:"/metadata/resourceVersion",value:.metadata.resourceVersion},{op:"add",path:"/metadata/finalizers",value:((.metadata.finalizers // []) + ["fixture.multica.ai/handoff"])}]' <<<"$current")
+  lv_kube -n "$lv_namespace" patch pod "$pod" --type=json -p "$patch" >/dev/null
+  lv_drive handoff-repeat-follow &
+  driver=$!
+  if ! lv_wait 'B executing behind old worker cleanup' 90 lv_handoff_waiting_b || ! lv_wait 'C claimed and the cancelled B shim stopped' 30 lv_handoff_c_claimed; then result=1; fi
+  if ! lv_wait 'releasing owned handoff cleanup barrier' 20 lv_handoff_unblock "$pod" "$uid"; then result=1; fi
+  if ! wait "$driver"; then result=1; fi
+  [[ $result == 0 ]] || return 1
+  lv_wait 'repeated instruction cleanup completed' 90 lv_handoff_absent
+  lv_kube -n "$lv_namespace" logs "$(lv_controller)" -c controller >"$lv_evidence/handoff-repeat-controller.log"
+  lv_backend_state >"$lv_evidence/handoff-repeat-tasks.json"
+  lv_pass 'C supersedes B during real blocked storage recovery; B performs no provider work and C preserves A files'
+}
+lv_handoff_timeout() {
+  lv_handoff_install 2
+  lv_drive handoff-timeout
+  lv_wait 'timed-out initialization workers reclaimed' 90 lv_handoff_absent
+  lv_kube -n "$lv_namespace" logs "$(lv_controller)" -c controller >"$lv_evidence/handoff-timeout-controller.log"
+  lv_backend_state >"$lv_evidence/handoff-timeout-tasks.json"
+  lv_handoff_install 2 45s
+  lv_drive handoff-explicit
+  lv_wait 'explicit-budget worker reclaimed after real completion' 90 lv_handoff_absent
+  lv_kube -n "$lv_namespace" logs "$(lv_controller)" -c controller >"$lv_evidence/handoff-explicit-controller.log"
+  lv_backend_state >"$lv_evidence/handoff-explicit-tasks.json"
+  lv_pass 'default initialize expiry fails safely; existing explicit handshake setting permits delayed real initialize response'
+}
+
+
+lv_handoff_native() {
+  lv_stage 'Exercising real Linux storage authority and cleanup handoff before task preparation'
+  lv_run handoff-native.log docker run --rm --network none --read-only \
+    --tmpfs /tmp:rw,nosuid,nodev,mode=1777 --tmpfs /workspace:rw,nosuid,nodev,mode=1777 \
+    --env HANDOFF_NATIVE_TEST=1 --entrypoint /usr/local/bin/verifyhandoff \
+    "$lv_fixture_a" -test.v -test.run '^TestNativeHandoff' -test.timeout=60s
+  lv_pass 'native storage handoff preserves prior files and rejects cancelled or revoked follow-up authority before preparation'
+}
+lv_handoff_watch_ready() {
+  local node=$1 pidfile=$2
+  docker exec "$node" sh -ec 'test -s "$1" && kill -0 "$(cat "$1")"' sh "$pidfile"
+}
+lv_handoff_capture() {
+  local phase=$1 node watcher scenario pidfile collection resource_version watch_url result=0
+  shift
+  node=$(lv_owned_container node)
+  pidfile="/tmp/$phase-watch.pid"
+  # Capture an API snapshot and watch from its exact resourceVersion. kubectl
+  # get's formatted List can omit the collection RV, and this pinned kubectl
+  # has no --resource-version flag; raw REST preserves both native contracts.
+  collection="/api/v1/namespaces/$lv_namespace/pods?labelSelector=multica.ai%2Ftask-id"
+  docker exec "$node" kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml get --raw "$collection" >"$lv_evidence/$phase-pods-initial.json" || return
+  resource_version=$(jq -er '.metadata.resourceVersion | select(length > 0)' "$lv_evidence/$phase-pods-initial.json") || return
+  watch_url="$collection&watch=true&resourceVersion=$resource_version&timeoutSeconds=900"
+  # These initial observations contain real API objects, explicitly marked as
+  # snapshot-derived rather than claiming a live ADDED event was received.
+  jq -c '.items[] | {type:"ADDED",source:"initial-list",object:.}' "$lv_evidence/$phase-pods-initial.json" >"$lv_evidence/$phase-pods.jsonstream" || return
+  docker exec "$node" sh -ec 'echo "$$" > "$1"; exec kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml --request-timeout=15m get --raw "$2"' \
+    sh "$pidfile" "$watch_url" >>"$lv_evidence/$phase-pods.jsonstream" 2>"$lv_evidence/$phase-watch.log" &
+  watcher=$!
+  if lv_wait 'namespace-scoped worker UID watch' 10 lv_handoff_watch_ready "$node" "$pidfile"; then
+    # Run outside an if/! command context so failures inside existing scenario
+    # functions retain bash errexit; the parent still owns watcher cleanup.
+    ( "$@" ) &
+    scenario=$!
+    if ! wait "$scenario"; then result=1; fi
+  else result=1; fi
+  if kill -0 "$watcher" 2>/dev/null; then
+    # The still-live docker exec handle identifies this owned watch process.
+    if ! docker exec "$node" sh -ec 'kill "$(cat "$1")"' sh "$pidfile"; then result=1; fi
+  else result=1; fi
+  wait "$watcher" || true
+  # Decode the real API stream for review; do not manufacture missing UIDs.
+  if ! jq -s '.' "$lv_evidence/$phase-pods.jsonstream" >"$lv_evidence/$phase-pods.json"; then result=1; fi
+  # An expired RV or any other API watch error invalidates the capture even if
+  # the HTTP stream returned successfully. Keep the actual error as evidence.
+  if jq -e 'any(.[]; .type == "ERROR")' "$lv_evidence/$phase-pods.json" >/dev/null; then
+    lv_fail 'worker watch reported an API error; lifecycle evidence is incomplete' || true
+    result=1
+  fi
+  return "$result"
+}
+
+
+lv_handoff_pending_observed() {
+  local task
+  task=$(lv_backend_state | jq -er '.tasks[] | select(.input.case == "handoff-pending") | .input.taskID') || return
+  lv_kube -n "$lv_namespace" get pods -l "multica.ai/task-id=$task" -o json >"$lv_evidence/handoff-pending-observed.json" || return
+  # This is the injected scheduling boundary: no kubelet has received the task.
+  jq -e 'any(.items[]; .status.phase == "Pending" and (.spec.nodeName // "") == "")' "$lv_evidence/handoff-pending-observed.json" >/dev/null
+}
+lv_handoff_remove_pending_taint() {
+  local uid=$1 current patch
+  current=$(lv_kube get node verification-node -o json) || return
+  [[ $(jq -r .metadata.uid <<<"$current") == "$uid" ]] || { lv_fail 'fixture node identity changed; refusing taint mutation'; return 125; }
+  patch=$(jq -c '[{op:"test",path:"/metadata/uid",value:.metadata.uid},{op:"test",path:"/metadata/resourceVersion",value:.metadata.resourceVersion},{op:"add",path:"/spec/taints",value:((.spec.taints // []) | map(select(.key != "fixture.multica.ai/handoff-pending" or .value != "true" or .effect != "NoSchedule")))}]' <<<"$current")
+  lv_kube patch node verification-node --type=json -p "$patch" >/dev/null
+}
+lv_handoff_pending() {
+  local current uid patch driver result=0
+  lv_handoff_install 2
+  lv_stage 'Holding a worker unscheduled through the default initialize budget'
+  current=$(lv_kube get node verification-node -o json)
+  printf '%s\n' "$current" >"$lv_evidence/handoff-pending-node-before.json"
+  if jq -e 'any(.spec.taints[]?; .key == "fixture.multica.ai/handoff-pending")' <<<"$current" >/dev/null; then
+    lv_fail 'handoff scheduling taint already exists; refusing to overwrite another owner'
+    return 1
+  fi
+  uid=$(jq -er .metadata.uid <<<"$current")
+  patch=$(jq -c '[{op:"test",path:"/metadata/uid",value:.metadata.uid},{op:"test",path:"/metadata/resourceVersion",value:.metadata.resourceVersion},{op:"add",path:"/spec/taints",value:((.spec.taints // []) + [{key:"fixture.multica.ai/handoff-pending",value:"true",effect:"NoSchedule"}])}]' <<<"$current")
+  lv_kube patch node verification-node --type=json -p "$patch" >/dev/null
+  lv_drive handoff-pending &
+  driver=$!
+  if ! lv_wait 'actual task Pod pending without a scheduled node' 45 lv_handoff_pending_observed; then result=1; fi
+  if ! wait "$driver"; then result=1; fi
+  # Keep scheduling blocked until failed-task cleanup is observed, so a delayed
+  # monitor cannot briefly start the provider after the daemon reported failure.
+  if ! lv_wait 'unschedulable task Pod and credentials reclaimed' 90 lv_handoff_absent; then result=1; fi
+  # Always release only this injection, including failed driver/reachability.
+  if ! lv_wait 'removing owned pending-worker taint' 20 lv_handoff_remove_pending_taint "$uid"; then result=1; fi
+  lv_kube -n "$lv_namespace" logs "$(lv_controller)" -c controller >"$lv_evidence/handoff-pending-controller.log"
+  lv_backend_state >"$lv_evidence/handoff-pending-tasks.json"
+  [[ $result == 0 ]] || return 1
+  lv_pass 'actual unscheduled worker reaches default initialize failure without provider work and its resources are reclaimed'
 }

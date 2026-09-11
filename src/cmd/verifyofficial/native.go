@@ -150,7 +150,7 @@ func (v *verifier) nativeCatalog(parent context.Context) error {
 		return err
 	}
 	env = append(env, "OPENAI_BASE_URL="+backend.URL+"/v1", "OPENAI_API_KEY=sk-disposable-local-fixture", "MULTICA_GC_ENABLED=false")
-	process, err := official.Setup(official.DaemonOptions{CoreRoot: wire.ControllerRoot, Home: home, TokenFile: filepath.Join(wire.ControlRoot, "verifyofficial-token"), DaemonID: uuid.NewString(), Name: "Native catalog fixture", BackendURL: backend.URL, ProxyURL: "http://" + listener.Addr().String(), Capacity: 1, PollInterval: time.Second, HeartbeatInterval: time.Second, Providers: enabledProviders(v.descriptor), RuntimeRef: v.selection.RuntimeRef, Env: env})
+	process, err := official.Setup(v.descriptor, official.DaemonOptions{CoreRoot: wire.ControllerRoot, Home: home, TokenFile: filepath.Join(wire.ControlRoot, "verifyofficial-token"), DaemonID: uuid.NewString(), Name: "Native catalog fixture", BackendURL: backend.URL, ProxyURL: "http://" + listener.Addr().String(), Capacity: 1, PollInterval: time.Second, HeartbeatInterval: time.Second, Providers: enabledProviders(v.descriptor), RuntimeRef: v.selection.RuntimeRef, Env: env})
 	if err != nil {
 		return err
 	}
