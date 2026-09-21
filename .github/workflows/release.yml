@@ -176,7 +176,7 @@ jobs:
           } >>"$GITHUB_OUTPUT"
       - name: Build the native candidate locally
         if: steps.candidate.outputs.reuse != 'true'
-        uses: docker/build-push-action@v7.3.0
+        uses: docker/build-push-action@v7.4.0
         with:
           context: ./source
           platforms: ${{ matrix.platform }}
