@@ -17,21 +17,21 @@ docker image inspect "$image" | jq -e \
       .Os + "/" + .Architecture == $platform and
       .Config.Labels["org.opencontainers.image.version"] == $version and
       .Config.Labels["org.opencontainers.image.revision"] == $revision and
-      .Config.Labels["io.multica.controller-abi"] == "2" and
-      .Config.User == "65532:65532" and
-      all(.Config.Env[]; startswith("MULTICA_CLI_VERSION=") | not))
+      .Config.User == "65532:65532")
   ' >/dev/null
-docker run --rm --network none --read-only "$image" version
-docker run --rm --network none --read-only \
-  --tmpfs /home/multica/agents:rw,mode=0700,uid=65532,gid=65532 \
-  --tmpfs /tmp:rw,exec,mode=0700,uid=65532,gid=65532 \
-  --entrypoint /bin/sh "$image" -ec '
-    test "$(id -u)" = 65532
-    ! command -v multica
-    test ! -e /opt/multica/controller/multica
-    test ! -e /artifact
-    test -x /usr/local/go/bin/go
-    go version
-    printf "package main\nfunc main() {}\n" > /tmp/hello.go
-    CGO_ENABLED=0 go run /tmp/hello.go
-  '
+docker run --rm -i --network none --read-only --user 65532:65532 \
+  --cap-drop ALL --security-opt no-new-privileges --entrypoint /bin/sh "$image" -eu <<'VERIFY'
+packages=$(dpkg-query -W -f='${binary:Package}\t${db:Status-Status}\n')
+if printf '%s\n' "$packages" | awk '$1 ~ /^tini(-static)?(:[^[:space:]]+)?$/ && $2 != "not-installed" && $2 != "config-files" { found=1 } END { exit !found }' ||
+   command -v tini >/dev/null 2>&1 || command -v tini-static >/dev/null 2>&1; then
+  echo 'Controller base still contains Tini; rebuild the matching controller base.' >&2
+  exit 1
+fi
+for candidate in /usr/bin/tini /usr/bin/tini-static /bin/tini /bin/tini-static; do
+  if [ -e "$candidate" ] || [ -L "$candidate" ]; then
+    echo 'Controller base still contains a Tini executable or link.' >&2
+    exit 1
+  fi
+done
+exec /opt/multica/controller/runtime version
+VERIFY

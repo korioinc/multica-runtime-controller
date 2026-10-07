@@ -29,10 +29,8 @@ func WithoutAppCredentials(env []string) []string {
 func GitEnvironment(env []string) ([]string, error) {
 	values := map[string]string{}
 	for _, entry := range WithoutAppCredentials(env) {
-		key, value, ok := strings.Cut(entry, "=")
-		if ok {
-			values[key] = value
-		}
+		key, value, _ := strings.Cut(entry, "=")
+		values[key] = value
 	}
 	count := 0
 	if raw, exists := values["GIT_CONFIG_COUNT"]; exists {
@@ -63,6 +61,5 @@ func GitEnvironment(env []string) ([]string, error) {
 	}
 	values["GIT_CONFIG_COUNT"] = strconv.Itoa(count)
 	values["GIT_TERMINAL_PROMPT"] = "0"
-	values[EnabledEnv] = "true"
 	return wire.Environment(values), nil
 }

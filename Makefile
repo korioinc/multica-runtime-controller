@@ -1,4 +1,4 @@
-.PHONY: build image image-push repository-validate runtime-version-test workflow-validate test test-race vet verify-core verify-local verify
+.PHONY: build image image-push repository-validate runtime-version-test workflow-validate test vet verify
 
 RUNTIME_VERSIONS_FILE := build/runtime-versions.env
 include $(RUNTIME_VERSIONS_FILE)
@@ -60,15 +60,8 @@ workflow-validate:
 test:
 	go -C $(GO_MODULE_DIR) test ./...
 
-test-race:
-	go -C $(GO_MODULE_DIR) test -race ./...
-
 vet:
 	go -C $(GO_MODULE_DIR) vet ./...
 
-verify-core:
-	./scripts/verify-local.sh --core-only
-
-verify-local: verify-core
-
-verify: runtime-version-test repository-validate workflow-validate test test-race vet verify-core
+verify: runtime-version-test repository-validate workflow-validate vet
+	$(MAKE) test GOFLAGS="$(GOFLAGS) -race"

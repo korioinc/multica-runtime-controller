@@ -9,8 +9,8 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
@@ -18,25 +18,21 @@ import (
 	"github.com/korioinc/multica-runtime-controller/internal/wire"
 )
 
-// PrivateToken asks the controller's private broker for a repository grant.
-// The socket is intentionally fixed and is not mounted into task workers.
-func PrivateToken(ctx context.Context, repositories []githubapp.Repository) (githubapp.Token, error) {
-	if len(repositories) == 0 || len(repositories) > 500 {
-		return githubapp.Token{}, errors.New("GitHub token requires an explicit repository scope")
+const TaskAuthorizationName = "github-authorization.json"
+
+// TaskAuthorization is the only per-turn broker authority exposed to Git/gh.
+// Supervisor, session-control, and upstream backend credentials stay in PID 1.
+type TaskAuthorization struct {
+	GatewayURL      string `json:"gatewayURL"`
+	CacheCapability string `json:"cacheCapability"`
+}
+
+func (a TaskAuthorization) Validate() error {
+	u, err := url.Parse(a.GatewayURL)
+	if err != nil || u.Scheme != "http" || u.Host == "" || u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" || len(a.CacheCapability) < 32 || strings.ContainsAny(a.CacheCapability, "\x00\r\n \t") {
+		return errors.New("invalid GitHub task authorization")
 	}
-	scope := make([]githubapp.Repository, len(repositories))
-	for i, repository := range repositories {
-		parsed, err := githubapp.ParseRepository(repository.Owner + "/" + repository.Name)
-		if err != nil {
-			return githubapp.Token{}, errors.New("invalid GitHub token repository scope")
-		}
-		scope[i] = parsed
-	}
-	transport := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-		return (&net.Dialer{Timeout: 10 * time.Second}).DialContext(ctx, "unix", SocketPath)
-	}}
-	defer transport.CloseIdleConnections()
-	return exchangeToken(ctx, tokenClient(transport), "http://localhost"+Route, PrivateRequest{Repositories: scope})
+	return nil
 }
 
 // RequestToken uses the mounted task request rather than shell environment
@@ -51,12 +47,10 @@ func RequestToken(ctx context.Context, repository string) (githubapp.Token, erro
 		}
 		repository = repositoryURL(parsed)
 	}
-	file, err := os.Open(wire.RequestPath)
-	if errors.Is(err, os.ErrNotExist) {
-		if repository == "" {
-			return githubapp.Token{}, errors.New("select a GitHub repository outside a task worker")
-		}
-		return PrivateToken(ctx, []githubapp.Repository{parsed})
+	file, err := os.Open(wire.ControlRoot + "/" + TaskAuthorizationName)
+	legacy := errors.Is(err, os.ErrNotExist)
+	if legacy {
+		file, err = os.Open(wire.RequestPath)
 	}
 	if err != nil {
 		return githubapp.Token{}, errors.New("GitHub task authorization is unavailable")
@@ -66,17 +60,36 @@ func RequestToken(ctx context.Context, repository string) (githubapp.Token, erro
 	if err != nil || len(raw) > wire.MaxRequestBytes {
 		return githubapp.Token{}, errors.New("GitHub task authorization could not be read")
 	}
-	request, err := wire.Decode(raw)
-	if err != nil {
+	var authorization TaskAuthorization
+	if legacy {
+		request, err := wire.DecodeBootstrap(raw)
+		if err != nil || request.WorkerSessionID != "" {
+			return githubapp.Token{}, errors.New("GitHub task authorization is invalid")
+		}
+		authorization = TaskAuthorization{GatewayURL: request.GatewayURL, CacheCapability: request.CacheCapability}
+	} else if json.Unmarshal(raw, &authorization) != nil {
 		return githubapp.Token{}, errors.New("GitHub task authorization is invalid")
 	}
-	port, err := strconv.Atoi(wire.Value(request.Env, "MULTICA_DAEMON_PORT"))
-	if err != nil || port < 1 || port > 65535 {
-		return githubapp.Token{}, errors.New("GitHub task gateway is unavailable")
+	if authorization.Validate() != nil {
+		return githubapp.Token{}, errors.New("GitHub task authorization is invalid")
 	}
+	// Task capabilities stay on the internal gateway connection, never an
+	// environment-configured HTTP proxy.
 	transport := &http.Transport{DialContext: (&net.Dialer{Timeout: 10 * time.Second}).DialContext}
 	defer transport.CloseIdleConnections()
-	return exchangeToken(ctx, tokenClient(transport), "http://127.0.0.1:"+strconv.Itoa(port)+Route, Request{Repository: repository})
+	client := tokenClient(attemptTransport{base: transport, capability: authorization.CacheCapability})
+	return exchangeToken(ctx, client, authorization.GatewayURL+Route, Request{Repository: repository})
+}
+
+type attemptTransport struct {
+	base       http.RoundTripper
+	capability string
+}
+
+func (t attemptTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	r = r.Clone(r.Context())
+	r.Header.Set("Authorization", "Bearer "+t.capability)
+	return t.base.RoundTrip(r)
 }
 
 func tokenClient(transport http.RoundTripper) *http.Client {

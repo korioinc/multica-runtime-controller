@@ -86,7 +86,7 @@ jobs:
           cache-dependency-path: src/go.sum
       - name: Verify controller source and workflows
         if: github.event_name != 'pull_request' && steps.head.outputs.current == 'true'
-        run: make runtime-version-test repository-validate workflow-validate test test-race vet
+        run: make verify
       - name: Resolve image build arguments
         if: steps.head.outputs.current == 'true'
         id: args

@@ -6,26 +6,29 @@ import (
 	"strconv"
 	"time"
 
+	control "github.com/korioinc/multica-runtime-controller/internal/controller"
 	"github.com/korioinc/multica-runtime-controller/internal/wire"
 )
 
 type controllerOptions struct {
-	workerConfigFile  string
-	ownerID           string
-	namespace         string
-	podName           string
-	podUID            string
-	containerName     string
-	nodeName          string
-	startupTimeout    time.Duration
-	backendURL        string
-	gatewayURL        string
-	tokenFile         string
-	name              string
-	capacity          int
-	pollInterval      time.Duration
-	heartbeatInterval time.Duration
-	environment       []string
+	workerConfigFile        string
+	ownerID                 string
+	namespace               string
+	podName                 string
+	podUID                  string
+	containerName           string
+	nodeName                string
+	startupTimeout          time.Duration
+	backendURL              string
+	gatewayURL              string
+	tokenFile               string
+	name                    string
+	capacity                int
+	conversationIdleTimeout time.Duration
+	maxResidentPods         int
+	pollInterval            time.Duration
+	heartbeatInterval       time.Duration
+	environment             []string
 }
 
 func loadControllerOptions() (controllerOptions, error) {
@@ -38,7 +41,7 @@ func loadControllerOptions() (controllerOptions, error) {
 		containerName:    value("POD_CONTAINER_NAME", "controller"),
 		nodeName:         os.Getenv("POD_NODE_NAME"),
 		backendURL:       os.Getenv("MULTICA_BASE_URL"),
-		gatewayURL:       os.Getenv("MULTICA_DAEMON_PROXY_URL"),
+		gatewayURL:       os.Getenv("MULTICA_GATEWAY_URL"),
 		tokenFile:        os.Getenv("MULTICA_CONTROLLER_TOKEN_FILE"),
 		name:             value("MULTICA_RUNTIME_NAME", "runtime-controller"),
 		environment:      os.Environ(),
@@ -54,6 +57,14 @@ func loadControllerOptions() (controllerOptions, error) {
 	options.capacity, err = strconv.Atoi(value("MULTICA_RUNTIME_CAPACITY", "20"))
 	if err != nil || options.capacity < 1 {
 		return controllerOptions{}, errors.New("invalid runtime capacity")
+	}
+	options.conversationIdleTimeout, err = time.ParseDuration(value("MULTICA_CONVERSATION_IDLE_TIMEOUT", control.DefaultConversationIdleTimeout.String()))
+	if err != nil || options.conversationIdleTimeout < 0 {
+		return controllerOptions{}, errors.New("conversation idle timeout must be a nonnegative duration")
+	}
+	options.maxResidentPods, err = strconv.Atoi(value("MULTICA_MAX_RESIDENT_PODS", "0"))
+	if err != nil || options.maxResidentPods < 0 {
+		return controllerOptions{}, errors.New("resident Pod limit must be nonnegative")
 	}
 	options.pollInterval, err = time.ParseDuration(value("MULTICA_POLL_INTERVAL", "10s"))
 	if err != nil || options.pollInterval <= 0 {

@@ -226,6 +226,33 @@ func TestConcurrentRequestsRemainAuthorizedAcrossExpiry(t *testing.T) {
 	wg.Wait()
 }
 
+func TestCachedCredentialCannotOverrideRevokedInstallationGrant(t *testing.T) {
+	fixture, manager := newGitHubFixture(t)
+	scope := []Repository{{Owner: "acme", Name: "alpha"}}
+	original, err := manager.Token(t.Context(), scope)
+	if err != nil || !fixture.canRead(original, "alpha") {
+		t.Fatal("initial repository authority unavailable", err)
+	}
+	// A public repository can remain readable while the App's Contents grant
+	// is removed. The JWT installation response is the permission authority.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fixture.mu.Lock()
+		authenticated := fixture.authenticateJWT(r.Header.Get("Authorization"))
+		fixture.mu.Unlock()
+		if authenticated && strings.HasSuffix(r.URL.Path, "/installation") {
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 7, "account": map[string]string{"login": "acme"}, "permissions": map[string]string{"metadata": "read"}})
+			return
+		}
+		fixture.ServeHTTP(w, r)
+	}))
+	t.Cleanup(server.Close)
+	manager.baseURL = server.URL
+	credential, err := manager.Token(t.Context(), scope)
+	if err == nil || fixture.canRead(credential, "alpha") {
+		t.Fatal("cached credential bypassed the current revoked installation grant")
+	}
+}
+
 // observedWaitContext exposes only a scheduling barrier: its caller has entered
 // a cancellable wait. It lets the test overlap two real credential requests.
 type observedWaitContext struct {

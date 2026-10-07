@@ -22,7 +22,7 @@ type ImageBinding struct {
 // BindImage uses the current Pod API object and the checked installation. A registry's current tag is
 // not evidence for the bytes executing in this Pod, including after a restart.
 // The caller must verify its immutable private receipt before entering here.
-func (c *Client) BindImage(ctx context.Context, name, uid, container, node, platform string, descriptor runtimeimage.Descriptor) (ImageBinding, error) {
+func (c *Client) BindImage(ctx context.Context, name, uid, container, node, platform string, descriptor runtimeimage.Descriptor, cfg Config) (ImageBinding, error) {
 	var binding ImageBinding
 	if name == "" || uid == "" || container == "" || !core.SupportedPlatform(platform) || platform != core.HostPlatform() {
 		return binding, errors.New("controller image binding requires current Pod identity/platform")
@@ -32,14 +32,14 @@ func (c *Client) BindImage(ctx context.Context, name, uid, container, node, plat
 		if err != nil {
 			return false, err
 		}
-		image, pending, err := boundImage(pod, c.Namespace, name, uid, container, node, platform)
+		image, pending, err := boundImage(pod, c.Namespace, name, uid, container, node, platform, cfg.NFS)
 		if err != nil {
 			return false, err
 		}
 		if pending {
 			return false, nil
 		}
-		if err = admitImageEnvironment(pod, descriptor); err != nil {
+		if err = admitImageEnvironment(pod, descriptor, cfg); err != nil {
 			return false, err
 		}
 		binding = ImageBinding{Owner: Owner{Name: pod.Name, UID: string(pod.UID)}, Image: image}
@@ -48,11 +48,11 @@ func (c *Client) BindImage(ctx context.Context, name, uid, container, node, plat
 	return binding, err
 }
 
-func boundImage(p *corev1.Pod, namespace, name, uid, container, node, platform string) (string, bool, error) {
+func boundImage(p *corev1.Pod, namespace, name, uid, container, node, platform string, nfs NFS) (string, bool, error) {
 	if p == nil || p.Namespace != namespace || p.Name != name || string(p.UID) != uid || p.DeletionTimestamp != nil || node != "" && p.Spec.NodeName != node {
 		return "", false, diagnostics.Wrap("runtime_pod_identity_mismatch", errors.New("controller Pod identity or placement changed"))
 	}
-	if len(p.Spec.Containers) != 1 || p.Spec.Containers[0].Name != container || len(p.Spec.InitContainers) == 0 {
+	if len(p.Spec.Containers) < 2 || p.Spec.Containers[0].Name != container || p.Spec.Containers[1].Name != "nfs" || p.Spec.Containers[1].Image != nfs.Image || len(p.Spec.InitContainers) == 0 {
 		return "", false, errors.New("controller application container layout mismatch")
 	}
 	if p.Spec.NodeSelector["kubernetes.io/os"] != "linux" || p.Spec.NodeSelector["kubernetes.io/arch"] != strings.TrimPrefix(platform, "linux/") {
@@ -80,12 +80,27 @@ func boundImage(p *corev1.Pod, namespace, name, uid, container, node, platform s
 		return "", pending, err
 	}
 	selected = image
+	nfsImage, nfsPending, nfsErr := find("nfs", p.Status.ContainerStatuses)
+	if nfsErr != nil || nfsPending {
+		return "", nfsPending, nfsErr
+	}
+	if nfsImage != nfs.Image {
+		return "", false, errors.New("NFS executing image differs from admitted image")
+	}
+
 	for _, init := range p.Spec.InitContainers {
 		image, pending, err = find(init.Name, p.Status.InitContainerStatuses)
 		if err != nil || pending {
 			return "", pending, err
 		}
-		if image != selected {
+		expected := selected
+		if init.Name == "nfs-layout" {
+			expected = nfs.Image
+			if init.Image != expected {
+				return "", false, errors.New("NFS initializer image differs from admitted storage image")
+			}
+		}
+		if image != expected {
 			return "", false, diagnostics.Wrap("runtime_init_image_mismatch", errors.New("controller init and main are running different image digests"))
 		}
 	}

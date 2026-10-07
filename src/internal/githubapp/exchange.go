@@ -18,30 +18,39 @@ import (
 	"time"
 )
 
-func (m *Manager) issue(ctx context.Context, repositories []Repository) (Token, error) {
+type repositoryInstallation struct {
+	ID      int64 `json:"id"`
+	Account struct {
+		Login string `json:"login"`
+	} `json:"account"`
+	SuspendedAt *time.Time        `json:"suspended_at"`
+	Permissions map[string]string `json:"permissions"`
+}
+
+// This JWT-only endpoint proves current App membership even for public repos.
+// Public repository endpoints alone cannot establish an installation grant.
+func (m *Manager) installation(ctx context.Context, repository Repository) (repositoryInstallation, string, error) {
+	var installation repositoryInstallation
 	jwt, err := m.jwt()
 	if err != nil {
-		return Token{}, err
-	}
-	// One App has one installation per owning account. The exchange below asks
-	// GitHub to enforce membership of every named repository in that installation.
-	repository := repositories[0]
-	var installation struct {
-		ID      int64 `json:"id"`
-		Account struct {
-			Login string `json:"login"`
-		} `json:"account"`
-		SuspendedAt *time.Time        `json:"suspended_at"`
-		Permissions map[string]string `json:"permissions"`
+		return installation, "", err
 	}
 	if err := m.request(ctx, http.MethodGet, "/repos/"+repository.Owner+"/"+repository.Name+"/installation", jwt, nil, &installation); err != nil {
-		return Token{}, fmt.Errorf("discover GitHub App installation: %w", err)
+		return installation, "", fmt.Errorf("discover GitHub App installation: %w", err)
 	}
 	if installation.ID <= 0 || !strings.EqualFold(installation.Account.Login, repository.Owner) || installation.SuspendedAt != nil {
-		return Token{}, errors.New("GitHub App installation does not match an active repository owner")
+		return installation, "", errors.New("GitHub App installation does not match an active repository owner")
 	}
 	if level := installation.Permissions["contents"]; level != "read" && level != "write" {
-		return Token{}, errors.New("GitHub App installation requires repository contents read or write permission")
+		return installation, "", errors.New("GitHub App installation requires repository contents read or write permission")
+	}
+	return installation, jwt, nil
+}
+
+func (m *Manager) issue(ctx context.Context, repositories []Repository) (Token, error) {
+	installation, jwt, err := m.installation(ctx, repositories[0])
+	if err != nil {
+		return Token{}, err
 	}
 	// Explicitly request only coding-related repository permissions. Omitting
 	// this map would inherit organization and administration grants from the App.
@@ -73,7 +82,7 @@ func (m *Manager) issue(ctx context.Context, repositories []Repository) (Token, 
 		!response.ExpiresAt.After(m.now().Add(refreshWindow)) {
 		return Token{}, errors.New("GitHub returned an unusable installation token")
 	}
-	return Token{Value: response.Token, ExpiresAt: response.ExpiresAt}, nil
+	return Token{Value: response.Token, ExpiresAt: response.ExpiresAt, installationID: installation.ID}, nil
 }
 
 func (m *Manager) jwt() (string, error) {

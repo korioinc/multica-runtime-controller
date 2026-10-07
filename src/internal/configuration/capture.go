@@ -134,9 +134,12 @@ func collect(g *Group, source, target string) error {
 			return err
 		}
 		if !HomePath(dest, info.IsDir()) {
-			return errors.New("configuration tree shadows native session or daemon authority")
+			return errors.New("configuration tree escapes HOME or shadows daemon authority")
 		}
 		name := strings.TrimPrefix(dest, Home+"/")
+		if chromeProfileConflict(name, !info.IsDir()) {
+			return diagnostics.ForGroup("configuration_chrome_profile_conflict", g.Name, errors.New("configuration overlaps the retained Chrome profile"))
+		}
 		if info.IsDir() {
 			g.Directories = append(g.Directories, name)
 			return nil
@@ -154,7 +157,7 @@ func collect(g *Group, source, target string) error {
 }
 
 func Capture(copies []Copy, inputRoot string) (Bundle, error) {
-	b := Bundle{SchemaVersion: 1, Groups: []Group{}}
+	b := Bundle{Groups: []Group{}}
 	if err := ValidateCopies(copies, inputRoot); err != nil {
 		return b, diagnostics.Wrap("configuration_mapping_invalid", err)
 	}

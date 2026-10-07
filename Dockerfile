@@ -42,7 +42,6 @@ ARG COMMIT
 LABEL org.opencontainers.image.title="Multica Runtime Controller Base" \
       org.opencontainers.image.source="https://github.com/korioinc/multica-runtime-controller" \
       org.opencontainers.image.version="${VERSION}" \
-      org.opencontainers.image.revision="${COMMIT}" \
-      io.multica.controller-abi="2"
+      org.opencontainers.image.revision="${COMMIT}"
 ENTRYPOINT ["/opt/multica/controller/runtime"]
 CMD ["version"]

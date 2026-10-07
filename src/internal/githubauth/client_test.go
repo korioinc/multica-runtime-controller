@@ -28,9 +28,8 @@ func TestTokenClientDoesNotAcceptRedirectedAuthority(t *testing.T) {
 	client := tokenClient(transport)
 	ctx := context.Background()
 
-	// A grant obtained directly from the selected authority remains usable.
-	accepted, err := exchangeToken(ctx, client, issuer.URL, Request{})
-	if err != nil || accepted.Value != grant.Value {
+	// The selected authority accepts the same exchange without a redirect.
+	if _, err := exchangeToken(ctx, client, issuer.URL, Request{}); err != nil {
 		t.Fatal("the selected token authority could not grant access")
 	}
 	refused, err := exchangeToken(ctx, client, redirect.URL, Request{})

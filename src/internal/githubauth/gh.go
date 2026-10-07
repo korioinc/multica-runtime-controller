@@ -67,12 +67,12 @@ func PrepareGH(ctx context.Context, args, env []string, directory string) ([]str
 func ghEnvironment(env []string) map[string]string {
 	values := make(map[string]string)
 	for _, entry := range WithoutAppCredentials(env) {
-		key, value, ok := strings.Cut(entry, "=")
-		if !ok || key == "" {
+		key, value, _ := strings.Cut(entry, "=")
+		if key == "" {
 			continue
 		}
 		switch key {
-		case "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "GH_HOST", "GH_CONFIG_DIR", "GH_DEBUG", "GITHUB_WEBHOOK_SECRET":
+		case "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "GH_HOST", "GH_CONFIG_DIR", "GH_DEBUG":
 			continue
 		}
 		values[key] = value

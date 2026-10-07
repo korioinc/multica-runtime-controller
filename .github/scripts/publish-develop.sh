@@ -129,8 +129,7 @@ for platform in linux/amd64 linux/arm64; do
   jq -e --arg platform "$platform" --arg revision "$GITHUB_SHA" '
     .os + "/" + .architecture == $platform and
     .config.Labels["org.opencontainers.image.revision"] == $revision and
-    .config.Labels["org.opencontainers.image.version"] == "develop" and
-    .config.Labels["io.multica.controller-abi"] == "2"
+    .config.Labels["org.opencontainers.image.version"] == "develop"
   ' <<<"$metadata" >/dev/null 2>"$scratch/json-error" || fail 'native image metadata differs from its verified result'
   sources+=("$IMAGE@$digest")
 done

@@ -7,81 +7,31 @@ import (
 	"testing"
 )
 
-func artifactFixture(t *testing.T) string {
-	t.Helper()
-	source := t.TempDir()
-	for _, name := range []string{"runtime"} {
-		if err := os.WriteFile(filepath.Join(source, name), []byte("#!/bin/sh\nexit 0\n"), 0555); err != nil {
-			t.Fatal(err)
-		}
+func TestExecutableMutationRejected(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "runtime")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\nexit 0\n"), 0755); err != nil {
+		t.Fatal(err)
 	}
-	hash, err := HashFile(filepath.Join(source, "runtime"))
+	hash, err := HashFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Mkdir(filepath.Join(source, "shims"), 0755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Mkdir(filepath.Join(source, "disabled"), 0555); err != nil {
-		t.Fatal(err)
-	}
-	paths := map[string]string{}
-	for _, alias := range []string{"pi", "codex", "copilot", "agy"} {
-		paths[alias] = filepath.Join(source, "shims", alias)
-		if err := os.Link(filepath.Join(source, "runtime"), paths[alias]); err != nil {
-			t.Fatal(err)
-		}
-	}
-	contract := Contract{SchemaVersion: Version, ControllerABI: ABI, BuildID: hash, Platform: "linux/amd64", RuntimePath: filepath.Join(source, "runtime"), RuntimeSHA256: hash, ShimPaths: paths, GoVersion: "go1.26.1"}
-	b, _ := json.Marshal(contract)
-	if err = os.WriteFile(filepath.Join(source, "build.json"), b, 0444); err != nil {
-		t.Fatal(err)
-	}
-	return source
-}
-
-func TestExecutableMutationInvalidatesEveryConsumer(t *testing.T) {
-	target := artifactFixture(t)
-	var err error
-	if _, err = Check(target, "linux/amd64"); err != nil {
-		t.Fatal(err)
-	}
-	alias := filepath.Join(target, "shims", "pi")
-	if err = os.Chmod(alias, 0755); err != nil {
-		t.Fatal(err)
-	}
-	if err = os.WriteFile(alias, []byte("#!/bin/sh\necho replaced\n"), 0755); err != nil {
-		t.Fatal(err)
-	}
-	if _, err = Check(target, "linux/amd64"); err == nil {
-		t.Fatal("consumer accepted mutation through a shared executable alias")
-	}
-}
-
-func TestReplacedShimMustMatchRuntime(t *testing.T) {
-	target := artifactFixture(t)
-	data, err := os.ReadFile(filepath.Join(target, "runtime"))
+	contract := Contract{BuildID: hash, Platform: "linux/amd64", RuntimePath: path, RuntimeSHA256: hash, GoVersion: "go1.26.1"}
+	raw, err := json.Marshal(contract)
 	if err != nil {
 		t.Fatal(err)
 	}
-	alias := filepath.Join(target, "shims", "pi")
-	if err = os.Remove(alias); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "build.json"), raw, 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err = os.WriteFile(alias, data, 0555); err != nil {
+	if _, err := Check(root, "linux/amd64"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = Check(target, "linux/amd64"); err != nil {
-		t.Fatalf("consumer rejected an identical standalone executable: %v", err)
-	}
-	if err = os.Remove(alias); err != nil {
+	if err := os.WriteFile(path, []byte("#!/bin/sh\necho replaced\n"), 0755); err != nil {
 		t.Fatal(err)
 	}
-	data[len(data)-1] ^= 1
-	if err = os.WriteFile(alias, data, 0555); err != nil {
-		t.Fatal(err)
-	}
-	if _, err = Check(target, "linux/amd64"); err == nil {
-		t.Fatal("consumer accepted a modified standalone executable")
+	if _, err := Check(root, "linux/amd64"); err == nil {
+		t.Fatal("modified executable was admitted")
 	}
 }

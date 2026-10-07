@@ -3,117 +3,153 @@ package main
 import (
 	"context"
 	"errors"
-	"maps"
-	"net"
+	"log/slog"
 	"net/http"
 	"os"
-	"slices"
+	"path/filepath"
+	"strings"
 	"time"
 
-	"github.com/korioinc/multica-runtime-controller/internal/execution"
+	"github.com/korioinc/multica-runtime-controller/internal/configuration"
+	control "github.com/korioinc/multica-runtime-controller/internal/controller"
+	"github.com/korioinc/multica-runtime-controller/internal/core"
+	"github.com/korioinc/multica-runtime-controller/internal/daemonapi"
+	"github.com/korioinc/multica-runtime-controller/internal/diagnostics"
 	"github.com/korioinc/multica-runtime-controller/internal/githubapp"
-	"github.com/korioinc/multica-runtime-controller/internal/githubauth"
-	"github.com/korioinc/multica-runtime-controller/internal/official"
+	"github.com/korioinc/multica-runtime-controller/internal/kubernetes"
+	"github.com/korioinc/multica-runtime-controller/internal/repocache"
+	"github.com/korioinc/multica-runtime-controller/internal/runtimeimage"
 	"github.com/korioinc/multica-runtime-controller/internal/wire"
+	"github.com/korioinc/multica-runtime-controller/internal/workspace"
 )
 
 func controller(ctx context.Context) error {
-	options, err := loadControllerOptions()
+	o, err := loadControllerOptions()
 	if err != nil {
-		return err
+		return diagnostics.Wrap("controller_options_invalid", err)
 	}
-	admitted, err := admitController(ctx, options)
+	slog.Info("controller options validated", "capacity", o.capacity)
+	slog.Info("controller startup stage", "stage", "runtime_image_verification")
+	d, digest, err := runtimeimage.Check(ctx, runtimeimage.Root, core.Root, core.HostPlatform())
 	if err != nil {
-		return err
+		return diagnostics.Wrap("controller_runtime_image_invalid", err)
 	}
-	return serveController(ctx, options, admitted)
-}
-
-func serveController(ctx context.Context, options controllerOptions, admitted admittedController) error {
-	selection, resources := admitted.selection, admitted.resources
-	// Application workspace mutations are admitted only after image and config
-	// identity have been tied to this controller Pod.
-	if err := execution.LayoutWorkspace(selection.OwnerID); err != nil {
-		return err
+	if err := runtimeimage.CheckReceipt(wire.ControlRoot, d, digest); err != nil {
+		return diagnostics.Wrap("controller_runtime_receipt_invalid", err)
 	}
-	if err := execution.BindControllerSessions(); err != nil {
-		return err
-	}
-	store, err := execution.OpenWorkspace(selection.OwnerID)
+	slog.Info("controller runtime image verified", "providers", len(d.Providers))
+	slog.Info("controller startup stage", "stage", "configuration")
+	bundle, err := configuration.Read(wire.ControlRoot)
 	if err != nil {
-		return err
+		return diagnostics.Wrap("controller_configuration_unavailable", err)
 	}
-	runner, err := execution.NewRunner(selection, resources, store, admitted.descriptor)
+	if err := configuration.ApplyHomeConfiguration(wire.Home, bundle); err != nil {
+		return diagnostics.Wrap("controller_home_configuration_failed", err)
+	}
+	cfg, err := kubernetes.LoadConfig(o.workerConfigFile)
 	if err != nil {
-		return err
+		return diagnostics.Wrap("controller_worker_config_invalid", err)
 	}
-	providers := slices.Sorted(maps.Keys(admitted.descriptor.Providers))
-	bridge, err := official.NewBridge(official.BridgeOptions{BackendURL: selection.Backend, Store: store, RuntimeRef: selection.RuntimeRef, Providers: providers})
+	slog.Info("controller startup stage", "stage", "kubernetes_client")
+	resources, err := kubernetes.InCluster(o.namespace, o.capacity)
 	if err != nil {
-		return err
+		return diagnostics.Wrap("controller_kubernetes_client_unavailable", err)
 	}
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return err
-	}
-	defer listener.Close()
-	// App signing authority stays in this process. The official daemon and its
-	// per-task shims use the private credential broker instead of inheriting keys.
-	daemonEnvironment := githubauth.WithoutAppCredentials(admitted.environment)
-	var authServer *http.Server
-	var authListener net.Listener
-	appID, privateKey := wire.Value(admitted.environment, "GITHUB_APP_ID"), wire.Value(admitted.environment, "GITHUB_APP_PRIVATE_KEY")
-	if appID != "" || privateKey != "" {
-		manager, err := githubapp.New(appID, privateKey)
-		if err != nil {
-			return err
-		}
-		authListener, err = githubauth.ListenPrivate()
-		if err != nil {
-			return err
-		}
-		defer authListener.Close()
-		authServer = &http.Server{Handler: githubauth.PrivateHandler(manager), ReadHeaderTimeout: 10 * time.Second}
-		defer authServer.Close()
-		daemonEnvironment, err = githubauth.GitEnvironment(daemonEnvironment)
-		if err != nil {
-			return err
-		}
-	}
-	process, err := official.Setup(admitted.descriptor, official.DaemonOptions{
-		CoreRoot: wire.ControllerRoot, Home: wire.Home, TokenFile: options.tokenFile,
-		DaemonID: selection.OwnerID, Capacity: options.capacity, PollInterval: options.pollInterval,
-		HeartbeatInterval: options.heartbeatInterval, Name: options.name,
-		BackendURL: selection.Backend, ProxyURL: "http://" + listener.Addr().String(),
-		Providers: providers, RuntimeRef: selection.RuntimeRef, Env: daemonEnvironment,
-		Stdout: os.Stdout, Stderr: os.Stderr,
-	})
-	if err != nil {
-		return err
-	}
-	ctx, cancel := context.WithCancel(ctx)
+	startup, cancel := context.WithTimeout(ctx, o.startupTimeout)
 	defer cancel()
-	monitor, err := execution.ListenAttemptMonitor(execution.AttemptMonitorPath)
+	slog.Info("controller startup stage", "stage", "image_admission")
+	binding, err := resources.BindImage(startup, o.podName, o.podUID, o.containerName, o.nodeName, d.Platform, d, cfg)
 	if err != nil {
-		return err
+		return diagnostics.Wrap("controller_image_admission_failed", err)
 	}
-	defer monitor.Close()
-	gateway := &http.Server{Addr: ":8080", Handler: execution.ControllerGateway(resources), ReadHeaderTimeout: 10 * time.Second}
-	defer gateway.Close()
-	serviceError := make(chan error, 3)
-	if authServer != nil {
-		go func() { serviceError <- authServer.Serve(authListener); cancel() }()
+	slog.Info("controller startup stage", "stage", "storage_admission")
+	if err := resources.AdmitControllerStorage(startup, binding.Owner, cfg); err != nil {
+		return diagnostics.Wrap("controller_storage_admission_failed", err)
 	}
-	go func() { serviceError <- gateway.ListenAndServe(); cancel() }()
-	go func() { serviceError <- runner.ServeAttemptMonitor(ctx, monitor); cancel() }()
-	go runner.RunCollector(ctx)
-	err = official.RunDaemon(ctx, listener, bridge, process)
+	environment := []string{}
+	appEnv := map[string]string{}
+	for _, entry := range o.environment {
+		key, value, ok := strings.Cut(entry, "=")
+		if !ok {
+			continue
+		}
+		key, operator := strings.CutPrefix(key, "MULTICA_OPERATOR_")
+		if !operator {
+			continue
+		}
+		if githubapp.ControllerEnvironmentKey(key) {
+			appEnv[key] = value
+			continue
+		}
+		if runtimeimage.Reserved(key) && !runtimeimage.ExecutionSetting(key) {
+			return diagnostics.Wrap("controller_operator_environment_invalid", errors.New("operator environment overrides runtime authority"))
+		}
+		environment = append(environment, key+"="+value)
+	}
+	ref, err := d.Reference(binding.Image, digest, configuration.ExecutionDigest(bundle, environment))
+	if err != nil {
+		return diagnostics.Wrap("controller_runtime_reference_invalid", err)
+	}
+	slog.Info("controller startup stage", "stage", "backend_client")
+	token, err := os.ReadFile(o.tokenFile)
+	if err != nil {
+		return diagnostics.Wrap("controller_token_unavailable", err)
+	}
+	upstream, err := daemonapi.NewClient(o.backendURL, strings.TrimSpace(string(token)), d.Daemon.Version, nil)
+	if err != nil {
+		return diagnostics.Wrap("controller_backend_client_invalid", err)
+	}
+	slog.Info("controller startup stage", "stage", "metadata")
+	stateRoot := value("MULTICA_STATE_ROOT", kubernetes.ControllerStateRoot)
+	if stateRoot != kubernetes.ControllerStateRoot {
+		return diagnostics.Wrap("controller_metadata_path_invalid", errors.New("metadata path differs from admitted volume"))
+	}
+	store, err := workspace.OpenVolume(stateRoot, workspace.Options{OwnerID: o.ownerID, MaxTasks: cfg.Storage.MaxTasks})
+	if err != nil {
+		return diagnostics.Wrap("controller_metadata_unavailable", err)
+	}
+	defer store.Close()
+	slog.Info("controller startup stage", "stage", "workspace_binding")
+	workspaceUID, nfsServer, err := resources.ResolveWorkspace(startup, cfg)
+	if err != nil {
+		return diagnostics.Wrap("controller_workspace_unavailable", err)
+	}
+	if err := store.BindWorkspace(cfg.Storage.ClaimName, workspaceUID, nfsServer); err != nil {
+		return diagnostics.Wrap("controller_workspace_binding_failed", err)
+	}
+	slog.Info("controller startup stage", "stage", "repository_cache")
+	cache, err := repocache.New(ctx, filepath.Join(stateRoot, "repositories"))
+	if err != nil {
+		return diagnostics.Wrap("controller_repository_cache_unavailable", err)
+	}
+	defer cache.Close()
+	var app *githubapp.Manager
+	if appEnv["GITHUB_APP_ID"] != "" || appEnv["GITHUB_APP_PRIVATE_KEY"] != "" {
+		slog.Info("controller startup stage", "stage", "github_app")
+		app, err = githubapp.New(appEnv["GITHUB_APP_ID"], appEnv["GITHUB_APP_PRIVATE_KEY"])
+		if err != nil {
+			return diagnostics.Wrap("controller_github_app_invalid", err)
+		}
+	}
+	c := &control.Controller{Store: store, API: upstream, Kube: resources, Policy: cfg, Owner: binding.Owner, OwnerID: o.ownerID, Descriptor: d, RuntimeRef: ref, Configuration: bundle, Environment: environment, GatewayURL: o.gatewayURL, NFSServer: nfsServer, Name: o.name, Capacity: o.capacity, PollInterval: o.pollInterval, HeartbeatInterval: o.heartbeatInterval, App: app, Cache: cache}
+	c.ConversationIdleTimeout, c.MaxResidentPods = o.conversationIdleTimeout, o.maxResidentPods
+	server := &http.Server{Addr: ":8080", Handler: c.Handler(), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 64 << 10}
+	defer server.Close()
+	ctx, stop := context.WithCancel(ctx)
+	defer stop()
+	serverErrors := make(chan error, 1)
+	slog.Info("controller services starting", "port", 8080)
+	go func() {
+		serverErrors <- server.ListenAndServe()
+		stop()
+	}()
+	err = c.Run(ctx)
 	select {
-	case serviceErr := <-serviceError:
-		if serviceErr != nil && !errors.Is(serviceErr, http.ErrServerClosed) {
-			return serviceErr
+	case serverErr := <-serverErrors:
+		if !errors.Is(serverErr, http.ErrServerClosed) {
+			return diagnostics.Wrap("controller_http_service_failed", serverErr)
 		}
 	default:
 	}
-	return err
+	return diagnostics.Wrap("controller_service_stopped", err)
 }

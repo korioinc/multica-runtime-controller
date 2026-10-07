@@ -107,8 +107,7 @@ jobs:
           go-version-file: src/go.mod
           cache-dependency-path: src/go.sum
       - name: Verify controller source and workflows
-        run: |
-          make runtime-version-test repository-validate workflow-validate test test-race vet
+        run: make verify
 
   build:
     name: build-${{ matrix.architecture }}

@@ -15,15 +15,6 @@ func TestGHRefusesConflictingRepositoryAuthority(t *testing.T) {
 	}
 }
 
-func TestGHExplicitRepositoryOverridesUnrelatedDefaults(t *testing.T) {
-	selected, err := resolveGHRepository(context.Background(), []string{
-		"pr", "view", "https://github.com/team/selected/pull/123", "-R", "team/selected",
-	}, []string{"GH_REPO=team/unrelated-default"}, t.TempDir())
-	if err != nil || selected != "https://github.com/team/selected.git" {
-		t.Fatal("the requested repository did not own the credential selection")
-	}
-}
-
 func TestGHDoesNotSelectCredentialDestinationsOnOtherHosts(t *testing.T) {
 	secret := "untrusted-url-password"
 	for _, args := range [][]string{

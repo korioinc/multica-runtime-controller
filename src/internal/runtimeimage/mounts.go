@@ -25,9 +25,6 @@ func CheckImageMounts(d Descriptor, mounts []string) error {
 	for _, directory := range d.BinDirs {
 		paths = append(paths, imagePath{directory, true})
 	}
-	if d.HomeSeed != "" {
-		paths = append(paths, imagePath{d.HomeSeed, true})
-	}
 	for _, path := range paths {
 		if !ImmutablePath(path.path) {
 			return errors.New("installed path is in a mutable filesystem area")

@@ -5,20 +5,15 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strings"
-	"time"
+	"syscall"
 
 	"github.com/korioinc/multica-runtime-controller/internal/core"
 	"github.com/korioinc/multica-runtime-controller/internal/diagnostics"
 )
-
-var ErrCompatibility = errors.New("runtime image compatibility validation failed")
 
 func Decode(data []byte, value any) error {
 	decoder := json.NewDecoder(bytes.NewReader(data))
@@ -90,53 +85,94 @@ func executable(e Executable, controller core.Contract) (string, error) {
 	return p, nil
 }
 
-func ProviderPath(d Descriptor, id string) (string, error) {
-	p, ok := d.Providers[id]
+// CodexHelperExecutable resolves the admitted npm launcher to its native package.
+// The immutable image supplies this identity; retained task links never select it.
+func CodexHelperExecutable(d Descriptor) (Executable, error) {
+	launcher, ok := d.Providers["codex"]
 	if !ok {
-		return "", fmt.Errorf("provider %s not enabled", id)
+		return Executable{}, errors.New("Codex is absent from the admitted image")
 	}
-	// Admission has already checked the entrypoint bytes and controller
-	// separation. Preserve the installed link's resolved execution path.
-	return immutableResolved(p.Path)
+	path, err := executable(launcher, d.Controller)
+	if err != nil || filepath.Base(path) != "codex.js" || filepath.Base(filepath.Dir(path)) != "bin" {
+		return Executable{}, errors.New("Codex helper requires the admitted npm launcher")
+	}
+	packageRoot := filepath.Dir(filepath.Dir(path))
+	if filepath.Base(packageRoot) != "codex" || filepath.Base(filepath.Dir(packageRoot)) != "@openai" {
+		return Executable{}, errors.New("Codex launcher has an unsupported package layout")
+	}
+	var cpu, triple string
+	switch d.Platform {
+	case "linux/arm64":
+		cpu, triple = "arm64", "aarch64-unknown-linux-musl"
+	case "linux/amd64":
+		cpu, triple = "x64", "x86_64-unknown-linux-musl"
+	default:
+		return Executable{}, errors.New("Codex helper requires a supported Linux platform")
+	}
+	platformPackage := "@openai/codex-linux-" + cpu
+	var metadata struct {
+		Name, Version        string
+		OptionalDependencies map[string]string
+		OS, CPU              []string
+	}
+	readMetadata := func(name string) error {
+		if err := rootOwnedImagePath(name); err != nil {
+			return err
+		}
+		info, err := os.Lstat(name)
+		if err != nil || !info.Mode().IsRegular() || info.Size() > 1<<20 {
+			return errors.New("Codex package metadata is not a bounded regular file")
+		}
+		raw, err := os.ReadFile(name)
+		if err != nil {
+			return err
+		}
+		metadata = struct {
+			Name, Version        string
+			OptionalDependencies map[string]string
+			OS, CPU              []string
+		}{}
+		return json.Unmarshal(raw, &metadata)
+	}
+	if err := rootOwnedImagePath(path); err != nil {
+		return Executable{}, err
+	}
+	if err := readMetadata(filepath.Join(packageRoot, "package.json")); err != nil || metadata.Name != "@openai/codex" ||
+		metadata.Version != launcher.Version || metadata.OptionalDependencies[platformPackage] != "npm:@openai/codex@"+launcher.Version+"-linux-"+cpu {
+		return Executable{}, errors.New("Codex launcher package differs from the admitted version")
+	}
+	nativeRoot := filepath.Join(filepath.Dir(packageRoot), "codex-linux-"+cpu)
+	if err := readMetadata(filepath.Join(nativeRoot, "package.json")); err != nil || metadata.Name != "@openai/codex" ||
+		metadata.Version != launcher.Version+"-linux-"+cpu || len(metadata.OS) != 1 || metadata.OS[0] != "linux" || len(metadata.CPU) != 1 || metadata.CPU[0] != cpu {
+		return Executable{}, errors.New("Codex native package differs from the admitted platform/version")
+	}
+	native := filepath.Join(nativeRoot, "vendor", triple, "bin", "codex")
+	if err := rootOwnedImagePath(native); err != nil {
+		return Executable{}, err
+	}
+	info, err := os.Lstat(native)
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0111 == 0 {
+		return Executable{}, errors.New("Codex native helper is not an immutable executable")
+	}
+	sha, err := core.HashFile(native)
+	return Executable{Path: native, Version: launcher.Version, SHA256: sha}, err
 }
 
-// ReadMetadata reads execution settings only after controller or task authority
-// has been established. The fixed image path cannot be selected by a request.
-// It does not verify installed bytes or compare an image reference.
-func ReadMetadata() (Descriptor, error) {
-	var d Descriptor
-	if _, err := ReadJSON(DescriptorPath, &d); err != nil {
-		return d, err
+func rootOwnedImagePath(path string) error {
+	if !ImmutablePath(path) {
+		return errors.New("Codex package path is mutable")
 	}
-	return d, d.Validate(d.Platform)
-}
-
-func version(ctx context.Context, e Executable, args []string, env []string) error {
-	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, e.Path, args...)
-	cmd.Env = env
-	var out limitedOutput
-	cmd.Stdout = &out
-	cmd.Stderr = &out
-	if err := cmd.Run(); err != nil {
-		return errors.New("installed executable version probe failed")
-	}
-	pattern := regexp.MustCompile(`(^|[^0-9A-Za-z.])v?` + regexp.QuoteMeta(e.Version) + `($|[^0-9A-Za-z.])`)
-	if !pattern.Match(out.data) {
-		return errors.New("installed executable version differs from descriptor")
+	for current := path; current != "/"; current = filepath.Dir(current) {
+		info, err := os.Lstat(current)
+		if err != nil || current != path && !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0022 != 0 {
+			return errors.New("Codex package path is indirect or writable")
+		}
+		stat, ok := info.Sys().(*syscall.Stat_t)
+		if !ok || stat.Uid != 0 || info.Mode().IsRegular() && stat.Nlink != 1 {
+			return errors.New("Codex package path has untrusted ownership or shared files")
+		}
 	}
 	return nil
-}
-
-type limitedOutput struct{ data []byte }
-
-func (o *limitedOutput) Write(p []byte) (int, error) {
-	n := len(p)
-	if len(o.data) < 65536 {
-		o.data = append(o.data, p[:min(len(p), 65536-len(o.data))]...)
-	}
-	return n, nil
 }
 
 // ReadInstalled checks bytes and paths without starting an installed process.
@@ -165,38 +201,13 @@ func ReadInstalled(root, controllerRoot, platform string) (Descriptor, string, e
 			return d, "", err
 		}
 	}
-	if err = ValidateSeed(d); err != nil {
-		return d, "", err
-	}
 	return d, core.Digest(raw), nil
-}
-
-// CheckInstalled verifies installed files and probes the actual tool versions.
-// Local adapter integration checks use it before and after their scenarios.
-func CheckInstalled(ctx context.Context, root, controllerRoot, platform string) (Descriptor, string, error) {
-	d, digest, err := ReadInstalled(root, controllerRoot, platform)
-	if err != nil {
-		return d, digest, err
-	}
-	env, err := Vars(d, os.Environ(), Locations{Home: os.Getenv("HOME"), TmpDir: os.TempDir(), Workspace: "/workspace"})
-	if err != nil {
-		return d, "", err
-	}
-	if err = version(ctx, d.Daemon.Executable, []string{"version"}, env); err != nil {
-		return d, "", fmt.Errorf("official daemon: %w", err)
-	}
-	for id, e := range d.Providers {
-		if err = version(ctx, e, []string{"--version"}, env); err != nil {
-			return d, "", fmt.Errorf("provider %s: %w", id, err)
-		}
-	}
-	return d, digest, nil
 }
 
 func Check(ctx context.Context, root, controllerRoot, platform string) (d Descriptor, digest string, resultErr error) {
 	defer func() {
 		if resultErr != nil {
-			resultErr = fmt.Errorf("%w: %w", ErrCompatibility, diagnostics.Wrap("runtime_image_verification_failed", resultErr))
+			resultErr = diagnostics.Wrap("runtime_image_verification_failed", resultErr)
 		}
 	}()
 	if err := ctx.Err(); err != nil {
