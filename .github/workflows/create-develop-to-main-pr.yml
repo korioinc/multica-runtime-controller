@@ -1,0 +1,151 @@
+name: Create develop to main PR
+
+on:
+  pull_request:
+    branches: [develop, main]
+  push:
+    branches: [develop]
+  repository_dispatch:
+    types: [create-develop-to-main-pr]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: develop-to-main-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  context:
+    name: check-context
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      should_run: ${{ steps.resolve.outputs.should_run }}
+      head_sha: ${{ steps.resolve.outputs.head_sha }}
+    env:
+      GH_REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Resolve the exact PR head
+        id: resolve
+        env:
+          EVENT_HEAD: ${{ github.event.pull_request.head.sha }}
+          EVENT_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          head_sha=$EVENT_HEAD
+          number=$EVENT_NUMBER
+          [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]] || {
+            echo 'Invalid head SHA.' >&2; exit 1;
+          }
+          [[ "$number" =~ ^[1-9][0-9]*$ ]] || {
+            echo 'Invalid PR number.' >&2; exit 1;
+          }
+          pr=$(gh api "repos/$GH_REPO/pulls/$number")
+          jq -e --argjson number "$number" \
+            '.number == $number and
+             (.state == "open" or .state == "closed") and
+             (.head.sha | type == "string" and test("^[0-9a-f]{40}$")) and
+             (.base.ref | type == "string" and length > 0)' \
+            <<<"$pr" >/dev/null || {
+              echo 'Invalid PR response from GitHub.' >&2; exit 1;
+            }
+          reason=$(jq -r --arg head_sha "$head_sha" '
+            if .state == "closed" then "PR is already closed or merged."
+            elif .head.sha != $head_sha then "PR head changed since this run was queued."
+            elif .base.ref != "develop" and .base.ref != "main" then "PR no longer targets develop or main."
+            else "" end' <<<"$pr")
+          if [[ -n "$reason" ]]; then
+            printf 'Skipping PR #%s: %s\n' "$number" "$reason" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo 'should_run=false' >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          {
+            echo 'should_run=true'
+            echo "head_sha=$head_sha"
+          } >>"$GITHUB_OUTPUT"
+
+  verify:
+    name: verify
+    needs: context
+    if: needs.context.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the exact PR head
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.context.outputs.head_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up Go
+        id: go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: src/go.mod
+          cache: false
+      - name: Cache Go modules and compiled tests
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          # Save new build/race entries after source changes; restore the previous build first.
+          key: pr-go-${{ runner.os }}-${{ runner.arch }}-${{ steps.go.outputs.go-version }}-${{ hashFiles('src/go.mod', 'src/go.sum') }}-${{ hashFiles('src/**', 'Makefile') }}
+          restore-keys: |
+            pr-go-${{ runner.os }}-${{ runner.arch }}-${{ steps.go.outputs.go-version }}-${{ hashFiles('src/go.mod', 'src/go.sum') }}-
+      - name: Verify source and workflows
+        run: make verify
+
+  promote:
+    name: create-develop-to-main-pr
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'repository_dispatch' &&
+       github.event.action == 'create-develop-to-main-pr') ||
+      github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+    env:
+      GH_REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Maintain one develop to main PR
+        run: |
+          # shellcheck disable=SC2016
+          set -euo pipefail
+          main_sha=$(gh api "repos/$GH_REPO/git/ref/heads/main" --jq .object.sha)
+          develop_sha=$(gh api "repos/$GH_REPO/git/ref/heads/develop" --jq .object.sha)
+          compare=$(gh api "repos/$GH_REPO/compare/$main_sha...$develop_sha")
+          if [ "$(jq -r .ahead_by <<<"$compare")" -eq 0 ]; then
+            echo 'develop has no commits to promote to main.' >>"$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          prs=$(gh pr list --state open --base main --head develop \
+            --json number --limit 2)
+          count=$(jq 'length' <<<"$prs")
+          [ "$count" -le 1 ]
+          if [ "$count" -eq 0 ]; then
+            url=$(gh pr create --base main --head develop \
+              --assignee jskorlol \
+              --title 'release: merge develop into main' \
+              --body 'Merges the verified develop branch. When VERSION increases, main creates the matching tag and publishes its image and GitHub Release. VERSION is never bumped automatically.')
+            number=${url##*/}
+          else
+            number=$(jq -r '.[0].number' <<<"$prs")
+          fi
+          pr=$(gh api "repos/$GH_REPO/pulls/$number")
+          head_sha=$(jq -r .head.sha <<<"$pr")
+          [ "$head_sha" = "$develop_sha" ]
+          printf "Promotion PR #%s targets develop '%s'.\n" \
+            "$number" "$head_sha" >>"$GITHUB_STEP_SUMMARY"

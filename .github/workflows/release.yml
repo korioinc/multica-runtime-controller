@@ -1,0 +1,254 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag matching VERSION
+        required: true
+        type: string
+      expected_revision:
+        description: Full commit SHA originally selected for this release
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+  queue: max
+
+env:
+  IMAGE: ghcr.io/korioinc/multica-runtime-controller
+
+jobs:
+  plan:
+    name: plan-release
+    # The workflow and its control scripts must come from protected main.
+    # The requested tag is source data, never the workflow execution ref.
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      revision: ${{ steps.plan.outputs.revision }}
+      published: ${{ steps.plan.outputs.published }}
+    env:
+      GH_REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.tag }}
+      EXPECTED_REVISION: ${{ inputs.expected_revision }}
+    steps:
+      - name: Check out trusted release control from the main event revision
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: control
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Authorize the requested source before checking it out
+        run: |
+          set -euo pipefail
+          fail() { printf 'release blocked: %s\n' "$*" >&2; exit 1; }
+          [[ "$EXPECTED_REVISION" =~ ^[0-9a-f]{40}$ ]] || fail 'a full source commit SHA is required'
+          # shellcheck source=scripts/lib/version.sh
+          source "$GITHUB_WORKSPACE/control/scripts/lib/version.sh"
+          version_stable "$RELEASE_TAG"
+          scratch=$(mktemp -d "$RUNNER_TEMP/release-authority.XXXXXX")
+          trap 'rm -rf -- "$scratch"' EXIT
+          # shellcheck source=.github/scripts/github-lib.sh
+          source "$GITHUB_WORKSPACE/control/.github/scripts/github-lib.sh"
+          github_require_main_revision "$EXPECTED_REVISION"
+          owner=$(github_tag_revision "$RELEASE_TAG" true)
+          [[ "$owner" == "$EXPECTED_REVISION" ]] || fail 'release tag identifies another commit'
+      - name: Check out the authorized release source as data
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ inputs.expected_revision }}
+          path: source
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4.4.1
+      - name: Log in to GHCR for immutable release lookup
+        uses: docker/login-action@v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Validate the tag, VERSION, source revision and existing release bytes
+        id: plan
+        run: >-
+          control/.github/scripts/release.sh --root "$GITHUB_WORKSPACE/source"
+          --image "$IMAGE" --revision "$EXPECTED_REVISION" --version "$RELEASE_TAG" plan
+
+  verify:
+    name: verify-release-source
+    needs: plan
+    if: needs.plan.outputs.published != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the exact release source
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.revision }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: src/go.mod
+          cache-dependency-path: src/go.sum
+      - name: Verify controller source and workflows
+        run: make verify
+
+  build:
+    name: build-${{ matrix.architecture }}
+    needs: [plan, verify]
+    env:
+      RELEASE_REVISION: ${{ needs.plan.outputs.revision }}
+      RELEASE_VERSION: ${{ needs.plan.outputs.version }}
+    if: needs.plan.outputs.published != 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: amd64
+            runner: ubuntu-24.04
+            platform: linux/amd64
+          - architecture: arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out trusted release control from the main event revision
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: control
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check out the exact release source
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.revision }}
+          path: source
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4.4.1
+      - name: Log in to GHCR
+        uses: docker/login-action@v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Reuse the matching native candidate when retrying
+        id: candidate
+        run: >-
+          control/.github/scripts/release.sh --root "$GITHUB_WORKSPACE/source"
+          --image "$IMAGE" --revision "$RELEASE_REVISION" --version "$RELEASE_VERSION"
+          prepare-native --platform '${{ matrix.platform }}'
+      - name: Resolve controller-only build arguments
+        if: steps.candidate.outputs.reuse != 'true'
+        id: args
+        run: |
+          set -euo pipefail
+          control/scripts/runtime-versions.sh --root "$GITHUB_WORKSPACE/source" build-args \
+            --revision "$RELEASE_REVISION" --version "$RELEASE_VERSION" \
+            | jq -r 'to_entries[] | "\(.key)=\(.value)"' >"$RUNNER_TEMP/build-args"
+          {
+            echo 'value<<EOF'
+            cat "$RUNNER_TEMP/build-args"
+            echo EOF
+          } >>"$GITHUB_OUTPUT"
+      - name: Build the native candidate locally
+        if: steps.candidate.outputs.reuse != 'true'
+        uses: docker/build-push-action@v7.4.0
+        with:
+          context: ./source
+          platforms: ${{ matrix.platform }}
+          load: true
+          push: false
+          tags: ${{ steps.candidate.outputs.image }}
+          build-args: ${{ steps.args.outputs.value }}
+          provenance: false
+          sbom: false
+      - name: Execute the native base check and push only verified candidate bytes
+        run: >-
+          control/.github/scripts/release.sh --root "$GITHUB_WORKSPACE/source"
+          --image "$IMAGE" --revision "$RELEASE_REVISION" --version "$RELEASE_VERSION"
+          record-native --platform '${{ matrix.platform }}'
+          --records "$RUNNER_TEMP/native-results"
+      - name: Upload the verified native result
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: release-native-${{ matrix.architecture }}
+          path: ${{ runner.temp }}/native-results/*.json
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: publish-release
+    needs: [plan, verify, build]
+    if: >-
+      always() && needs.plan.result == 'success' &&
+      ((needs.plan.outputs.published == 'true' && needs.build.result == 'skipped') ||
+       (needs.verify.result == 'success' && needs.build.result == 'success'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      contents: write
+      packages: write
+    env:
+      GH_REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_REVISION: ${{ needs.plan.outputs.revision }}
+      RELEASE_VERSION: ${{ needs.plan.outputs.version }}
+    steps:
+      - name: Check out trusted release control from the main event revision
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: control
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check out the exact release source
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.revision }}
+          path: source
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Download native results
+        if: needs.plan.outputs.published != 'true'
+        uses: actions/download-artifact@v8.0.1
+        with:
+          pattern: release-native-*
+          path: ${{ runner.temp }}/native-results
+          merge-multiple: true
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4.4.1
+      - name: Log in to GHCR
+        uses: docker/login-action@v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Publish the immutable version, GitHub Release and current latest
+        run: >-
+          control/.github/scripts/release.sh --root "$GITHUB_WORKSPACE/source"
+          --image "$IMAGE" --revision "$RELEASE_REVISION" --version "$RELEASE_VERSION"
+          publish --records "$RUNNER_TEMP/native-results"
