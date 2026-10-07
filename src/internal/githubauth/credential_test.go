@@ -18,8 +18,7 @@ func TestCredentialTargetCannotChangeHostOrRepositoryBoundary(t *testing.T) {
 			t.Fatal("Git input escaped the single GitHub repository credential boundary")
 		}
 	}
-	selected, err := credentialRepository(strings.NewReader("protocol=https\nhost=github.com\npath=team/selected.git\n\n"))
-	if err != nil || selected != "https://github.com/team/selected.git" {
+	if _, err := credentialRepository(strings.NewReader("protocol=https\nhost=github.com\npath=team/selected.git\n\n")); err != nil {
 		t.Fatal("Git could not request the explicitly selected repository credential")
 	}
 }

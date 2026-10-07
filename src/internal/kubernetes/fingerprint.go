@@ -11,10 +11,10 @@ import (
 	"k8s.io/utils/ptr"
 )
 
-// PodFingerprint stores only a digest of the complete creation payload. The
-// journal never acquires the operator env values contained in that payload.
-func PodFingerprint(cfg Config, ref Reference, request wire.Request, gateway string) (string, error) {
-	pod, err := podObject(cfg, ref, request, gateway)
+// PodFingerprint binds the complete worker specification to its execution
+// authority, independently of Kubernetes defaults and scheduler assignment.
+func PodFingerprint(cfg Config, ref Reference, request wire.Bootstrap) (string, error) {
+	pod, err := podObject(cfg, ref, request)
 	if err != nil {
 		return "", err
 	}
@@ -24,7 +24,7 @@ func PodFingerprint(cfg Config, ref Reference, request wire.Request, gateway str
 // Normalize only defaulted Kubernetes fields and scheduler Node assignment.
 // Every mount, volume source, credential source, command and security setting
 // remains part of the payload proof, including additional admission-injected
-// containers. A configured fixed Node is checked separately before normalization.
+// containers.
 func specFingerprint(input corev1.PodSpec) string {
 	p := input.DeepCopy()
 	p.NodeName = ""

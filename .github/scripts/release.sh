@@ -86,8 +86,7 @@ image_metadata() {
   jq -e --arg platform "$2" --arg revision "$revision" --arg version "$version" '
     .os + "/" + .architecture == $platform and
     .config.Labels["org.opencontainers.image.revision"] == $revision and
-    .config.Labels["org.opencontainers.image.version"] == $version and
-    .config.Labels["io.multica.controller-abi"] == "2"
+    .config.Labels["org.opencontainers.image.version"] == $version
   ' <<<"$metadata" >/dev/null || fail 'native image platform or source/build mismatch'
 }
 

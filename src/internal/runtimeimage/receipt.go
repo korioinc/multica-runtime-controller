@@ -11,14 +11,13 @@ import (
 const ReceiptName = "image-receipt.json"
 
 type Receipt struct {
-	SchemaVersion    int    `json:"schemaVersion"`
 	ImageBuildID     string `json:"imageBuildID"`
 	DescriptorDigest string `json:"descriptorDigest"`
 	Platform         string `json:"platform"`
 }
 
 func (d Descriptor) Receipt(digest string) Receipt {
-	return Receipt{SchemaVersion: 1, ImageBuildID: d.ImageBuildID, DescriptorDigest: digest, Platform: d.Platform}
+	return Receipt{ImageBuildID: d.ImageBuildID, DescriptorDigest: digest, Platform: d.Platform}
 }
 
 func CheckReceipt(run string, d Descriptor, digest string) error {

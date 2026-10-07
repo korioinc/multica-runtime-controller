@@ -6,160 +6,80 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"github.com/go-logr/logr"
-	"io"
-	"k8s.io/klog/v2"
 	"log/slog"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"runtime"
 	"syscall"
-	"time"
 
+	"github.com/go-logr/logr"
 	"github.com/korioinc/multica-runtime-controller/internal/core"
 	"github.com/korioinc/multica-runtime-controller/internal/diagnostics"
-	"github.com/korioinc/multica-runtime-controller/internal/execution"
 	"github.com/korioinc/multica-runtime-controller/internal/githubauth"
-	"github.com/korioinc/multica-runtime-controller/internal/kubernetes"
-	"github.com/korioinc/multica-runtime-controller/internal/migration"
+	"github.com/korioinc/multica-runtime-controller/internal/initprocess"
 	"github.com/korioinc/multica-runtime-controller/internal/runtimeimage"
 	"github.com/korioinc/multica-runtime-controller/internal/wire"
+	"github.com/korioinc/multica-runtime-controller/internal/worker"
+	"k8s.io/klog/v2"
 )
 
 func main() {
-	phase, closeDiagnostics := configureDiagnostics(os.Args)
-	defer closeDiagnostics()
+	if len(os.Args) > 1 && os.Args[1] == "init" {
+		os.Exit(initprocess.Run(os.Args[2:]))
+	}
+	klog.SetLogger(logr.Discard())
+	controllerRole := len(os.Args) > 1 && os.Args[1] == "controller"
+	workerRole := len(os.Args) > 2 && os.Args[1] == "worker" && (os.Args[2] == "serve" || os.Args[2] == "layout" || os.Args[2] == "run" || os.Args[2] == "desktop")
+	if controllerRole || workerRole {
+		component := "controller"
+		if workerRole {
+			component = "worker"
+		}
+		slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})).With("component", component))
+	}
+	if controllerRole {
+		slog.Info("runtime controller starting")
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
-	err := dispatch(ctx, os.Args)
-	if errors.Is(err, flag.ErrHelp) {
-		return
-	}
-	if err != nil {
-		var providerExit *execution.ExitError
-		if errors.As(err, &providerExit) {
-			os.Exit(providerExit.Code)
+	if err := dispatch(ctx, os.Args[1:]); err != nil && !errors.Is(err, flag.ErrHelp) {
+		if controllerRole && errors.Is(ctx.Err(), context.Canceled) && errors.Is(err, context.Canceled) {
+			slog.Info("runtime controller stopped", "reason", "shutdown_requested")
+			return
 		}
-		if phase == "github" {
-			// Authentication helpers only construct redacted errors. Git reserves
-			// stdout for credentials; actionable diagnostics belong on stderr.
+		var exit *exec.ExitError
+		exitCode := 1
+		if errors.As(err, &exit) {
+			exitCode = exit.ExitCode()
+			if !controllerRole {
+				os.Exit(exitCode)
+			}
+		}
+		if len(os.Args) > 1 && os.Args[1] == "github" {
 			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
-		logger := slog.Default()
-		id := os.Getenv("MULTICA_RUNTIME_IMAGE_BUILD_ID")
-		task, attempt := os.Getenv("MULTICA_TASK_ID"), os.Getenv("MULTICA_ATTEMPT_ID")
-		var attemptFailure *execution.AttemptError
-		if errors.As(err, &attemptFailure) {
-			id, task, attempt = attemptFailure.ImageBuildID, attemptFailure.TaskID, attemptFailure.AttemptID
-		}
-		if !wire.UUID(id) {
-			id = ""
-		}
-		reason := "operation_failed"
-		if errors.Is(err, os.ErrPermission) {
-			reason = "permission_denied"
-		} else if errors.Is(err, os.ErrNotExist) {
-			reason = "required_file_missing"
-		} else if errors.Is(err, context.DeadlineExceeded) {
-			reason = "deadline_exceeded"
-		}
-		class := errorClass(phase)
-		switch {
-		case errors.Is(err, core.ErrCompatibility):
-			class = "core_compatibility"
-		case errors.Is(err, runtimeimage.ErrCompatibility):
-			class = "runtime_image_compatibility"
-		case errors.Is(err, execution.ErrTransport) || errors.Is(err, kubernetes.ErrTransport):
-			class = "transport"
-		case errors.Is(err, execution.ErrProviderStart):
-			class = "provider_start"
-		}
-		var diagnostic *diagnostics.Error
-		if errors.As(err, &diagnostic) {
-			reason = diagnostic.Reason
-			if diagnostic.AttemptID != "" {
-				attempt = diagnostic.AttemptID
+		} else {
+			reason := "operation_failed"
+			var diagnostic *diagnostics.Error
+			if errors.As(err, &diagnostic) {
+				reason = diagnostic.Reason
 			}
+			slog.Error("runtime operation failed", "reason", reason)
 		}
-		attributes := []any{"phase", phase, "error_class", class, "reason", reason, "imageBuildID", id}
-		if diagnostic != nil {
-			if diagnostic.Path != "" {
-				attributes = append(attributes, "path", diagnostic.Path)
-			}
-			if diagnostic.SourceGroup != "" {
-				attributes = append(attributes, "sourceGroup", diagnostic.SourceGroup)
-			}
-			if diagnostic.StorageID != "" {
-				attributes = append(attributes, "storage", diagnostic.StorageID)
-			}
-			if diagnostic.EntrySHA256 != "" {
-				attributes = append(attributes, "entrySHA256", diagnostic.EntrySHA256)
-			}
-		}
-		if wire.UUID(task) {
-			attributes = append(attributes, "task", task)
-		}
-		if wire.UUID(attempt) {
-			attributes = append(attributes, "attempt", attempt)
-		}
-		logger.Error("runtime operation failed", attributes...)
-		os.Exit(execution.ErrorCode(err))
+		os.Exit(exitCode)
 	}
-}
-
-// Configure every diagnostic writer before the shim can start an execution.
-// Cleanup warnings and nested library logs must not enter provider protocol pipes.
-func configureDiagnostics(args []string) (string, func()) {
-	// Kubernetes warning headers and verbose request logs can contain caller
-	// data. Runtime failures are reported through our separate, structured sink.
-	klog.SetLogger(logr.Discard())
-	phase := "configuration"
-	providerStream := wire.Provider(filepath.Base(args[0])) != ""
-	if providerStream {
-		phase = "provider"
-	} else if len(args) > 1 {
-		switch args[1] {
-		case "version", "image", "workspace", "controller", "worker", "home", "github":
-			phase = args[1]
-		}
+	if controllerRole {
+		slog.Info("runtime controller stopped", "reason", "completed")
 	}
-	providerStream = providerStream || phase == "worker" && len(args) > 2 && args[2] == "execute"
-	if !providerStream {
-		if phase == "controller" || phase == "worker" {
-			slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, nil)))
-		}
-		return phase, func() {}
-	}
-	var output io.Writer = io.Discard
-	cleanup := func() {}
-	if runtime.GOOS == "linux" {
-		if file, err := os.OpenFile("/proc/1/fd/2", os.O_WRONLY, 0); err == nil {
-			output = file
-			cleanup = func() { _ = file.Close() }
-		}
-	}
-	slog.SetDefault(slog.New(slog.NewTextHandler(output, nil)))
-	return phase, cleanup
 }
 
 func dispatch(ctx context.Context, args []string) error {
-	if provider := wire.Provider(filepath.Base(args[0])); provider != "" {
-		cwd, err := os.Getwd()
-		if err != nil {
-			return err
-		}
-		return execution.Launch(ctx, provider, args[1:], os.Environ(), cwd, execution.ProcessStreams{Stdin: os.Stdin, Stdout: os.Stdout, Stderr: os.Stderr})
-	}
-	if len(args) < 2 {
+	if len(args) == 0 {
 		return errors.New("runtime role required")
 	}
-	switch args[1] {
-	case "github":
-		return githubCommand(ctx, args[2:])
+	switch args[0] {
 	case "version":
-		if len(args) != 2 {
+		if len(args) != 1 {
 			return errors.New("usage: runtime version")
 		}
 		contract, err := core.Check(core.Root, core.HostPlatform())
@@ -168,57 +88,60 @@ func dispatch(ctx context.Context, args []string) error {
 		}
 		return json.NewEncoder(os.Stdout).Encode(contract)
 	case "image":
-		if len(args) != 3 || args[2] != "verify" {
+		if len(args) != 2 || args[1] != "verify" {
 			return errors.New("usage: runtime image verify")
 		}
 		_, _, err := runtimeimage.Check(ctx, runtimeimage.Root, core.Root, core.HostPlatform())
 		return err
-	case "workspace":
-		if len(args) >= 3 && args[2] == "migrate" {
-			return migrateWorkspace(args[3:])
-		}
-		return errors.New("usage: runtime workspace migrate --root PATH --owner-id UUID (--dry-run | --expected-source-sha256 DIGEST --commit)")
 	case "home":
-		if len(args) >= 3 && args[2] == "layout" {
-			return layoutHome(ctx, args[3:])
+		if len(args) < 2 || args[1] != "layout" {
+			return errors.New("usage: runtime home layout")
 		}
-		return errors.New("usage: runtime home layout --private-root PATH [--config-copy JSON ...]")
+		return layoutHome(ctx, args[2:])
 	case "controller":
+		if len(args) != 1 {
+			return errors.New("usage: runtime controller")
+		}
 		return controller(ctx)
 	case "worker":
-		if len(args) < 3 {
+		if len(args) < 2 {
 			return errors.New("worker operation required")
 		}
-		switch args[2] {
+		switch args[1] {
 		case "serve":
-			return execution.WorkerServe(ctx)
-		case "proxy":
-			return execution.WorkerProxy(ctx)
+			if len(args) != 2 {
+				return errors.New("usage: runtime worker serve")
+			}
+			return worker.Serve(ctx)
+		case "run":
+			if len(args) != 3 {
+				return errors.New("usage: runtime worker run <supervisor-socket>")
+			}
+			return worker.RunProvider(ctx, args[2])
+		case "desktop":
+			if len(args) != 3 || args[2] == "" {
+				return errors.New("usage: runtime worker desktop <supervisor-socket>")
+			}
+			return worker.RunDesktop(ctx, args[2])
+		case "chrome":
+			return worker.Chrome(ctx, args[2:])
 		case "ready":
-			return execution.WorkerReady()
-		case "execute":
-			parser := flag.NewFlagSet("worker execute", flag.ContinueOnError)
-			digest := parser.String("request-digest", "", "")
-			uid := parser.String("pod-uid", "", "")
-			stdin := parser.Bool("stdin", true, "")
-			stdout := parser.Bool("stdout", true, "")
-			stderr := parser.Bool("stderr", true, "")
-			if err := parser.Parse(args[3:]); err != nil {
+			_, err := os.Stat(wire.ControlRoot + "/ready")
+			return err
+		case "layout":
+			flags := flag.NewFlagSet("worker layout", flag.ContinueOnError)
+			privateRoot := flags.String("private-root", "", "")
+			request := flags.String("request", wire.RequestPath, "")
+			if err := flags.Parse(args[2:]); err != nil {
 				return err
 			}
-			var inputFile *os.File
-			if *stdin {
-				inputFile = os.Stdin
+			if flags.NArg() != 0 {
+				return errors.New("invalid layout arguments")
 			}
-			var outputWriter, errorWriter io.Writer
-			if *stdout {
-				outputWriter = os.Stdout
-			}
-			if *stderr {
-				errorWriter = os.Stderr
-			}
-			return execution.WorkerExecute(ctx, *digest, *uid, execution.ProcessStreams{Stdin: inputFile, Stdout: outputWriter, Stderr: errorWriter})
+			return worker.Layout(ctx, *privateRoot, *request)
 		}
+	case "github":
+		return githubCommand(ctx, args[1:])
 	}
 	return errors.New("unsupported runtime operation")
 }
@@ -232,53 +155,20 @@ func githubCommand(ctx context.Context, args []string) error {
 	}
 	executable := args[1]
 	if !runtimeimage.ImmutablePath(executable) || filepath.Base(executable) != "gh" {
-		return errors.New("GitHub CLI wrapper requires its installed immutable executable")
+		return errors.New("installed GitHub executable required")
 	}
 	directory, err := os.Getwd()
 	if err != nil {
-		return errors.New("GitHub CLI working directory unavailable")
+		return errors.New("GitHub working directory unavailable")
 	}
-	env := githubauth.WithoutAppCredentials(os.Environ())
-	env, err = githubauth.PrepareGH(ctx, args[2:], env, directory)
+	env, err := githubauth.PrepareGH(ctx, args[2:], githubauth.WithoutAppCredentials(os.Environ()), directory)
 	if err != nil {
 		return err
 	}
-	result := execution.RunProcess(ctx, executable, args[2:], env, directory, 5*time.Second, execution.ProcessStreams{Stdin: os.Stdin, Stdout: os.Stdout, Stderr: os.Stderr})
-	return execution.ResultError(result)
-}
-
-func errorClass(phase string) string {
-	switch phase {
-	case "version":
-		return "core_compatibility"
-	case "image":
-		return "runtime_image_compatibility"
-	case "controller", "workspace", "home", "configuration":
-		return "configuration"
-	case "worker":
-		return "provider_start"
-	default:
-		return "task_authorization"
-	}
-}
-
-func migrateWorkspace(args []string) error {
-	parser := flag.NewFlagSet("workspace migrate", flag.ContinueOnError)
-	root := parser.String("root", "", "existing workspace root")
-	owner := parser.String("owner-id", "", "existing installation UUID")
-	dryRun := parser.Bool("dry-run", false, "validate without writing")
-	commit := parser.Bool("commit", false, "commit the validated conversion")
-	expected := parser.String("expected-source-sha256", "", "source digest from dry-run")
-	if err := parser.Parse(args); err != nil {
-		return err
-	}
-	if parser.NArg() != 0 || *dryRun == *commit {
-		parser.Usage()
-		return diagnostics.Wrap("migration_mode_invalid", errors.New("workspace migrate requires exactly one of --dry-run or --commit"))
-	}
-	result, err := migration.Migrate(migration.Options{Root: *root, OwnerID: *owner, Commit: *commit, ExpectedSourceSHA256: *expected})
-	if err != nil {
-		return err
-	}
-	return json.NewEncoder(os.Stdout).Encode(result)
+	command := exec.CommandContext(ctx, executable, args[2:]...)
+	command.Env = env
+	command.Stdin = os.Stdin
+	command.Stdout = os.Stdout
+	command.Stderr = os.Stderr
+	return command.Run()
 }

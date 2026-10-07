@@ -19,6 +19,19 @@ func Reserved(name string) bool {
 	return name == "PATH" || name == "HOME" || name == "TMPDIR" || name == "PWD" || name == "OLDPWD" || name == "SHELL" || name == "ENV" || name == "BASH_ENV" || name == "LD_PRELOAD" || strings.HasPrefix(name, "MULTICA_") || strings.HasPrefix(name, "KUBERNETES_") || strings.HasPrefix(name, "POD_") || strings.HasPrefix(name, "ENV_") || strings.HasPrefix(name, "TASK_")
 }
 
+// ExecutionSetting permits only native execution defaults through operator
+// configuration. Task-controlled environment cannot select runtime authority.
+func ExecutionSetting(name string) bool {
+	switch name {
+	case "MULTICA_CODEX_MODEL", "MULTICA_PI_MODEL", "MULTICA_CODEX_ARGS", "MULTICA_PI_ARGS",
+		"MULTICA_AGENT_TIMEOUT", "MULTICA_AGENT_IDLE_WATCHDOG", "MULTICA_AGENT_TOOL_WATCHDOG",
+		"MULTICA_CODEX_SEMANTIC_INACTIVITY_TIMEOUT", "MULTICA_CODEX_HANDSHAKE_TIMEOUT",
+		"MULTICA_CODEX_FIRST_TURN_TIMEOUT", "MULTICA_CODEX_TURN_INTERRUPT_TIMEOUT":
+		return true
+	}
+	return false
+}
+
 func expand(value string, loc Locations) (string, error) {
 	invalid := false
 	out := variable.ReplaceAllStringFunc(value, func(s string) string {

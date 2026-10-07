@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"testing"
-	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -20,11 +19,11 @@ func TestLostControllerCannotAuthorizeTaskResourcesOrExecution(t *testing.T) {
 			ctx := context.Background()
 			client, ref, request, cfg := currentTaskFixture(t)
 			var err error
-			ref.SecretUID, err = client.CreateSecret(ctx, ref, request)
+			ref.SecretUID, err = client.EnsureSecret(ctx, ref, request)
 			if err != nil {
 				t.Fatal(err)
 			}
-			ref.PodUID, err = client.CreatePod(ctx, cfg, ref, request, "http://controller:8080")
+			ref.PodUID, err = ensureTaskPod(ctx, client, cfg, ref, request)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -32,15 +31,16 @@ func TestLostControllerCannotAuthorizeTaskResourcesOrExecution(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			pod.Spec.NodeName = cfg.SingleNodeName
+			pod.Spec.NodeName = "independent-worker-node"
 			if _, err = client.API.CoreV1().Pods(client.Namespace).Update(ctx, pod, metav1.UpdateOptions{}); err != nil {
 				t.Fatal(err)
 			}
-			pod.Status.ContainerStatuses = []corev1.ContainerStatus{{Name: "worker", Ready: true}}
+			pod.Status.ContainerStatuses = []corev1.ContainerStatus{{Name: "worker", Ready: true, ImageID: ref.RuntimeRef.Image}}
+			pod.Status.InitContainerStatuses = []corev1.ContainerStatus{{Name: "task-layout", ImageID: ref.RuntimeRef.Image}}
 			if _, err = client.API.CoreV1().Pods(client.Namespace).UpdateStatus(ctx, pod, metav1.UpdateOptions{}); err != nil {
 				t.Fatal(err)
 			}
-			if err = client.authorizeExecution(ctx, ref); err != nil {
+			if _, err = client.Authorize(ctx, ref); err != nil {
 				t.Fatal("live controller could not authorize its worker", err)
 			}
 			controller, err := client.API.CoreV1().Pods(client.Namespace).Get(ctx, ref.Owner.Name, metav1.GetOptions{})
@@ -66,7 +66,8 @@ func TestLostControllerCannotAuthorizeTaskResourcesOrExecution(t *testing.T) {
 				if _, err = client.API.CoreV1().Pods(client.Namespace).Update(ctx, controller, metav1.UpdateOptions{}); err != nil {
 					t.Fatal(err)
 				}
-				if exists, err := client.OwnerExists(ctx, ref); err != nil || !exists {
+				retained, err := client.API.CoreV1().Pods(client.Namespace).Get(ctx, controller.Name, metav1.GetOptions{})
+				if err != nil || retained.UID != controller.UID {
 					t.Fatal("terminating controller lost the fence for unresolved creates", err)
 				}
 			case "unavailable":
@@ -77,22 +78,21 @@ func TestLostControllerCannotAuthorizeTaskResourcesOrExecution(t *testing.T) {
 					return false, nil, nil
 				})
 			}
-			if _, err = client.ResolveSecret(ctx, ref); err == nil {
-				t.Fatal("lost controller reauthorized an existing request")
+			if _, err = client.Authorize(ctx, ref); err == nil {
+				t.Fatal("a ready worker acquired execution authority without a live controller")
 			}
-			if _, err = client.ResolvePod(ctx, ref); err == nil {
-				t.Fatal("lost controller reauthorized an existing worker")
-			}
-			if err = client.Execute(ctx, ref, time.Second, Streams{}); err == nil {
-				t.Fatal("a ready worker accepted execution without a live controller")
+			unacknowledged := ref
+			unacknowledged.SecretUID = ""
+			if _, err = client.EnsureSecret(ctx, unacknowledged, request); err == nil {
+				t.Fatal("lost controller adopted an existing bootstrap for execution")
 			}
 			if err = client.Cleanup(ctx, ref); err != nil {
 				t.Fatal("lost execution authority prevented owned resource cleanup", err)
 			}
-			if _, err = client.CreateSecret(ctx, ref, request); err == nil {
+			if _, err = client.EnsureSecret(ctx, ref, request); err == nil {
 				t.Fatal("lost controller authorized a new request")
 			}
-			if _, err = client.CreatePod(ctx, cfg, ref, request, "http://controller:8080"); err == nil {
+			if _, err = ensureTaskPod(ctx, client, cfg, ref, request); err == nil {
 				t.Fatal("lost controller authorized a new worker")
 			}
 			if _, err = client.API.CoreV1().Secrets(client.Namespace).Get(ctx, ref.SecretName, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
@@ -102,29 +102,5 @@ func TestLostControllerCannotAuthorizeTaskResourcesOrExecution(t *testing.T) {
 				t.Fatal("unapproved worker persisted", err)
 			}
 		})
-	}
-}
-
-func TestControllerOutsideFixedNodeCannotAuthorizeNewAttempt(t *testing.T) {
-	ctx := context.Background()
-	client, ref, request, cfg := currentTaskFixture(t)
-	ref.FixedNode = "another-node"
-	cfg.SingleNodeName = ref.FixedNode
-	var err error
-	ref.PodDigest, err = PodFingerprint(cfg, ref, request, "http://controller:8080")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err = client.CreateSecret(ctx, ref, request); err == nil {
-		t.Fatal("controller outside the selected storage node authorized a request")
-	}
-	if _, err = client.CreatePod(ctx, cfg, ref, request, "http://controller:8080"); err == nil {
-		t.Fatal("controller outside the selected storage node authorized a worker")
-	}
-	if _, err = client.API.CoreV1().Secrets(client.Namespace).Get(ctx, ref.SecretName, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
-		t.Fatal("unapproved request persisted", err)
-	}
-	if _, err = client.API.CoreV1().Pods(client.Namespace).Get(ctx, ref.PodName, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
-		t.Fatal("unapproved worker persisted", err)
 	}
 }

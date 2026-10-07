@@ -2,9 +2,15 @@ package workspace
 
 import (
 	"bytes"
+	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -13,303 +19,764 @@ import (
 	"github.com/korioinc/multica-runtime-controller/internal/runtimeimage"
 )
 
-func TestEnvironmentChangePreservesWorkButCannotResumeOldSession(t *testing.T) {
-	store, options := testStore(t)
-	a, b := testEnvironment("a"), testEnvironment("b")
-	first := testObservation(a)
-	approve(t, store, first)
-	root := prepareRoot(t, options.WorkspaceRoot, first)
-	session := prepareSession(t, options.SessionRoot)
-	_, binding, err := store.AuthorizeAndBind(first.ID, first.AuthToken, first.WorkspaceID, first.AgentID, root, session, a)
-	if err != nil {
-		t.Fatal(err)
-	}
-	edits := filepath.Join(options.WorkspaceRoot, binding.WorkerSubPath, "uncommitted")
-	writeFile(t, edits, []byte("unfinished repository work"))
-	writeFile(t, session, []byte("prior private session history"))
-	same := testObservation(a)
-	same.PriorWorkDir = filepath.Join(root, "workdir")
-	same.PriorSession = session
-	approve(t, store, same)
-	if _, _, err := store.AuthorizeAndBind(same.ID, same.AuthToken, same.WorkspaceID, same.AgentID, root, session, a); err != nil {
-		t.Fatalf("authorized same-environment continuation: %v", err)
-	}
-	store, err = Open(options)
-	if err != nil {
-		t.Fatal(err)
-	}
-	next := testObservation(b)
-	next.PriorWorkDir = filepath.Join(root, "workdir")
-	next.PriorSession = session
-	approve(t, store, next)
-	if _, _, err := store.AuthorizeAndBind(next.ID, next.AuthToken, next.WorkspaceID, next.AgentID, root, session, b); err == nil {
-		t.Fatal("new environment acquired old provider session")
-	}
-	fresh := prepareSession(t, options.SessionRoot)
-	_, continued, err := store.AuthorizeAndBind(next.ID, next.AuthToken, next.WorkspaceID, next.AgentID, root, fresh, b)
-	if err != nil {
-		t.Fatal(err)
-	}
-	assertData(t, filepath.Join(options.WorkspaceRoot, continued.WorkerSubPath, "uncommitted"), []byte("unfinished repository work"))
-	assertData(t, session, []byte("prior private session history"))
-	// An official same-TaskID retry can reset its preparation root while worker
-	// edits and their authorization remain in the installation registry.
-	if err := os.RemoveAll(root); err != nil {
-		t.Fatal(err)
-	}
-	retryRoot := prepareRoot(t, options.WorkspaceRoot, next)
-	approve(t, store, next)
-	_, retried, err := store.AuthorizeAndBind(next.ID, next.AuthToken, next.WorkspaceID, next.AgentID, retryRoot, fresh, b)
-	if err != nil {
-		t.Fatal(err)
-	}
-	assertData(t, filepath.Join(options.WorkspaceRoot, retried.WorkerSubPath, "uncommitted"), []byte("unfinished repository work"))
-}
-
-func TestScopeAndCredentialCannotAuthorizeAnotherStorage(t *testing.T) {
-	store, options := testStore(t)
-	ref := testEnvironment("a")
-	first := testObservation(ref)
-	if _, err := store.Lookup(first.ID, first.AuthToken, first.WorkspaceID, first.AgentID); err == nil {
-		t.Fatal("unobserved task authorized")
-	}
-	approve(t, store, first)
-	root := prepareRoot(t, options.WorkspaceRoot, first)
-	session := prepareSession(t, options.SessionRoot)
-	if _, _, err := store.AuthorizeAndBind(first.ID, first.AuthToken, first.WorkspaceID, first.AgentID, root, session, ref); err != nil {
-		t.Fatal(err)
-	}
-	writeFile(t, session, []byte("repository A history"))
-	if _, _, err := store.AuthorizeAndBind(first.ID, "mat_wrong", first.WorkspaceID, first.AgentID, root, session, ref); err == nil {
-		t.Fatal("wrong credential acquired bound work")
-	}
-	if _, _, err := store.AuthorizeAndBind(first.ID, first.AuthToken, "another-workspace", first.AgentID, root, session, ref); err == nil {
-		t.Fatal("another workspace acquired bound work")
-	}
-	if _, _, err := store.AuthorizeAndBind(first.ID, first.AuthToken, first.WorkspaceID, "another-agent", root, session, ref); err == nil {
-		t.Fatal("another agent acquired bound work")
-	}
-	if _, _, err := store.AuthorizeAndBind(first.ID, first.AuthToken, first.WorkspaceID, first.AgentID, root, session, testEnvironment("another-runtime")); err == nil {
-		t.Fatal("unobserved runtime acquired bound work")
-	}
-	other := testObservation(ref)
-	other.RepositoryURLs = []string{"https://example.invalid/private-other.git"}
-	other.PriorWorkDir = filepath.Join(root, "workdir")
-	other.PriorSession = session
-	approve(t, store, other)
-	if _, _, err := store.AuthorizeAndBind(other.ID, other.AuthToken, other.WorkspaceID, other.AgentID, root, session, ref); err == nil {
-		t.Fatal("another repository acquired prior root")
-	}
-	otherRoot := prepareRoot(t, options.WorkspaceRoot, other)
-	if _, _, err := store.AuthorizeAndBind(other.ID, other.AuthToken, other.WorkspaceID, other.AgentID, otherRoot, session, ref); err == nil {
-		t.Fatal("another repository acquired prior session through a new root")
-	}
-	changed := first
-	changed.RepositoryURLs = other.RepositoryURLs
-	if _, err := store.ObserveBatch([]Observation{changed}); err == nil {
-		t.Fatal("same TaskID changed repository authority")
-	}
-	if _, err := store.Lookup(first.ID, first.AuthToken, first.WorkspaceID, first.AgentID); err == nil {
-		t.Fatal("revoked claim remained authorized")
-	}
-	if _, err := store.ObserveBatch([]Observation{first}); err == nil {
-		t.Fatal("replaying old scope restored revoked authorization")
-	}
-	assertData(t, session, []byte("repository A history"))
-}
-
-func TestInvalidBatchAndLocalDirectoryGrantNoAuthority(t *testing.T) {
-	store, _ := testStore(t)
-	ref := testEnvironment("a")
-	first := testObservation(ref)
-	local := testObservation(ref)
-	local.LocalDirectory = "/home/operator/project"
-	if _, err := store.ObserveBatch([]Observation{first, local}); err == nil {
-		t.Fatal("local-directory claim accepted")
-	}
-	if _, err := store.Lookup(first.ID, first.AuthToken, first.WorkspaceID, first.AgentID); err == nil {
-		t.Fatal("partial failed batch authorized an earlier task")
-	}
-	if _, err := store.Lookup(local.ID, local.AuthToken, local.WorkspaceID, local.AgentID); err == nil {
-		t.Fatal("local-directory task authorized")
-	}
-}
-
-func TestOwnerMismatchAndCorruptionPreserveAuthorityBytes(t *testing.T) {
-	store, options := testStore(t)
-	task := testObservation(testEnvironment("a"))
-	approve(t, store, task)
-	path := filepath.Join(options.Directory, "registry.json")
-	original, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	foreign := options
-	foreign.OwnerID = uuid.NewString()
-	if _, err := Open(foreign); err == nil {
-		t.Fatal("foreign installation adopted authority")
-	}
-	assertData(t, path, original)
-	damaged := append(append([]byte{}, original...), []byte("incomplete-write")...)
-	writeFile(t, path, damaged)
-	if _, err := Open(options); err == nil {
-		t.Fatal("corrupt registry allowed startup")
-	}
-	if _, err := store.ObserveBatch([]Observation{task}); err == nil {
-		t.Fatal("new claim repaired corrupt authority by overwriting it")
-	}
-	assertData(t, path, damaged)
-}
-
-func TestMissingRegistryDoesNotAdoptExistingWorkerFiles(t *testing.T) {
-	root, err := filepath.EvalSymlinks(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	options := Options{Directory: filepath.Join(root, ".multica-runtime/state"), WorkspaceRoot: root, SessionRoot: filepath.Join(root, ".multica-runtime/sessions"), OwnerID: uuid.NewString()}
-	file := filepath.Join(root, StoragePrefix, uuid.NewString(), "private-data")
-	if err := os.MkdirAll(filepath.Dir(file), 0700); err != nil {
-		t.Fatal(err)
-	}
-	writeFile(t, file, []byte("unregistered data"))
-	if _, err := Open(options); err == nil {
-		t.Fatal("unregistered data was adopted as a current installation")
-	}
-	assertData(t, file, []byte("unregistered data"))
-}
-
-func TestLeaseAndActiveAttemptProtectRetirement(t *testing.T) {
-	store, options := testStore(t)
-	task := testObservation(testEnvironment("a"))
-	approve(t, store, task)
-	root := prepareRoot(t, options.WorkspaceRoot, task)
-	_, binding, err := store.AuthorizeAndBind(task.ID, task.AuthToken, task.WorkspaceID, task.AgentID, root, "", task.RuntimeRef)
-	if err != nil {
-		t.Fatal(err)
-	}
-	file := filepath.Join(options.WorkspaceRoot, binding.WorkerSubPath, "work")
-	writeFile(t, file, []byte("valuable work"))
-	// Advance the fixture's claim age, without depending on a wall-clock sleep.
-	if err := store.locked(func() error {
-		state, err := store.read()
-		if err != nil {
-			return err
-		}
-		c := state.Claims[task.ID]
-		c.ObservedAt = time.Now().Add(-365 * 24 * time.Hour)
-		state.Claims[task.ID] = c
-		return store.write(state)
-	}); err != nil {
-		t.Fatal(err)
-	}
-	cutoff := time.Now().Add(-60 * 24 * time.Hour)
-	if _, err := store.Collect(options.WorkspaceRoot, cutoff, map[string]bool{}); err != nil {
-		t.Fatal(err)
-	}
-	assertData(t, file, []byte("valuable work"))
-	if err := os.RemoveAll(root); err != nil {
-		t.Fatal(err)
-	}
-	release, err := store.AcquireLease(filepath.Base(binding.WorkerSubPath))
-	if err != nil {
-		t.Fatal(err)
-	}
-	reopened, err := Open(options)
-	if err != nil {
-		release()
-		t.Fatal(err)
-	}
-	if _, err := reopened.AcquireLease(filepath.Base(binding.WorkerSubPath)); err == nil {
-		release()
-		t.Fatal("another store acquired live storage lease")
-	}
-	if _, err := reopened.Collect(options.WorkspaceRoot, cutoff, map[string]bool{}); err != nil {
-		release()
-		t.Fatal(err)
-	}
-	assertData(t, file, []byte("valuable work"))
-	release()
-	if _, err := store.Collect(options.WorkspaceRoot, cutoff, map[string]bool{filepath.Base(binding.WorkerSubPath): true}); err != nil {
-		t.Fatal(err)
-	}
-	assertData(t, file, []byte("valuable work"))
-	if _, err := store.Collect(options.WorkspaceRoot, cutoff, map[string]bool{}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.ReadFile(file); !os.IsNotExist(err) {
-		t.Fatal("retired inactive storage was not reclaimed")
-	}
-	if _, err := store.Lookup(task.ID, task.AuthToken, task.WorkspaceID, task.AgentID); err == nil {
-		t.Fatal("retired task retained execution authority")
-	}
-}
-
 func testStore(t *testing.T) (*Store, Options) {
 	t.Helper()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	options := Options{Directory: filepath.Join(dir, "state"), OwnerID: uuid.NewString()}
+	s, err := Open(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.BindWorkspace("workspace-new", uuid.NewString(), "127.0.0.1"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+	return s, options
+}
+func testGrant() TaskGrant {
+	sha := core.Digest([]byte("immutable execution"))
+	executable := runtimeimage.Executable{Path: "/opt/tools/runner", Version: "1.0.0", SHA256: sha}
+	ref := runtimeimage.Ref{Image: "example.invalid/runtime@sha256:" + sha, Platform: "linux/amd64", ImageBuildID: "11111111-1111-4111-8111-111111111111", DescriptorDigest: sha, ConfigurationDigest: sha, Controller: core.Contract{BuildID: sha, Platform: "linux/amd64", RuntimePath: core.Root + "/runtime", RuntimeSHA256: sha, GoVersion: "go1.26.6"}, Daemon: runtimeimage.Daemon{Executable: executable, AdapterContract: runtimeimage.AdapterContract}, Providers: map[string]runtimeimage.Executable{"codex": executable}}
+	return TaskGrant{TaskID: uuid.NewString(), RuntimeID: "runtime", WorkspaceID: uuid.NewString(), AgentID: uuid.NewString(), Repositories: []Repository{{URL: "https://example.invalid/private.git"}}, Envelope: json.RawMessage(`{ "opaque_option": { "nested": true, "text": "<tag>&private" } }`), RuntimeRef: ref}
+}
+func readyGrant(t *testing.T, s *Store, input TaskGrant) (TaskGrant, ed25519.PrivateKey, string) {
+	t.Helper()
+	g, token := preparedGrant(t, s, input)
+	pub, key, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = s.Admit(g.AttemptID, pub); err != nil {
+		t.Fatal(err)
+	}
+	g, err = s.Get(g.AttemptID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return g, key, token
+}
+
+func preparedGrant(t *testing.T, s *Store, input TaskGrant) (TaskGrant, string) {
+	t.Helper()
+	g, err := s.Create(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := s.IssueCapability(g.AttemptID, "daemon", time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.BeginPreparation(g.AttemptID, PreparationProcess{PodName: "controller", PodUID: uuid.NewString(), ContainerID: "containerd://fixture"}); err != nil {
+		t.Fatal(err)
+	}
+	prepared := Prepared{OwnerID: g.OwnerID, WorkspaceID: g.WorkspaceID, TaskID: g.TaskID, AgentID: g.AgentID, AttemptID: g.AttemptID, Generation: g.Generation, PVCUID: g.PVCUID, TaskRoot: g.TaskRoot, Provider: "codex", Executable: "/opt/tools/runner", RuntimeDigest: g.Fingerprint, ConfigurationDigest: g.RuntimeRef.ConfigurationDigest, CreatedAt: time.Now().UTC(), CleanupManifest: json.RawMessage(`{}`), AllowedLinks: map[string]string{}, Environment: NativeEnvironment{RootDir: g.TaskRoot, WorkDir: g.TaskRoot + "/workdir", MulticaConfigRoot: g.TaskRoot + "/multica-config", CodexHome: g.TaskRoot + "/codex-home"}}
+	prepared.Digest = preparedDigest(prepared)
+	if err := s.CompletePreparation(g.AttemptID, &prepared, json.RawMessage(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.BindPod(g.AttemptID, g.PodName, uuid.NewString(), "node-a"); err != nil {
+		t.Fatal(err)
+	}
+	g, err = s.Get(g.AttemptID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return g, token
+}
+func startGrant(t *testing.T, s *Store, g TaskGrant) {
+	t.Helper()
+	if _, ok, err := s.Offer(g.AttemptID); err != nil || !ok {
+		t.Fatal("task was not offered", err)
+	}
+	if err := s.BeginStart(g.AttemptID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkStarted(g.AttemptID); err != nil {
+		t.Fatal(err)
+	}
+}
+func sealReceipt(g TaskGrant, t Terminal, key ed25519.PrivateKey) SignedReceipt {
+	r := SignedReceipt{TaskID: g.TaskID, AttemptID: g.AttemptID, RequestDigest: t.RequestDigest, PodUID: g.PodUID, PVCUID: g.PVCUID, Nonce: t.Nonce, WritersStopped: true, FlushOK: true}
+	r.Signature = ed25519.Sign(key, ReceiptMessage(r))
+	return r
+}
+
+func TestConcurrentOfferAndReopenNeverReoffer(t *testing.T) {
+	s, options := testStore(t)
+	g, _, _ := readyGrant(t, s, testGrant())
+	if other, err := Open(options); err == nil {
+		other.Close()
+		t.Fatal("second controller acquired write authority")
+	}
+	var offered atomic.Int32
+	var wg sync.WaitGroup
+	gate := make(chan struct{})
+	for range 12 {
+		wg.Go(func() {
+			<-gate
+			_, ok, err := s.Offer(g.AttemptID)
+			if err != nil {
+				t.Error(err)
+			}
+			if ok {
+				offered.Add(1)
+			}
+		})
+	}
+	close(gate)
+	wg.Wait()
+	if offered.Load() != 1 {
+		t.Fatal("same task offered to more than one consumer")
+	}
+	if err := s.BeginStart(g.AttemptID); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	s, err := Open(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if _, ok, err := s.Offer(g.AttemptID); err != nil || ok {
+		t.Fatal("lost response authorized a duplicate offer", err)
+	}
+	if err := s.BeginStart(g.AttemptID); err == nil {
+		t.Fatal("ambiguous start was sent a second time")
+	}
+	input := testGrant()
+	input.TaskID = g.TaskID
+	if _, err := s.Create(input); err == nil {
+		t.Fatal("active task gained another attempt")
+	}
+}
+
+func TestTerminalPersistenceSealAndResumeAuthority(t *testing.T) {
+	s, options := testStore(t)
+	g, key, token := readyGrant(t, s, testGrant())
+	supervisor, err := s.IssueCapability(g.AttemptID, "supervisor", time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	startGrant(t, s, g)
+	body := []byte("{\n \"opaque_result\": true\n}\n")
+	terminal, err := s.ReceiveTerminal(g.AttemptID, "complete", body, ResumePointers{WorkDir: g.TaskRoot + "/workdir"}, core.Digest([]byte("fixture provider result")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Authorize(token, "daemon"); err == nil {
+		t.Fatal("terminal retained general task authority")
+	}
+	if err := s.BeginForward(g.AttemptID); err == nil {
+		t.Fatal("unflushed terminal acquired delivery authority")
+	}
+	s.Close()
+	s, err = Open(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if _, err := s.Authorize(supervisor, "supervisor"); err != nil {
+		t.Fatal("supervisor lost receipt retry authority", err)
+	}
+	same, err := s.ReceiveTerminal(g.AttemptID, "complete", body, ResumePointers{WorkDir: g.TaskRoot + "/workdir"}, core.Digest([]byte("fixture provider result")))
+	if err != nil || same.ReceiptID != terminal.ReceiptID {
+		t.Fatal("durable retry lost terminal ownership", err)
+	}
+	if _, err := s.ReceiveTerminal(g.AttemptID, "fail", []byte(`{}`), ResumePointers{}, core.Digest([]byte("fixture provider result"))); err == nil {
+		t.Fatal("conflicting callback replaced completion")
+	}
+	persisted, err := s.Terminal(g.AttemptID)
+	if err != nil || !bytes.Equal(persisted.Body, body) {
+		t.Fatal("acknowledged result bytes lost", err)
+	}
+	receipt := sealReceipt(g, terminal, key)
+	if err := s.Seal(g.AttemptID, receipt); err == nil {
+		t.Fatal("worker sealed task data without closing controller checkout writers")
+	}
+	if err := s.CloseCheckouts(g.AttemptID); err != nil {
+		t.Fatal(err)
+	}
+	receipt.FlushOK = false
+	receipt.Signature = ed25519.Sign(key, ReceiptMessage(receipt))
+	if err := s.Seal(g.AttemptID, receipt); err == nil {
+		t.Fatal("failed flush acquired delivery authority")
+	}
+	receipt = sealReceipt(g, terminal, key)
+	receipt.PodUID = uuid.NewString()
+	receipt.Signature = ed25519.Sign(key, ReceiptMessage(receipt))
+	if err := s.Seal(g.AttemptID, receipt); err == nil {
+		t.Fatal("substituted Pod acquired seal authority")
+	}
+	if err := s.Seal(g.AttemptID, sealReceipt(g, terminal, key)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.BeginForward(g.AttemptID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.FinishForward(g.AttemptID, "delivered"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RequestStop(g.AttemptID, "execution_finished"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ObserveStop(g.AttemptID, StopEvidence{PodUID: g.PodUID, PVCUID: g.PVCUID, Kind: "missing", ObservedAt: time.Now().UTC()}); err == nil {
+		t.Fatal("missing Pod was accepted as stopped writer")
+	}
+	if err := s.ObserveStop(g.AttemptID, StopEvidence{PodUID: g.PodUID, PVCUID: g.PVCUID, Kind: "terminated", ObservedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CloseStopped(g.AttemptID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkCleaned(g.AttemptID); err != nil {
+		t.Fatal(err)
+	}
+	next := testGrant()
+	next.TaskID, next.WorkspaceID, next.AgentID = g.TaskID, g.WorkspaceID, g.AgentID
+	stolen := next
+	stolen.AgentID = uuid.NewString()
+	if _, err := s.Create(stolen); err == nil {
+		t.Fatal("another agent acquired private task storage")
+	}
+	mismatch := next
+	mismatch.RuntimeRef.ConfigurationDigest = core.Digest([]byte("changed authority"))
+	if _, err := s.Create(mismatch); err == nil {
+		t.Fatal("different configuration acquired private task storage")
+	}
+	resumed, err := s.Create(next)
+	if err != nil || resumed.StorageID != g.StorageID || resumed.PVCUID != g.PVCUID || !resumed.Reuse {
+		t.Fatal("same task lost retained workspace", err)
+	}
+	if _, err := s.Authorize(supervisor, "supervisor"); err == nil {
+		t.Fatal("previous attempt authorized replacement")
+	}
+	if err := s.Quarantine(resumed.AttemptID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Create(next); err == nil {
+		t.Fatal("unknown writer released quarantine")
+	}
+}
+
+func TestWorkerSealRequiresControllerFlushAfterWriterCompletion(t *testing.T) {
+	s, options := testStore(t)
+	g, key, _ := readyGrant(t, s, testGrant())
+	startGrant(t, s, g)
+	process := PreparationProcess{PodName: "controller", PodUID: uuid.NewString(), ContainerID: "containerd://checkout"}
+	if err := s.BeginCheckout(g.AttemptID, process); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CloseCheckouts(g.AttemptID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CheckoutsFlushed(g.AttemptID); err == nil {
+		t.Fatal("live controller writer lost its flush obligation")
+	}
+	if err := s.CompleteCheckout(g.AttemptID, process); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var err error
+	s, err = Open(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	body := []byte(`{"output":"completed provider work"}`)
+	terminal, err := s.ReceiveTerminal(g.AttemptID, "complete", body, ResumePointers{}, core.Digest(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt := sealReceipt(g, terminal, key)
+	if err := s.Seal(g.AttemptID, receipt); err == nil {
+		t.Fatal("NFS worker flush certified unflushed controller writes after restart")
+	}
+	if err := s.CheckoutsFlushed(g.AttemptID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Seal(g.AttemptID, receipt); err != nil {
+		t.Fatal("completed local and NFS flushes could not seal the task", err)
+	}
+}
+
+func TestTerminalSurvivesProcessExitWithoutClose(t *testing.T) {
+	if os.Getenv("MULTICA_STORE_CRASH_CHILD") == "1" {
+		s, err := Open(Options{Directory: os.Getenv("MULTICA_STORE_CRASH_DIR"), OwnerID: os.Getenv("MULTICA_STORE_CRASH_OWNER")})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = s.ReceiveTerminal(os.Getenv("MULTICA_STORE_CRASH_ATTEMPT"), "complete", []byte(`{"durable_result":"owned"}`), ResumePointers{}, core.Digest([]byte("fixture provider result"))); err != nil {
+			t.Fatal(err)
+		}
+		os.Exit(0)
+	}
+	s, options := testStore(t)
+	g, _, _ := readyGrant(t, s, testGrant())
+	startGrant(t, s, g)
+	s.Close()
+	child := exec.Command(os.Args[0], "-test.run=^TestTerminalSurvivesProcessExitWithoutClose$")
+	child.Env = append(os.Environ(), "MULTICA_STORE_CRASH_CHILD=1", "MULTICA_STORE_CRASH_DIR="+options.Directory, "MULTICA_STORE_CRASH_OWNER="+options.OwnerID, "MULTICA_STORE_CRASH_ATTEMPT="+g.AttemptID)
+	if output, err := child.CombinedOutput(); err != nil {
+		t.Fatalf("crash child: %v %s", err, output)
+	}
+	s, err := Open(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	terminal, err := s.Terminal(g.AttemptID)
+	if err != nil || !bytes.Equal(terminal.Body, []byte(`{"durable_result":"owned"}`)) {
+		t.Fatal("acknowledged terminal lost after process exit", err)
+	}
+}
+
+func TestForeignOrDamagedMetadataCannotAuthorizeStorage(t *testing.T) {
+	s, options := testStore(t)
+	g, _, _ := readyGrant(t, s, testGrant())
+	s.Close()
+	if other, err := Open(Options{Directory: options.Directory, OwnerID: uuid.NewString()}); err == nil {
+		other.Close()
+		t.Fatal("foreign installation acquired authority")
+	}
+	raw, err := os.ReadFile(filepath.Join(options.Directory, "journal.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var st registry
+	if err = json.Unmarshal(raw, &st); err != nil {
+		t.Fatal(err)
+	}
+	storage := st.Storages[g.StorageID]
+	storage.PVCUID = uuid.NewString()
+	st.Storages[g.StorageID] = storage
+	corrupted, err := json.Marshal(st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(filepath.Join(options.Directory, "journal.json"), corrupted, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if other, err := Open(options); err == nil {
+		other.Close()
+		t.Fatal("corrupt binding gained write authority")
+	}
+	kept, err := os.ReadFile(filepath.Join(options.Directory, "journal.json"))
+	if err != nil || !bytes.Equal(kept, corrupted) {
+		t.Fatal("failed startup rewrote original metadata", err)
+	}
+}
+
+func TestControllerFailureSurvivesReopenWithoutReleasingStorage(t *testing.T) {
+	s, options := testStore(t)
+	input := testGrant()
+	g, err := s.Create(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.BeginPreparation(g.AttemptID, PreparationProcess{PodName: "controller", PodUID: uuid.NewString(), ContainerID: "containerd://fixture"}); err != nil {
+		t.Fatal(err)
+	}
+	body := []byte("{\n\"error\":\"worker preparation failed\"\n}")
+	failure, err := s.ReceiveFailure(g.AttemptID, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	s, err = Open(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	retried, err := s.ReceiveFailure(g.AttemptID, body)
+	if err != nil || retried.ReceiptID != failure.ReceiptID || !bytes.Equal(retried.Body, body) {
+		t.Fatal("controller failure lost durable ownership", err)
+	}
+	if err = s.BeginForward(g.AttemptID); err == nil {
+		t.Fatal("controller failure acquired native success delivery authority")
+	}
+	if err = s.BeginFailureForward(g.AttemptID); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	s, err = Open(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err = s.BeginFailureForward(g.AttemptID); err == nil {
+		t.Fatal("ambiguous failure delivery was sent again")
+	}
+	if _, err := s.RequestStop(g.AttemptID, "preparation_failed"); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.CloseStopped(g.AttemptID); err == nil {
+		t.Fatal("failure receipt falsely released uncertain writer")
+	}
+	if _, err = s.Create(input); err == nil {
+		t.Fatal("quarantined task acquired another writer")
+	}
+}
+
+func TestControllerFailureCannotOverwriteNativeTerminal(t *testing.T) {
+	s, _ := testStore(t)
+	g, _, _ := readyGrant(t, s, testGrant())
+	startGrant(t, s, g)
+	body := []byte(`{"output":"native result"}`)
+	native, err := s.ReceiveTerminal(g.AttemptID, "complete", body, ResumePointers{}, core.Digest([]byte("fixture provider result")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.ReceiveFailure(g.AttemptID, []byte(`{"error":"controller failure"}`)); err == nil {
+		t.Fatal("controller replaced admitted native completion")
+	}
+	if err = s.BeginFailureForward(g.AttemptID); err == nil {
+		t.Fatal("native result bypassed seal through failure forwarding")
+	}
+	retained, err := s.Terminal(g.AttemptID)
+	if err != nil || retained.ReceiptID != native.ReceiptID || !bytes.Equal(retained.Body, body) {
+		t.Fatal("controller failure changed durable native result", err)
+	}
+}
+
+func TestFreshMetadataVolumeEstablishesPrivateDurableAuthority(t *testing.T) {
 	root, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	options := Options{Directory: filepath.Join(root, ".multica-runtime/state"), WorkspaceRoot: root, SessionRoot: filepath.Join(root, ".multica-runtime/sessions"), OwnerID: uuid.NewString()}
-	store, err := Open(options)
+	if err = os.Chmod(root, 0777|os.ModeSetgid); err != nil {
+		t.Fatal(err)
+	}
+	// Recovery contents must not be traversed or adopted as controller state.
+	if err = os.Mkdir(filepath.Join(root, "lost+found"), 0000); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(root)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return store, options
-}
-func testEnvironment(name string) runtimeimage.Ref {
-	sha := core.Digest([]byte(name))
-	controller := core.Contract{SchemaVersion: 2, ControllerABI: 2, BuildID: sha, Platform: "linux/amd64", RuntimePath: core.Root + "/runtime", RuntimeSHA256: sha, GoVersion: "go1.26.1", ShimPaths: map[string]string{}}
-	for _, alias := range []string{"pi", "codex", "copilot", "agy"} {
-		controller.ShimPaths[alias] = core.Root + "/shims/" + alias
-	}
-	executable := runtimeimage.Executable{Path: "/opt/multica/tools/bin/pi", Version: "1.0.0", SHA256: sha}
-	return runtimeimage.Ref{SchemaVersion: 2, Image: "example.invalid/runtime@sha256:" + sha, Platform: "linux/amd64", ImageBuildID: uuid.NewSHA1(uuid.NameSpaceOID, []byte(name)).String(), DescriptorDigest: sha, Controller: controller, Daemon: runtimeimage.Daemon{Executable: runtimeimage.Executable{Path: "/opt/multica/tools/bin/multica", Version: "0.4.40", SHA256: sha}, AdapterContract: runtimeimage.AdapterContract}, Providers: map[string]runtimeimage.Executable{"pi": executable}, ConfigurationDigest: sha}
-}
-func testObservation(ref runtimeimage.Ref) Observation {
-	id := uuid.NewString()
-	return Observation{ID: id, WorkspaceID: "workspace", AgentID: "agent", IssueID: "issue", AuthToken: "mat_" + id, RepositoryURLs: []string{"https://example.invalid/private.git"}, RuntimeRef: ref}
-}
-func approve(t *testing.T, store *Store, task Observation) {
-	t.Helper()
-	if _, err := store.ObserveBatch([]Observation{task}); err != nil {
-		t.Fatal(err)
-	}
-}
-func prepareRoot(t *testing.T, workspace string, task Observation) string {
-	t.Helper()
-	root := filepath.Join(workspace, "team", task.ID)
-	if err := os.MkdirAll(filepath.Join(root, "workdir"), 0700); err != nil {
-		t.Fatal(err)
-	}
-	raw, _ := json.Marshal(map[string]string{"workspace_id": task.WorkspaceID, "task_id": task.ID})
-	writeFile(t, filepath.Join(root, ".task_owner"), raw)
-	return root
-}
-func prepareSession(t *testing.T, root string) string {
-	t.Helper()
-	if err := os.MkdirAll(root, 0700); err != nil {
-		t.Fatal(err)
-	}
-	file, err := os.CreateTemp(root, "session-*.jsonl")
+	owner := uuid.NewString()
+	s, err := OpenVolume(root, Options{OwnerID: owner})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := file.Close(); err != nil {
+	if err := s.BindWorkspace("workspace-new", uuid.NewString(), "127.0.0.1"); err != nil {
 		t.Fatal(err)
 	}
-	return file.Name()
-}
-func writeFile(t *testing.T, path string, data []byte) {
-	t.Helper()
-	if err := os.WriteFile(path, data, 0600); err != nil {
+	g, err := s.Create(testGrant())
+	if err != nil {
 		t.Fatal(err)
 	}
+	if err = s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s, err = OpenVolume(root, Options{OwnerID: owner})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if _, err = s.Get(g.AttemptID); err != nil {
+		t.Fatal("fresh volume lost committed task authority", err)
+	}
+	after, err := os.Stat(root)
+	if err != nil || after.Mode() != before.Mode() {
+		t.Fatal("opening journal changed filesystem-root access", err)
+	}
+	journal, err := os.Stat(filepath.Join(root, "journal"))
+	if err != nil || journal.Mode().Perm()&0007 != 0 {
+		t.Fatal("fresh authority exposed controller secrets to other users", err)
+	}
 }
-func assertData(t *testing.T, path string, want []byte) {
-	t.Helper()
-	got, err := os.ReadFile(path)
-	if err != nil || !bytes.Equal(got, want) {
-		t.Fatalf("protected data changed at %s: %v", path, err)
+
+func TestPopulatedMetadataVolumeIsPreservedWithoutAdoption(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents := []byte("previous installation authority")
+	path := filepath.Join(root, "registry.json")
+	if err = os.WriteFile(path, contents, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if s, err := OpenVolume(root, Options{OwnerID: uuid.NewString()}); err == nil {
+		s.Close()
+		t.Fatal("unknown populated volume gained controller authority")
+	}
+	actual, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(actual, contents) {
+		t.Fatal("rejected startup altered prior installation data", err)
+	}
+}
+
+func TestCleanupAuthorityCannotBeSuppliedOrMarkALiveWriter(t *testing.T) {
+	s, _ := testStore(t)
+	input := testGrant()
+	input.CleanupComplete = true
+	if _, err := s.QueueClaim(input); !errors.Is(err, ErrInvalidClaim) {
+		t.Fatal("claim input supplied cleanup authority", err)
+	}
+	g, _, token := readyGrant(t, s, testGrant())
+	if err := s.MarkCleaned(g.AttemptID); err == nil {
+		t.Fatal("live writer was marked cleaned")
+	}
+	if _, err := s.Authorize(token, "daemon"); err != nil {
+		t.Fatal("refused cleanup changed live writer authority", err)
+	}
+}
+
+func TestUncertainDeliveryCannotAuthorizeAReplayOrTaskReuse(t *testing.T) {
+	s, options := testStore(t)
+	input := testGrant()
+	g, key, _ := readyGrant(t, s, input)
+	startGrant(t, s, g)
+	terminal, err := s.ReceiveTerminal(g.AttemptID, "complete", []byte(`{"output":"completed work"}`), ResumePointers{}, core.Digest([]byte("fixture provider result")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CloseCheckouts(g.AttemptID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Seal(g.AttemptID, sealReceipt(g, terminal, key)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.BeginForward(g.AttemptID); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	options.MaxPendingResults = 1
+	s, err = Open(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.BeginForward(g.AttemptID); err == nil {
+		t.Fatal("ambiguous callback replayed")
+	}
+	if _, err := s.RequestStop(g.AttemptID, "delivery_uncertain"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CloseStopped(g.AttemptID); err == nil {
+		t.Fatal("uncertain delivery was mistaken for writer termination")
+	}
+	if _, err := s.Create(input); err == nil {
+		t.Fatal("uncertain completion reran provider")
+	}
+	if _, err := s.Create(testGrant()); !errors.Is(err, ErrAdmissionBudget) {
+		t.Fatal("unresolved result budget failed to stop new task admission", err)
+	}
+	queued, err := s.QueueClaim(testGrant())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ReceiveFailure(queued.AttemptID, []byte(`{"error":"admission refused"}`)); !errors.Is(err, ErrAdmissionBudget) {
+		t.Fatal("controller failure bypassed the pending result budget", err)
+	}
+	queued, err = s.Get(queued.AttemptID)
+	if err != nil || queued.State != "waiting_storage" || queued.StorageID != "" {
+		t.Fatal("unrecorded rejection changed queued authority", err)
+	}
+}
+
+func TestAdmissionBudgetRetainsExistingTaskAuthority(t *testing.T) {
+	s, options := testStore(t)
+	s.Close()
+	options.MaxTasks = 1
+	s, err := Open(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	first, err := s.Create(testGrant())
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(filepath.Join(options.Directory, "journal.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Create(testGrant()); !errors.Is(err, ErrAdmissionBudget) {
+		t.Fatal("exhausted admission budget did not explicitly refuse another workspace", err)
+	}
+	after, err := os.ReadFile(filepath.Join(options.Directory, "journal.json"))
+	if err != nil || !bytes.Equal(before, after) {
+		t.Fatal("budget refusal changed retained task authority", err)
+	}
+	if _, err := s.Get(first.AttemptID); err != nil {
+		t.Fatal("budget refusal lost existing work", err)
+	}
+}
+
+func TestStoppedPreparationRequiresRecoveryWithoutACompletedBaseline(t *testing.T) {
+	s, _ := testStore(t)
+	input := testGrant()
+	g, err := s.Create(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.BeginPreparation(g.AttemptID, PreparationProcess{PodName: "controller", PodUID: uuid.NewString(), ContainerID: "containerd://fixture"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CompletePreparation(g.AttemptID, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ReceiveFailure(g.AttemptID, []byte(`{"error":"preparation failed"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.BeginFailureForward(g.AttemptID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.FinishForward(g.AttemptID, "delivered"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RequestStop(g.AttemptID, "preparation_failed"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ObserveStop(g.AttemptID, StopEvidence{PVCUID: g.PVCUID, Kind: "no-worker", ObservedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CloseStopped(g.AttemptID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkCleaned(g.AttemptID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Create(input); !errors.Is(err, ErrStorageBusy) {
+		t.Fatal("partially prepared task was reused without a clean baseline", err)
+	}
+	retained, err := s.Get(g.AttemptID)
+	if err != nil || retained.TaskRoot != g.TaskRoot || retained.StorageID != g.StorageID || retained.State != "closed" {
+		t.Fatal("stopping incomplete preparation lost retained task storage", err)
+	}
+}
+
+func TestFailedPreparationReleasesOnlyAfterItsWritersStop(t *testing.T) {
+	for _, running := range []bool{false, true} {
+		s, _ := testStore(t)
+		input := testGrant()
+		g, err := s.Create(input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if running {
+			if err := s.BeginPreparation(g.AttemptID, PreparationProcess{PodName: "controller", PodUID: uuid.NewString(), ContainerID: "containerd://fixture"}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := s.ReceiveFailure(g.AttemptID, []byte(`{"error":"preparation lease unavailable"}`)); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.RejectFailure(g.AttemptID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.RequestStop(g.AttemptID, "preparation_failed"); err != nil {
+			t.Fatal(err)
+		}
+		if running {
+			if err := s.ObserveStop(g.AttemptID, StopEvidence{PVCUID: g.PVCUID, Kind: "no-worker", ObservedAt: time.Now().UTC()}); err == nil {
+				t.Fatal("failure delivery released a still-running preparation")
+			}
+			if _, err := s.Create(input); err == nil {
+				t.Fatal("failed preparation acquired a competing writer before stopping")
+			}
+			if err := s.CompletePreparation(g.AttemptID, nil, nil); err != nil {
+				t.Fatal("actual preparation completion could not settle an earlier failure", err)
+			}
+		}
+		if err := s.ObserveStop(g.AttemptID, StopEvidence{PVCUID: g.PVCUID, Kind: "no-worker", ObservedAt: time.Now().UTC()}); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.CloseStopped(g.AttemptID); err != nil {
+			t.Fatal("failure with no live writer could not close", err)
+		}
+		if err := s.MarkCleaned(g.AttemptID); err != nil {
+			t.Fatal(err)
+		}
+		_, err = s.Create(input)
+		if running && !errors.Is(err, ErrStorageBusy) {
+			t.Fatal("stopped incomplete preparation bypassed data recovery", err)
+		}
+		if !running && err != nil {
+			t.Fatal("task with no preparation writes remained blocked", err)
+		}
+	}
+}
+
+func TestInterruptedPreparationRequiresItsContainerAndRetainsCheckpoint(t *testing.T) {
+	s, options := testStore(t)
+	input := testGrant()
+	g, err := s.Create(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetResources(g.AttemptID, json.RawMessage(`{"podCreateRequested":false,"secretCreateRequested":false}`)); err != nil {
+		t.Fatal(err)
+	}
+	process := PreparationProcess{PodName: "controller", PodUID: uuid.NewString(), ContainerID: "containerd://original"}
+	if err := s.BeginPreparation(g.AttemptID, process); err != nil {
+		t.Fatal(err)
+	}
+	checkpoint := Prepared{OwnerID: g.OwnerID, WorkspaceID: g.WorkspaceID, TaskID: g.TaskID, AgentID: g.AgentID, AttemptID: g.AttemptID, Generation: g.Generation, PVCUID: g.PVCUID, TaskRoot: g.TaskRoot, Provider: "codex", Executable: "/opt/tools/runner", RuntimeDigest: g.Fingerprint, ConfigurationDigest: g.RuntimeRef.ConfigurationDigest, CreatedAt: time.Now().UTC(), CleanupManifest: json.RawMessage(`{}`), AllowedLinks: map[string]string{}, Environment: NativeEnvironment{RootDir: g.TaskRoot, WorkDir: g.TaskRoot + "/workdir", MulticaConfigRoot: g.TaskRoot + "/multica-config", CodexHome: g.TaskRoot + "/codex-home"}}
+	checkpoint.Digest = preparedDigest(checkpoint)
+	if err := s.CheckpointPreparation(g.AttemptID, checkpoint); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.BindPod(g.AttemptID, g.PodName, uuid.NewString(), "node-a"); err == nil {
+		t.Fatal("native checkpoint prematurely authorized a worker")
+	}
+	if _, err := s.ReceiveFailure(g.AttemptID, []byte(`{"error":"preparation interrupted"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RejectFailure(g.AttemptID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s, err = Open(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	wrong := process
+	wrong.ContainerID = "containerd://replacement"
+	if err := s.InterruptPreparation(g.AttemptID, wrong); err == nil {
+		t.Fatal("another container released the preparation writer")
+	}
+	if _, err := s.Create(input); err == nil {
+		t.Fatal("unproven interruption allowed another writer")
+	}
+	if err := s.InterruptPreparation(g.AttemptID, process); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RequestStop(g.AttemptID, "preparation_interrupted"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ObserveStop(g.AttemptID, StopEvidence{PVCUID: g.PVCUID, Kind: "no-worker", ObservedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CloseStopped(g.AttemptID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkCleaned(g.AttemptID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s, err = Open(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if _, err := s.Create(input); !errors.Is(err, ErrStorageBusy) {
+		t.Fatal("interrupted checkout was reused without data recovery", err)
+	}
+	retained, err := s.PreviousPrepared(g.AttemptID)
+	if err != nil || retained == nil || retained.Digest != checkpoint.Digest {
+		t.Fatal("recovery lost the durable native initialization checkpoint", err)
 	}
 }

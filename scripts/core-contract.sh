@@ -38,17 +38,14 @@ runtime=$directory/runtime
 [[ -f $runtime && ! -L $runtime && -x $runtime ]] || fail 'controller is not a regular executable'
 chmod 0555 "$runtime"
 runtime_hash=$(sha256 <"$runtime")
-mkdir -m 0755 -- "$directory/shims"
-mkdir -m 0555 -- "$directory/disabled"
-for alias in pi codex copilot agy; do ln -- "$runtime" "$directory/shims/$alias"; done
 image_root=${root%/}
 build=$(jq -cnS --arg version "$version" --arg commit "$commit" --arg platform "$platform" \
   --arg runtime_hash "$runtime_hash" --arg go_version "$go_version" \
-  '{version:$version,commit:$commit,platform:$platform,runtimeSHA256:$runtime_hash,goVersion:$go_version,controllerABI:2}')
+  '{version:$version,commit:$commit,platform:$platform,runtimeSHA256:$runtime_hash,goVersion:$go_version}')
 build_id=$(printf '%s' "$build" | sha256)
 contract=$(jq -cnS --arg build_id "$build_id" --arg platform "$platform" --arg root "$image_root" \
   --arg runtime_hash "$runtime_hash" --arg go_version "$go_version" \
-  '{schemaVersion:2,controllerABI:2,buildID:$build_id,platform:$platform,runtimePath:($root+"/runtime"),runtimeSHA256:$runtime_hash,
-    shimPaths:(["pi","codex","copilot","agy"] | map({key:.,value:($root+"/shims/"+.)}) | from_entries),goVersion:$go_version}')
+  '{buildID:$build_id,platform:$platform,runtimePath:($root+"/runtime"),runtimeSHA256:$runtime_hash,
+    goVersion:$go_version}')
 printf '%s' "$contract" >"$directory/build.json"
 chmod 0444 "$directory/build.json"

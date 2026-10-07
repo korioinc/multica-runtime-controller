@@ -1,6 +1,6 @@
 // Package configuration owns the immutable, per-Pod capture of operator files.
-// Configuration contents stay outside task request Secrets and runtime identity
-// uses content, never the names or UIDs of derived Kubernetes objects.
+// Runtime identity uses content, never the names or UIDs of derived Kubernetes
+// objects. Worker bootstrap applies its aggregate transport limit separately.
 package configuration
 
 import (
@@ -17,10 +17,11 @@ import (
 )
 
 const (
-	Home          = "/home/multica/agents"
-	InputRoot     = "/opt/multica/config-input"
-	BundleName    = "configuration.json"
-	MaxGroupBytes = 1 << 20
+	Home              = "/home/multica/agents"
+	ChromeProfileRoot = Home + "/.config/google-chrome"
+	InputRoot         = "/opt/multica/config-input"
+	BundleName        = "configuration.json"
+	MaxGroupBytes     = 1 << 20
 )
 
 var groupName = regexp.MustCompile(`^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$`)
@@ -45,9 +46,8 @@ type Group struct {
 }
 
 type Bundle struct {
-	SchemaVersion int     `json:"schemaVersion"`
-	Groups        []Group `json:"groups"`
-	Digest        string  `json:"digest"`
+	Groups []Group `json:"groups"`
+	Digest string  `json:"digest"`
 }
 
 func GroupName(value string) bool { return len(value) <= 63 && groupName.MatchString(value) }
@@ -56,10 +56,9 @@ func HomePath(path string, directory bool) bool {
 	if filepath.Clean(path) != path || !strings.HasPrefix(path, Home+"/") || strings.ContainsAny(path, "\x00\n\r") {
 		return false
 	}
-	for _, protected := range []string{Home + "/.multica/pi-sessions", Home + "/.multica/config.json", Home + "/.pi/agent/sessions"} {
-		if path == protected || strings.HasPrefix(path, protected+"/") || !directory && strings.HasPrefix(protected, path+"/") {
-			return false
-		}
+	protected := Home + "/.multica/config.json"
+	if path == protected || strings.HasPrefix(path, protected+"/") || !directory && strings.HasPrefix(protected, path+"/") {
+		return false
 	}
 	return true
 }
@@ -144,8 +143,17 @@ func Digest(groups []Group) string {
 	return core.Digest(raw)
 }
 
+// ExecutionDigest binds native configuration and operator environment together.
+// Secret bytes contribute only to the digest and never become identity labels.
+func ExecutionDigest(bundle Bundle, environment []string) string {
+	values := slices.Clone(environment)
+	slices.Sort(values)
+	raw, _ := json.Marshal([]any{bundle.Digest, values})
+	return core.Digest(raw)
+}
+
 func (b Bundle) Validate() error {
-	if b.SchemaVersion != 1 || b.Groups == nil || !core.ValidSHA(b.Digest) {
+	if b.Groups == nil || !core.ValidSHA(b.Digest) {
 		return errors.New("invalid configuration bundle")
 	}
 	targets := map[string]string{}

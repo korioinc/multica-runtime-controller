@@ -18,7 +18,7 @@ import (
 const (
 	Root            = "/opt/multica/runtime"
 	DescriptorPath  = Root + "/image.json"
-	AdapterContract = "multica-v0.4.40-v1"
+	AdapterContract = "multica-v0.4.43-helper-agent-v1"
 )
 
 type Executable struct {
@@ -33,22 +33,19 @@ type Daemon struct {
 }
 
 type Descriptor struct {
-	SchemaVersion int                   `json:"schemaVersion"`
-	Kind          string                `json:"kind"`
-	ImageBuildID  string                `json:"imageBuildID"`
-	Platform      string                `json:"platform"`
-	Controller    core.Contract         `json:"controller"`
-	Daemon        Daemon                `json:"daemon"`
-	Providers     map[string]Executable `json:"providers"`
-	BinDirs       []string              `json:"binDirs"`
-	Env           map[string]string     `json:"env"`
-	HomeSeed      string                `json:"homeSeed,omitempty"`
+	Kind         string                `json:"kind"`
+	ImageBuildID string                `json:"imageBuildID"`
+	Platform     string                `json:"platform"`
+	Controller   core.Contract         `json:"controller"`
+	Daemon       Daemon                `json:"daemon"`
+	Providers    map[string]Executable `json:"providers"`
+	BinDirs      []string              `json:"binDirs"`
+	Env          map[string]string     `json:"env"`
 }
 
 // Ref contains only stable execution identity. Kubernetes resource identity is
 // deliberately separate so an equivalent configuration preserves native sessions.
 type Ref struct {
-	SchemaVersion       int                   `json:"schemaVersion"`
 	Image               string                `json:"image"`
 	Platform            string                `json:"platform"`
 	ImageBuildID        string                `json:"imageBuildID"`
@@ -62,24 +59,6 @@ type Ref struct {
 func canonicalUUID(value string) bool {
 	id, err := uuid.Parse(value)
 	return err == nil && id.String() == value && id != uuid.Nil
-}
-
-func SupportedProvider(id string) bool {
-	switch id {
-	case "pi", "codex", "copilot", "antigravity":
-		return true
-	}
-	return false
-}
-
-func Alias(id string) string {
-	if id == "antigravity" {
-		return "agy"
-	}
-	if SupportedProvider(id) {
-		return id
-	}
-	return ""
 }
 
 // Repository components use the distribution reference grammar: one dot,
@@ -122,7 +101,7 @@ func (e Executable) validate() error {
 	return nil
 }
 
-func validateComponents(controller core.Contract, daemon Daemon, providers map[string]Executable, platform string) error {
+func validateComponents(controller core.Contract, daemon Daemon, installed map[string]Executable, platform string) error {
 	if err := controller.Validate(platform); err != nil {
 		return err
 	}
@@ -132,12 +111,12 @@ func validateComponents(controller core.Contract, daemon Daemon, providers map[s
 	if daemon.AdapterContract != AdapterContract {
 		return errors.New("unsupported official daemon adapter contract")
 	}
-	if len(providers) == 0 {
+	if len(installed) == 0 {
 		return errors.New("runtime image must enable a supported provider")
 	}
-	for id, provider := range providers {
-		if !SupportedProvider(id) {
-			return fmt.Errorf("unsupported provider %q", id)
+	for id, provider := range installed {
+		if strings.TrimSpace(id) != id || id == "" || strings.ContainsAny(id, "\x00\r\n") {
+			return errors.New("invalid runtime inventory identifier")
 		}
 		if err := provider.validate(); err != nil {
 			return fmt.Errorf("provider %s: %w", id, err)
@@ -147,8 +126,8 @@ func validateComponents(controller core.Contract, daemon Daemon, providers map[s
 }
 
 func (d Descriptor) Validate(platform string) error {
-	if d.SchemaVersion != 1 || d.Kind != "multica-runtime-image" || !canonicalUUID(d.ImageBuildID) || !core.SupportedPlatform(platform) || d.Platform != platform {
-		return errors.New("runtime image descriptor schema/build/platform mismatch")
+	if d.Kind != "multica-runtime-image" || !canonicalUUID(d.ImageBuildID) || !core.SupportedPlatform(platform) || d.Platform != platform {
+		return errors.New("runtime image descriptor build/platform mismatch")
 	}
 	if err := validateComponents(d.Controller, d.Daemon, d.Providers, platform); err != nil {
 		return err
@@ -158,7 +137,7 @@ func (d Descriptor) Validate(platform string) error {
 	}
 	seen := map[string]bool{}
 	for _, path := range d.BinDirs {
-		if !ImmutablePath(path) || seen[path] || path == core.Root+"/shims" {
+		if !ImmutablePath(path) || seen[path] || path == core.Root || strings.HasPrefix(path, core.Root+"/") {
 			return errors.New("invalid runtime image PATH directory")
 		}
 		seen[path] = true
@@ -171,16 +150,13 @@ func (d Descriptor) Validate(platform string) error {
 			return err
 		}
 	}
-	if d.HomeSeed != "" && !ImmutablePath(d.HomeSeed) {
-		return errors.New("home seed is not an immutable image path")
-	}
 	return nil
 }
 
 func (r Ref) Validate() error {
 	image, err := NormalizeImageID(r.Image)
-	if err != nil || image != r.Image || r.SchemaVersion != 2 || !canonicalUUID(r.ImageBuildID) || !core.ValidSHA(r.DescriptorDigest) || !core.ValidSHA(r.ConfigurationDigest) {
-		return errors.New("invalid runtime reference; schema 2 and bound image/configuration required")
+	if err != nil || image != r.Image || !canonicalUUID(r.ImageBuildID) || !core.ValidSHA(r.DescriptorDigest) || !core.ValidSHA(r.ConfigurationDigest) {
+		return errors.New("invalid runtime reference; bound image/configuration required")
 	}
 	return validateComponents(r.Controller, r.Daemon, r.Providers, r.Platform)
 }
@@ -192,6 +168,6 @@ func (r Ref) Equal(other Ref) bool {
 }
 
 func (d Descriptor) Reference(image, descriptorDigest, configurationDigest string) (Ref, error) {
-	r := Ref{SchemaVersion: 2, Image: image, Platform: d.Platform, ImageBuildID: d.ImageBuildID, DescriptorDigest: descriptorDigest, Controller: d.Controller, Daemon: d.Daemon, Providers: d.Providers, ConfigurationDigest: configurationDigest}
+	r := Ref{Image: image, Platform: d.Platform, ImageBuildID: d.ImageBuildID, DescriptorDigest: descriptorDigest, Controller: d.Controller, Daemon: d.Daemon, Providers: d.Providers, ConfigurationDigest: configurationDigest}
 	return r, r.Validate()
 }

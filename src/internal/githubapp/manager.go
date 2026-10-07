@@ -5,8 +5,10 @@ import (
 	"context"
 	"crypto/rsa"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -18,8 +20,9 @@ const refreshWindow = 5 * time.Minute
 
 // Token is a short-lived installation credential. Value must never be logged.
 type Token struct {
-	Value     string
-	ExpiresAt time.Time
+	Value          string
+	ExpiresAt      time.Time
+	installationID int64
 }
 
 // Manager keeps credentials only in memory and shares renewals for equal scopes.
@@ -97,6 +100,16 @@ func (m *Manager) Token(ctx context.Context, repositories []Repository) (Token, 
 	if err := ctx.Err(); err != nil {
 		return Token{}, err
 	}
+	// Recheck App membership/Contents before returning a cached credential.
+	// Permission changes select a new cache entry rather than retaining broader grants.
+	for _, repo := range scope {
+		installation, _, err := m.installation(ctx, repo)
+		if err != nil {
+			return Token{}, err
+		}
+		permissions, _ := json.Marshal(installation.Permissions)
+		key += "|" + strconv.FormatInt(installation.ID, 10) + ":" + string(permissions)
+	}
 	m.mu.Lock()
 	now := m.now()
 	if token, ok := m.cache[key]; ok && token.ExpiresAt.After(now.Add(refreshWindow)) {
@@ -132,6 +145,36 @@ func (m *Manager) Token(ctx context.Context, repositories []Repository) (Token, 
 		}
 		return pending.token, pending.err
 	}
+}
+
+// Authorize verifies that a current installation token can access the requested
+// repository. Callers obtain repository-scoped authority only when Git is used.
+func (m *Manager) Authorize(ctx context.Context, repository Repository, token Token) error {
+	_, err := m.repositoryIdentity(ctx, repository, token)
+	return err
+}
+
+type repositoryIdentity struct {
+	ID   int64  `json:"id"`
+	Name string `json:"full_name"`
+}
+
+func (m *Manager) repositoryIdentity(ctx context.Context, repository Repository, token Token) (repositoryIdentity, error) {
+	var identity repositoryIdentity
+	repository, err := canonicalRepository(repository)
+	if err != nil {
+		return identity, err
+	}
+	if token.Value == "" || !token.ExpiresAt.After(m.now()) {
+		return identity, errors.New("GitHub repository token is missing or expired")
+	}
+	if err := m.request(ctx, http.MethodGet, "/repos/"+repository.Owner+"/"+repository.Name, token.Value, nil, &identity); err != nil {
+		return identity, fmt.Errorf("authorize GitHub repository: %w", err)
+	}
+	if !strings.EqualFold(identity.Name, repository.Owner+"/"+repository.Name) {
+		return identity, errors.New("GitHub repository identity changed")
+	}
+	return identity, nil
 }
 
 func (m *Manager) renew(ctx context.Context, scope []Repository, key string, pending *renewal) {
