@@ -234,7 +234,7 @@ jobs:
           persist-credentials: false
       - name: Download native results
         if: needs.plan.outputs.published != 'true'
-        uses: actions/download-artifact@v8.0.1
+        uses: actions/download-artifact@v8.0.2
         with:
           pattern: release-native-*
           path: ${{ runner.temp }}/native-results
