@@ -169,7 +169,7 @@ jobs:
             '{image:$image,digest:$digest,platform:$platform,revision:$revision,run_id:$run_id}' \
             >"$RUNNER_TEMP/develop-results/$ARCHITECTURE.json"
       - name: Upload the verified native result
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: develop-native-${{ matrix.architecture }}
           path: ${{ runner.temp }}/develop-results/*.json

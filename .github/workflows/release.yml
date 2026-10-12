@@ -192,7 +192,7 @@ jobs:
           record-native --platform '${{ matrix.platform }}'
           --records "$RUNNER_TEMP/native-results"
       - name: Upload the verified native result
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: release-native-${{ matrix.architecture }}
           path: ${{ runner.temp }}/native-results/*.json
