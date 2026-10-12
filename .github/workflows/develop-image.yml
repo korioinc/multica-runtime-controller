@@ -291,7 +291,7 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
       - name: Download both verified native results
-        uses: actions/download-artifact@v8.0.1
+        uses: actions/download-artifact@v8.0.2
         with:
           pattern: develop-native-*
           path: ${{ runner.temp }}/develop-results
